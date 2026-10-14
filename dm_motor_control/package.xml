@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dm_motor_control</name>
+  <version>0.1.0</version>
+  <description>C++ MIT motor controller with serial USB2CAN and simulation.</description>
+  <maintainer email="yizhongzhang1989@users.noreply.github.com">yizhongzhang1989</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>dm_motor_interfaces</depend>
+  <depend>std_srvs</depend>
+  <exec_depend>launch_ros</exec_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
