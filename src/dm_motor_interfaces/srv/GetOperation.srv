@@ -1,0 +1,11 @@
+uint64 operation_id
+---
+uint8 PENDING=0
+uint8 CONFIRMED=1
+uint8 REJECTED=2
+uint8 UNKNOWN=3
+bool success
+uint8 state
+uint8 address
+uint32 raw_value
+string message

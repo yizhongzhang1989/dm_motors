@@ -1,0 +1,11 @@
+---
+bool ready
+string name
+string profile
+string backend
+string evidence
+uint8[] modes
+RegisterDescriptor[] registers
+bool simulated
+bool legacy_control
+string message

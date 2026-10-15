@@ -1,0 +1,12 @@
+uint8 MIT=1
+uint8 POSITION_VELOCITY=2
+uint8 VELOCITY=3
+uint8 POSITION_FORCE=4
+uint8 mode
+float64 position
+float64 velocity
+float64 kp
+float64 kd
+float64 torque
+float64 velocity_limit
+float64 current_ratio

@@ -1,0 +1,62 @@
+# Site-specific, bounded MIT validation profile. Launch never enables motors.
+# ID 1 is not repeatably certified under the 0.3 Nm estimate budget; see README.
+/**:
+  ros__parameters:
+    control_rate: 200.0
+    state_rate: 200.0
+    max_task_duration: 10.0
+    bus_names: [main]
+    motor_names: [motor_1, motor_2]
+    buses:
+      main:
+        backend: serial
+        port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+        can_fd: false
+        can_bitrate: 1000000.0
+    motors:
+      motor_1:
+        host_protection_enabled: true
+        bus: main
+        motor_id: 1
+        master_id: 0
+        profile: j4310_v12
+        mode: 1
+        direction: 1.0
+        watchdog_timeout: 0.2
+        command_timeout: 0.25
+        feedback_timeout: 0.1
+        velocity_limit: 0.2
+        torque_limit: 0.1
+        kp_limit: 30.0
+        kd_limit: 1.0
+        measured_velocity_limit: 0.5
+        measured_torque_limit: 0.5
+        estimated_torque_limit: 0.3
+        mos_temperature_stop: 60.0
+        rotor_temperature_stop: 60.0
+        protection_samples: 3
+        fault_group: dual_test
+        legacy_control: false
+      motor_2:
+        host_protection_enabled: true
+        bus: main
+        motor_id: 2
+        master_id: 0
+        profile: j4310_v12
+        mode: 1
+        direction: 1.0
+        watchdog_timeout: 0.2
+        command_timeout: 0.25
+        feedback_timeout: 0.1
+        velocity_limit: 0.2
+        torque_limit: 0.1
+        kp_limit: 30.0
+        kd_limit: 1.0
+        measured_velocity_limit: 0.5
+        measured_torque_limit: 0.5
+        estimated_torque_limit: 0.3
+        mos_temperature_stop: 60.0
+        rotor_temperature_stop: 60.0
+        protection_samples: 3
+        fault_group: dual_test
+        legacy_control: false

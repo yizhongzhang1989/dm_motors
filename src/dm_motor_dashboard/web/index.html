@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>达妙单电机控制台</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div><div class="eyebrow">DAMIAO / ROS 2 / UNIVERSAL DRIVER</div><h1>单电机控制台 <span id="motor-id"></span></h1></div>
+      <span id="connection" class="badge">未连接</span>
+    </header>
+    <section id="status-panel" class="panel status-panel" aria-label="电机状态栏">
+      <div class="section-heading"><h2>电机状态</h2><span id="phase" class="badge">等待反馈</span></div>
+      <div class="metrics">
+        <div class="metric"><div class="eyebrow">位置 / rad</div><div class="value" id="position">--</div></div>
+        <div class="metric"><div class="eyebrow">速度 / rad·s⁻¹</div><div class="value" id="velocity">--</div></div>
+        <div class="metric"><div class="eyebrow">反馈力矩 / Nm</div><div class="value" id="torque">--</div></div>
+        <div class="metric"><div class="eyebrow">MOS / 转子温度 · °C</div><div class="value temperature" id="temperature">--</div></div>
+      </div>
+      <div id="telemetry" class="subtle">连接后显示实际反馈频率、CAN ID 和控制周期。</div>
+      <div class="status-footer">
+        <div id="endpoint" class="subtle"></div>
+        <div class="row">
+          <button id="connect">连接并获取控制权</button>
+          <button id="claim" class="secondary" disabled>获取控制权</button>
+          <button id="disconnect" class="secondary" disabled>断开</button>
+        </div>
+      </div>
+    </section>
+    <div id="workspace" class="workspace">
+    <section id="plot-panel" class="panel plot-panel" aria-label="电机反馈曲线">
+      <div class="section-heading"><h2>实时反馈</h2><span class="subtle">最近 15 秒 · 各曲线独立量程</span></div>
+      <div id="plot-stats" class="subtle">等待实时反馈流 · 绘图独立刷新</div>
+      <canvas id="chart" width="1100" height="450" aria-label="位置、速度、力矩反馈曲线"></canvas>
+    </section>
+    <section id="control-panel" class="panel control-panel" aria-label="电机控制">
+      <div class="section-heading"><h2>电机控制</h2><span id="current-mode" class="subtle">等待模式</span></div>
+      <p id="capabilities" class="subtle">等待驱动能力发现。</p>
+      <div class="motor-actions">
+        <button id="enable" disabled>使能（中性目标）</button>
+        <button id="stop" class="danger" disabled>STOP / 失能</button>
+        <button id="reset" class="secondary" disabled>复位主机故障</button>
+      </div>
+      <h3>控制目标</h3>
+      <p class="subtle target-hint">数值与滑条同步；所有编辑仅修改草稿，点击“应用目标”才发送当前模式的参数。</p>
+      <form id="target-form">
+        <div class="fields">
+          <div>
+            <label for="target-position">位置 / rad</label>
+            <input id="target-position" name="position" type="number" step="any" value="0" aria-describedby="range-position applied-position" required disabled>
+            <input id="slider-position" type="range" step="any" aria-label="目标位置滑条" disabled>
+            <small id="range-position">等待范围</small><small id="applied-position" class="applied">服务目标：--</small>
+          </div>
+          <div>
+            <label for="target-velocity">速度 / rad·s⁻¹</label>
+            <input id="target-velocity" name="velocity" type="number" step="any" value="0" aria-describedby="range-velocity applied-velocity" required disabled>
+            <input id="slider-velocity" type="range" step="any" aria-label="目标速度滑条" disabled>
+            <small id="range-velocity">等待范围</small><small id="applied-velocity" class="applied">服务目标：--</small>
+          </div>
+          <div>
+            <label for="target-kp">Kp / Nm·rad⁻¹</label>
+            <input id="target-kp" name="kp" type="number" step="any" value="0" aria-describedby="range-kp applied-kp" required disabled>
+            <input id="slider-kp" type="range" step="any" aria-label="Kp 滑条" disabled>
+            <small id="range-kp">等待范围</small><small id="applied-kp" class="applied">服务目标：--</small>
+          </div>
+          <div>
+            <label for="target-kd">Kd / Nm·s·rad⁻¹</label>
+            <input id="target-kd" name="kd" type="number" step="any" value="0" aria-describedby="range-kd applied-kd" required disabled>
+            <input id="slider-kd" type="range" step="any" aria-label="Kd 滑条" disabled>
+            <small id="range-kd">等待范围</small><small id="applied-kd" class="applied">服务目标：--</small>
+          </div>
+          <div class="wide-field">
+            <label for="target-torque">前馈力矩 / Nm</label>
+            <input id="target-torque" name="torque" type="number" step="any" value="0" aria-describedby="range-torque applied-torque" required disabled>
+            <input id="slider-torque" type="range" step="any" aria-label="前馈力矩滑条" disabled>
+            <small id="range-torque">等待范围</small><small id="applied-torque" class="applied">服务目标：--</small>
+          </div>
+          <div>
+            <label for="target-velocity_limit">速度上限 / rad·s⁻¹（非负）</label>
+            <input id="target-velocity_limit" name="velocity_limit" type="number" step="any" value="0" required disabled>
+            <input id="slider-velocity_limit" type="range" step="any" aria-label="速度上限滑条" disabled>
+            <small id="range-velocity_limit">等待范围</small><small id="applied-velocity_limit" class="applied">服务目标：--</small>
+          </div>
+          <div>
+            <label for="target-current_ratio">电流比例 / 0～1</label>
+            <input id="target-current_ratio" name="current_ratio" type="number" step="any" value="0" required disabled>
+            <input id="slider-current_ratio" type="range" step="any" aria-label="电流比例滑条" disabled>
+            <small id="range-current_ratio">等待范围</small><small id="applied-current_ratio" class="applied">服务目标：--</small>
+          </div>
+        </div>
+        <div class="actions draft-actions">
+          <button id="fill-position" type="button" class="secondary" disabled>填入当前位置</button>
+          <button id="restore-target" type="button" class="secondary" disabled>恢复服务目标</button>
+        </div>
+        <p id="draft-status" class="subtle" role="status">等待连接后编辑目标。</p>
+        <div class="actions">
+          <button id="apply" type="submit" disabled>应用目标</button>
+          <button id="zero" type="button" class="secondary" disabled>应用零目标</button>
+        </div>
+      </form>
+      <details class="parameter-help">
+        <summary>参数含义与支持范围</summary>
+        <p>MIT 力矩请求 = Kp ×（目标位置 − 反馈位置）+ Kd ×（目标速度 − 反馈速度）+ 前馈力矩。</p>
+        <p>Kp 为位置刚度，Kd 为速度误差增益。Kp=0 时位置目标不起作用；Kp=Kd=0 时仅前馈力矩起作用。正 Kp 配合过小 Kd 可能振荡。</p>
+        <p>范围来自驱动反馈的有效限制，不是建议实验值，也不代表最终输出力矩的硬限幅。请从小幅目标和小增益开始。</p>
+        <p>“填入当前位置”只修改位置草稿，不归零、不使能、不自动设定增益。“应用零目标”清零当前模式各项，不是锁轴或抱闸。</p>
+        <p>模式 1：MIT 五参数；模式 2：位置和非负速度上限；模式 3：有符号速度；模式 4：位置、非负速度上限和 0～1 电流比例。只显示驱动声明支持的模式。</p>
+      </details>
+      <details>
+        <summary>失能配置与参数只读查询</summary>
+        <p class="subtle">配置必须在新鲜、已失能状态下显式提交；不会恢复使能。电机故障清除也允许新鲜、非使能故障反馈，之后仍需单独复位主机故障。操作提交不等于确认，以下显示驱动操作 ID 的最终结果。</p>
+        <label for="mode-select">驱动模式</label>
+        <select id="mode-select" disabled></select>
+        <button id="set-mode" class="secondary" disabled>提交模式切换</button>
+        <div class="actions">
+          <button id="clear-fault" class="secondary" disabled>清除电机故障</button>
+          <button id="device-zero" class="secondary" disabled>设置设备零点</button>
+          <button id="software-zero" class="secondary" disabled>设置软件零点</button>
+          <button id="save-parameters" class="secondary" disabled>保存设备参数</button>
+        </div>
+        <p id="operation-status" class="subtle" role="status">尚无操作。</p>
+        <p class="subtle">参数读取也是维护事务：共享总线的所有轴必须有新鲜、已确认失能反馈。异步拒绝会明确显示，不会因此发送 STOP。</p>
+        <label for="parameter-select">驱动参数（只读）</label>
+        <select id="parameter-select" disabled></select>
+        <button id="read-parameter" class="secondary" disabled>异步读取参数</button>
+        <p id="parameter-value" class="subtle" role="status">等待参数列表。</p>
+        <pre id="driver-targets" class="subtle"></pre>
+      </details>
+      <div id="notice" role="status" aria-live="polite">启动时不自动使能。零目标不等于锁轴或抱闸。</div>
+    </section>
+    </div>
+    <footer>浏览器失联、页面关闭或隐藏会停止本会话输出并请求失能。软件停止不是硬件急停。
+      本服务无登录鉴权，任何能够访问的机器都可以控制，仅用于可信隔离网络。
+      跨网访问请用 VPN 或防火墙限制来源；HTTPS 仅加密，不提供访问控制。浏览器控制权绑定驱动租约，其它 ROS 控制源必须先取得同一驱动的独占租约。</footer>
+  </main>
+</body>
+</html>

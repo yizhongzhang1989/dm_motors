@@ -1,511 +1,611 @@
 # dm_motors
 
-ROS 2 Humble 单个达妙电机控制。第一阶段支持 **MIT 模式**、旧式串口 USB2CAN 和仿真后端。
-控制功能不依赖 dashboard，其他 ROS 节点可以直接使用相同话题和服务。
+ROS 2 Humble / C++17 达妙电机控制工作空间。采用独立 CAN 服务和独立设备节点：
 
-## 结构
+```text
+电机 1 dashboard / CLI ─ motor_1 节点 ─┐
+电机 2 dashboard / CLI ─ motor_2 节点 ─┼─ can_bus 节点 ─ USB2CAN / SocketCAN
+其他设备应用 ─────────── 其他设备节点 ─┘        │
+                                         CAN dashboard
+```
 
-- `dm_motor_interfaces`：带时间戳的 MIT 目标和状态消息。
-- `dm_motor_control`：C++17 协议、传输、安全状态机及 ROS 节点。核心库不依赖 ROS，可复用。
-- `dm_motor_dashboard`：独立 Python HTTP 服务与浏览器界面，只使用 ROS 接口，不直接访问硬件。
-  电机机器运行服务，远程机器只需要浏览器，不需要 ROS 2 或图形桌面。
+**默认仿真、默认失能，启动和打开网页均不自动使能或运动。**
+`can_bus` 是物理设备的唯一所有者，不解释达妙协议；每台电机由独立进程控制。
+以下操作方法对应当前 `src/` 布局，不需要参考旧单电机阶段的启动方式。
 
-协议实现依据原项目 `~/Documents/DM_Motors_ref/DM_CAN_API.md` 中归纳的协议事实，
-没有直接复制厂商 SDK。当前仅针对原项目使用的旧式 USB2CAN；USB2CANFD/libusb、
-SocketCAN、其他控制模式和多电机共享总线管理尚未实现。
+## 目录
 
-## 构建和测试
+- [1. 工作空间与构建](#1-工作空间与构建)
+- [2. 快速启动：双电机仿真与三个面板](#2-快速启动双电机仿真与三个面板)
+- [3. 连接真实双电机](#3-连接真实双电机)
+- [4. Dashboard 操作](#4-dashboard-操作)
+- [5. 命令行控制与参数访问](#5-命令行控制与参数访问)
+- [6. 配置更多电机与总线](#6-配置更多电机与总线)
+- [7. 单独启动各组件](#7-单独启动各组件)
+- [8. ROS 接口与控制模式](#8-ros-接口与控制模式)
+- [9. 故障、保护与恢复](#9-故障保护与恢复)
+- [10. 测试、日志与常见问题](#10-测试日志与常见问题)
 
-在 Ubuntu 22.04 / ROS 2 Humble 环境中：
+## 1. 工作空间与构建
+
+建议环境：Ubuntu 22.04、ROS 2 Humble、colcon。所有命令均在工作空间根目录执行。
+
+```text
+dm_motors/
+├── src/
+│   ├── can_bus/              # 通用帧、硬件收发、路由与客户端管理
+│   ├── can_bus_dashboard/    # 总线监测与独立原始帧调试
+│   ├── dm_motor_interfaces/  # 电机消息、服务和 action
+│   ├── dm_motor_control/     # 每电机控制节点、CLI、协议模拟器和组合 launch
+│   └── dm_motor_dashboard/   # 单电机网页面板，每台可独立启动
+├── build/                   # 自动生成，不提交 Git
+├── install/                 # 自动生成，不提交 Git
+├── log/                     # 自动生成，不提交 Git
+├── DM_CAN_API.md
+└── README.md
+```
+
+首次构建：
 
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/Documents/dm_motors
-# 首次构建且缺少依赖时：
-rosdep install --from-paths . --ignore-src -r -y
+
+# 首次使用、确实缺少依赖时执行：
+# rosdep install --from-paths src --ignore-src -r -y
+
 colcon build --symlink-install
 source install/setup.bash
-colcon test --packages-select dm_motor_control dm_motor_dashboard
-colcon test-result --verbose
 ```
 
-测试包含协议/串口解析/状态机单元测试，以及只使用 `backend=sim` 的 ROS 服务、命令超时、
-非法目标和旧时间戳集成测试；Web 测试验证无登录访问、跨来源拒绝、单会话控制、
-目标应用、输入拒绝、失能和浏览器心跳丢失停机，不需要 `DISPLAY`。
-推流测试检查样本格式、递增序列、180..220 Hz 实测速率及本机回调到客户端 p99<50 ms。
-
-浏览器交互回归测试位于 `dm_motor_dashboard/test/test_dashboard.js`，使用隔离 iframe 与
-模拟 API，不连接 ROS 或真机。可在仓库根目录执行
-`python3 -m http.server 18089 --bind 127.0.0.1`，打开 `http://127.0.0.1:18089/`，
-在浏览器开发者工具控制台运行以下代码；成功时返回检查数，失败时抛出具体断言：
-
-```javascript
-const base = "/dm_motor_dashboard/";
-const [html, source, test] = await Promise.all(
-  ["web/index.html", "web/dashboard.js", "test/test_dashboard.js"]
-    .map(async path => (await fetch(base + path)).text())
-);
-await new Function(test + "\nreturn runDashboardTests;")()(html, source);
-```
-
-测试覆盖草稿/滑条同步、显式发送、当前位置填入、有效范围、服务器拒绝、零目标、
-STOP、只读控制权、反馈过期与断开。测试结束后关闭静态测试服务器；无需安装前端依赖。
-
-## 启动单电机及独立 dashboard
-
-终端 1（默认仿真，不打开串口，不使能实物）：
+**每个新终端都要加载 ROS 和本工作空间：**
 
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/Documents/dm_motors/install/setup.bash
+```
+
+修改 C++、接口或构建配置后需要重新 build；`--symlink-install` 不意味着 C++ 修改会自动生效。
+包已经迁移到 `src/`，旧构建产物已清理并重建；包名和 ROS 接口名称没有改变。
+不要在 `src/` 内运行工作空间构建，也不要在虚拟环境未包含 ROS 依赖时直接启动 Python 节点。
+
+## 2. 快速启动：双电机仿真与三个面板
+
+终端 1：
+
+```bash
+ros2 launch dm_motor_control bus.launch.py dashboards:=true
+```
+
+默认读取 [sim_bus.yaml](src/dm_motor_control/config/sim_bus.yaml)，启动：
+
+| 组件 | 命名空间 / 地址 |
+| --- | --- |
+| 通用 CAN 节点 | `/can/main` |
+| 独立达妙设备模拟器 | `/can/main`，仅仿真需要 |
+| ID 1 电机节点 | `/motor_1` |
+| ID 2 电机节点 | `/motor_2` |
+| CAN dashboard | <http://127.0.0.1:8090/> |
+| ID 1 dashboard | <http://127.0.0.1:8081/> |
+| ID 2 dashboard | <http://127.0.0.1:8082/> |
+
+默认仿真配置中 ID 2 的 `direction=-1.0`；真机配置中两台均为 `1.0`。
+模拟电机和真实电机走同样的 CAN 服务与独立节点边界，但仿真不验证实际负载、电气保护或固件行为。
+
+终端 2 查询状态：
+
+```bash
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 state
+ros2 run dm_motor_control motor_client.py --namespace /motor_2 state
+```
+
+若不需要网页：
+
+```bash
+ros2 launch dm_motor_control bus.launch.py
+```
+
+组合 launch 参数：
+
+| 参数 | 默认值 | 用途 |
+| --- | --- | --- |
+| `config` | 安装包中的 `config/sim_bus.yaml` | 总线和电机 YAML 配置 |
+| `namespace` | 空 | 部署前缀，例如 `robot` |
+| `dashboards` | `false` | 同时启动总线及每台电机面板 |
+| `dashboard_host` | `127.0.0.1` | 组合启动时所有面板的监听地址 |
+| `can_dashboard_port` | `8090` | 第一条总线的面板端口，后续总线依次递增 |
+| `motor_dashboard_base_port` | `8081` | 第一台电机的面板端口，后续电机依次递增 |
+
+例如：
+
+```bash
+ros2 launch dm_motor_control bus.launch.py dashboards:=true namespace:=robot \
+  can_dashboard_port:=9090 motor_dashboard_base_port:=9081
+```
+
+此时接口为 `/robot/can/main`、`/robot/motor_1`、`/robot/motor_2`；
+CLI 的 `--namespace` 也要加上 `/robot`。所有 HTTP 端口必须唯一。
+
+## 3. 连接真实双电机
+
+### 3.1 启动前
+
+确认电源与型号匹配、接线/终端正确、机构与轴周围安全，并具备立即断电或硬件急停措施。
+电机应失能、模式与配置一致，CAN 速率事先匹配。**同一个适配器只能有一个所有者**，
+先停止旧驱动、厂商调试工具或其他占用串口的进程。
+
+查看实际设备路径：
+
+```bash
+ls -l /dev/serial/by-id/
+```
+
+当前现场配置为旧式 USB2CAN、基础 ID 1/2、两台 MST_ID 均为 0、MIT 模式。
+配置见 [dual_serial.yaml](src/dm_motor_control/config/dual_serial.yaml)。
+其中串口路径是本机设备绑定，换适配器后必须修改，不能直接照搬：
+
+```text
+/dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+```
+
+如需调整配置，复制一份后编辑，而不是修改节点源码：
+
+```bash
+cp src/dm_motor_control/config/dual_serial.yaml ./motors.local.yaml
+# 编辑 motors.local.yaml 中的设备路径、ID、模式和现场参数。
+```
+
+### 3.2 启动
+
+使用现有现场配置：
+
+```bash
+ros2 launch dm_motor_control bus.launch.py dashboards:=true \
+  config:="$(ros2 pkg prefix --share dm_motor_control)/config/dual_serial.yaml"
+```
+
+或使用自己的配置：
+
+```bash
+ros2 launch dm_motor_control bus.launch.py dashboards:=true \
+  config:="$PWD/motors.local.yaml"
+```
+
+启动会读回模式、映射及失能状态，配置并独立回读非零硬件通信 watchdog。
+当前默认 `watchdog_timeout=0.2` 秒，对应该协议 `TIMEOUT=4000`，只改 RAM，
+**不保存 Flash、不自动改模式、归零、标定或使能**。模式不匹配时明确报错，不自动迁就。
+
+等待两台 `ready=true`、`feedback_fresh=true`，检查 `status=0` 和故障字段后再操作。
+`simulated` 必须为 `false`；打开网页并不意味着已经使能。
+
+后端能力：
+
+| 后端 | 配置 | 边界 |
+| --- | --- | --- |
+| `sim` | 无物理设备 | 需要设备模拟器；通用 CAN 服务本身不模拟电机 |
+| `serial` | 稳定串口路径 | 旧 USB2CAN，921600/8N1；标准经典 CAN、通道 0，4 字节兼容填充到 8 字节 |
+| `socketcan` | 如 `port: can0` | 接口须由系统预先配置；支持相应经典 CAN/FD 能力 |
+
+`can_bitrate` 记录配置并用于相关校验，**不会自动设置适配器、系统接口或电机速率**。
+CAN-FD 的仲裁域、数据域及固件兼容性需独立确认。厂商原生 `dmcan` USB2CANFD 后端尚未接入。
+
+## 4. Dashboard 操作
+
+### 4.1 每台电机面板
+
+1. 打开对应页面，核对电机 ID、HARDWARE/SIMULATION、状态和反馈新鲜度。
+2. 页面会尝试申请该电机控制权；已有其他客户端持有时只能只读。
+3. 点击“使能（中性目标）”，等待 **ENABLED**。
+4. 编辑当前模式字段；输入、滑条及“填入当前位置”只改草稿，点击“应用目标”才发送。
+5. 点击 **STOP / 失能**，以新鲜状态反馈确认失能。
+
+使能清空旧目标，不恢复此前草稿。MIT 中 `Kp=Kd=前馈力矩=0` 是中性输出，
+**不是锁轴或抱闸**；重力负载可能运动。Kp/Kd 本身也产生力矩，前馈力矩范围不是总输出硬限矩。
+“填入当前位置”不设置零点，也不会自动添加保持增益。
+
+页面显示位置、速度、反馈力矩、双温度、状态码/描述、主机与设备故障、
+请求/活动目标、控制权及周期统计。曲线采用独立 SSE 推流；时间是主机接收时间，不是电机内部采样时间。
+
+两个面板各持有自己的租约，主动 STOP 一台不会改写另一台目标。
+浏览器关闭、隐藏、断开或心跳丢失时，会停止该页面输出并请求失能；
+返回后需要重新连接，**不会自动恢复运动**。需要同时可见时使用两个窗口。
+不要同时让 CLI 和网页争用同一电机；使用 CLI 前先在该电机网页点击“断开”。
+
+设备 clear、主机 reset、模式切换、零点和保存位于维护区。
+除明确的故障恢复条件外，维护要求失能、新鲜反馈且无活动任务；
+寄存器事务还要求同总线客户端全部 quiet。界面暂时禁用操作时先等待维护窗口释放。
+
+### 4.2 CAN 面板与独立调试
+
+面板展示后端/设备、精确 epoch、实际收发计数与速率、队列、客户端、维护和错误，
+并提供按 CAN ID/方向过滤的有界帧记录：
+
+- `rx`：实际接收观测。
+- `written`：后端成功写入观测；**不是 CAN ACK 或设备执行成功**。
+- `submitted`：该 dashboard 提交了调试请求，尚不代表总线接受或写出。
+
+默认只监测，不注册调试客户端、不发送帧。手动调试须明确确认风险、申请确切路由，
+填写一次发送的数据；活动调试还需提供该设备真实有效的不透明 STOP 帧。
+发送不自动循环、不扫描设备、不重放历史流量，也不解释达妙协议。
+不能抢占已有电机路由，不能绕过维护锁；原始帧可能改参或运动，不能把它当作随意试发工具。
+
+释放调试会话后停止续租，由约 0.3 秒 broker 租约到期清队列并尝试 STOP，
+不是立即物理停机。完整字段、HTTP API 和后端限制见
+[CAN dashboard 说明](src/can_bus_dashboard/README.md)。
+
+### 4.3 网络访问
+
+**两个 dashboard 均无登录鉴权，HTTP 不加密。** 只部署在本机或可信隔离网络，
+不要直接暴露公网；控制租约只负责仲裁，不是网络访问鉴权。
+组合启动默认监听 `127.0.0.1`。需要其他机器访问时，指定本机实际地址：
+
+```bash
+ros2 launch dm_motor_control bus.launch.py dashboards:=true \
+  dashboard_host:=192.168.1.10
+```
+
+将示例 IP 换成本机地址，并通过该地址访问。CAN dashboard 校验 Host；
+`0.0.0.0` 通配监听不等于允许任意 Host，优先绑定明确地址。
+防火墙、VPN、路由由现场管理，程序不自动调整网络安全策略。
+
+## 5. 命令行控制与参数访问
+
+以下例子以 `/motor_1` 为例；操作第二台时改为 `/motor_2`。
+CLI 会在需要时申请并独立续租，结束后释放控制权并请求 STOP。
+同一电机已有网页或其他控制源持有租约时会明确拒绝，不强制夺权。
+
+### 5.1 只读查询
+
+```bash
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 info
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 state
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 read \
+  ESC_ID CTRL_MODE TIMEOUT PMAX VMAX TMAX VBus p_m xout
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 export > motor_1_parameters.json
+```
+
+`state` 可在运动时读取；`read/export` 是寄存器维护事务，要求全总线 quiet。
+`export` 是逐项读取快照，不是同时刻原子快照，也不保存 Flash。
+部分固件的扩展寄存器可能返回 0；本机 ID 2 的 `VBus/Tpcb/Tmtr` 曾返回 0，
+不能据此认定实际电压/温度为零，也不能用它覆盖普通温度反馈。
+
+### 5.2 任务示例：先用仿真
+
+以下有运动输出，默认仿真配置可用于学习：
+
+```bash
+# MIT 小幅定位，绝对位置以当前坐标为准
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 run move \
+  --position 0.03 --kp 40 --kd 1 --duration 6 --settling-time 2 \
+  --max-velocity 0.1 --max-acceleration 0.2 --tolerance 0.008
+
+# MIT 阻尼型速度任务：Kp=0，Kd>0，由客户端按任务类型填写
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 run velocity \
+  --velocity 0.05 --kd 1 --duration 2 --max-velocity 0.1 \
+  --max-acceleration 1 --ramp-time 0.2
+
+# 限时纯前馈力矩，Kp=Kd=0
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 run torque \
+  --torque 0.1 --duration 1 --ramp-time 0.2
+```
+
+可用任务：`move`、`velocity`、`torque`、`hold`、`sine`、`ramp`、`trajectory`。
+所有任务有时限；正常结束和取消都请求失能，当前不提供结束后永久保持使能的选项。
+位置任务须与当前模式兼容，MIT 位置任务需要正 Kp。速度/力矩任务需要正 `ramp_time`。
+分段轨迹使用 `--times` / `--positions`，2..256 点，首时间为 0、首位置接近当前反馈；
+各段采用静止端点五次插值，需满足总时限和速度/加速度约束。
+SINE 定义为 `base + amplitude × (1−cos(2πft))/2`，从 base 静止开始。
+任务参考限速不等于实际速度硬限制。
+
+### 5.3 真机命令的额外确认
+
+CLI 对真机运动要求 `--allow-hardware-motion`，对维护要求 `--allow-hardware-maintenance`，
+均放在子命令之前。它们只是防误操作确认，不替代现场安全批准。
+
+真机运动前先查 `state`，根据**当时当前位置**决定目标，不直接照搬上面的绝对位置。
+例如，经现场确认后：
+
+```bash
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 \
+  --allow-hardware-motion run move --position <确认后的绝对目标位置> \
+  --kp 40 --kd 1 --duration 6 --settling-time 2 \
+  --max-velocity 0.1 --max-acceleration 0.2 --tolerance 0.008
+```
+
+`<确认后的绝对目标位置>` 是说明占位符，必须替换为实际数值后才能执行。
+Kp=40、Kd=1 是本机小行程测试参数，不是所有机构、负载通用的推荐增益。
+
+### 5.4 STOP 与维护
+
+STOP 不需要持有租约，也不需要硬件确认 flag：
+
+```bash
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 stop
+ros2 run dm_motor_control motor_client.py --namespace /motor_2 stop
+```
+
+下面是维护命令语法，**不是每次启动必须执行的步骤**：
+
+```bash
+# 清除设备保护错误；成功后仍失能
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 --allow-hardware-maintenance clear
+
+# 仅在存在独立主机锁定、反馈新鲜且设备已失能时使用
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 --allow-hardware-maintenance reset
+
+# 切模式或改内部增益：仅在理解型号参数、已失能且全总线 quiet 时操作
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 --allow-hardware-maintenance mode 2
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 --allow-hardware-maintenance write KP_ASR 2.0
+
+# 软件零点仅改变主机关节坐标；--device 才是设备归零
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 --allow-hardware-maintenance zero
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 --allow-hardware-maintenance zero --device
+
+# 显式保存全部 RAM 参数，不只保存最近一项
+ros2 run dm_motor_control motor_client.py --namespace /motor_1 --allow-hardware-maintenance save
+```
+
+改模式后再启动时，配置的 `mode` 也必须匹配；未保存的设备参数可能在断电后恢复。
+Flash 保存有寿命限制，不要周期执行，ACK 也不等于已经验证掉电持久化。
+不开放任意写 ID、速率、映射、只读或未公开寄存器；`info` 中
+`writable` 是固件 RW 权限，`raw_write_allowed` 才表示普通写接口是否开放。
+
+## 6. 配置更多电机与总线
+
+从 [sim_bus.yaml](src/dm_motor_control/config/sim_bus.yaml) 或
+[dual_serial.yaml](src/dm_motor_control/config/dual_serial.yaml) 复制配置。
+根结构是 `/**: ros__parameters:`，保留 `bus_names`、`motor_names`、`buses`、`motors`。
+
+```yaml
+/**:
+  ros__parameters:
+    control_rate: 200.0
+    state_rate: 200.0
+    bus_names: [main]
+    motor_names: [motor_1, motor_2, motor_3]
+    buses:
+      main:
+        backend: sim
+        port: ""
+        can_fd: false
+        can_bitrate: 1000000
+    motors:
+      motor_1: {bus: main, motor_id: 1, master_id: 0, mode: 1}
+      motor_2: {bus: main, motor_id: 2, master_id: 0, mode: 1}
+      motor_3: {bus: main, motor_id: 3, master_id: 0, mode: 1}
+```
+
+- 电机名称形成 ROS 命名空间；HTTP 电机端口按 `motor_names` 顺序递增。
+- 同一总线基础 ID 必须唯一，当前达妙 profile 使用 1..15。不同总线可重复 ID。
+- 同一物理设备/接口不能声明成多个所有者；增加电机不等于增加 USB 所有者。
+- `master_id` 必须与设备真实反馈地址一致，不自动按电机 ID 推导。
+- 当前 profile 为 `j4310_v11` / `j4310_v12`；不能将所有达妙型号自动当作兼容。
+- 增加第二条总线时，在 `bus_names/buses` 声明，并通过每台 `bus` 绑定。
+  只启动通用总线而无电机时，使用下一节的独立总线 launch。
+- 注册和发送受总线预算、路由及队列约束；配置 1000 Hz 不代表多设备实际达到 1000 Hz。
+
+常用每轴参数：
+
+| 参数 | 默认 / 语义 |
+| --- | --- |
+| `mode` | 1；启动时要求与设备一致 |
+| `direction` / `software_offset` | `1.0` / `0.0`；目标和反馈双向坐标变换 |
+| `command_timeout` / `feedback_timeout` | `0.25` / `0.1` 秒 |
+| `watchdog_timeout` | `0.2` 秒，写入后回读，不自动保存 |
+| `position_limit/velocity_limit/torque_limit` | 0 表示跟随映射；命令范围，不是物理硬限幅 |
+| `kp_limit/kd_limit` | 500 / 5，受协议范围限制 |
+| `host_protection_enabled` | false；额外主机物理阈值仅显式开启后实施 |
+| `measured_velocity_limit/measured_torque_limit` | 默认 0，未额外设置阈值 |
+| `estimated_torque_limit` | 默认 0；可选合成 MIT 请求估算限制 |
+| `mos_temperature_stop/rotor_temperature_stop` | 默认 0；可选主机温度阈值 |
+| `position_min/position_max` | 可选非对称关节边界；无显式设置时按映射/偏置解析 |
+| `fault_group` | 空；独立轴，不因另一台设备保护错误联动 |
+| `legacy_control` | false；新部署使用 tokenized 接口 |
+
+配置是启动配置；模式、零点、参数和任务通过专门接口修改。
+不支持无实际生效的 `ros2 param set`，其余配置需失能后修改 YAML 并重启。
+[dual_serial_test.yaml](src/dm_motor_control/config/dual_serial_test.yaml) 是历史显式保护测试配置，
+不是默认真机操作配置。
+
+## 7. 单独启动各组件
+
+### 7.1 只启动 CAN 服务
+
+```bash
+# 无硬件的通用模拟线缆；不会自动生成设备反馈
+ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=sim
+
+# 或：独立打开真实适配器；不能与组合 launch 重复占用
+ros2 launch can_bus can_bus.launch.py namespace:=can/main \
+  backend:=serial port:=/dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+```
+
+总线 launch 参数为 `namespace/backend/port/can_fd/can_bitrate`。
+仅启动模拟 CAN 服务时还需要独立设备模拟器；入门优先使用组合仿真。
+
+### 7.2 电机节点连接已有总线
+
+在已运行 `/can/main` 的情况下：
+
+```bash
+ros2 launch dm_motor_control motor.launch.py motor_id:=1 master_id:=0 \
+  start_can_bus:=false can_bus_namespace:=/can/main
+
+ros2 launch dm_motor_control motor.launch.py motor_id:=2 master_id:=0 \
+  start_can_bus:=false can_bus_namespace:=/can/main
+```
+
+**必须设置 `start_can_bus:=false`**，否则单电机 launch 默认还会启动自己的总线服务。
+直接运行 `motor_node` 也只连接已有 CAN 服务，不创建适配器：
+
+```bash
+ros2 run dm_motor_control motor_node --ros-args \
+  -r __ns:=/motor_2 -p motor_name:=motor_2 -p motor_id:=2 \
+  -p master_id:=0 -p can_bus_namespace:=/can/main
+```
+
+需要完整单电机仿真时：
+
+```bash
 ros2 launch dm_motor_control motor.launch.py motor_id:=1 backend:=sim
 ```
 
-终端 2（同样运行在电机机器上，不需要 DISPLAY）：
+其默认 CAN 命名空间是 `/motor_1/can`，**不是**组合启动的 `/can/main`。
+
+### 7.3 单独启动面板
+
+不需要重新启动已经运行的总线或电机：
+
+```bash
+ros2 launch can_bus_dashboard dashboard.launch.py \
+  bus_namespace:=/can/main host:=127.0.0.1 port:=8090
+
+ros2 launch dm_motor_dashboard dashboard.launch.py \
+  motor_id:=1 namespace:=/motor_1 host:=127.0.0.1 port:=8081 command_timeout:=0.25
+
+ros2 launch dm_motor_dashboard dashboard.launch.py \
+  motor_id:=2 namespace:=/motor_2 host:=127.0.0.1 port:=8082 command_timeout:=0.25
+```
+
+电机面板的 `command_timeout` 必须与对应驱动一致。**单独的电机面板 launch**
+历史默认是 `host=0.0.0.0、port=8080`，因此上例显式指定本机地址及不同端口；
+不要与组合启动重复启动同端口面板。
+
+## 8. ROS 接口与控制模式
+
+以 `/motor_1` 为例，类型均位于 `dm_motor_interfaces`：
+
+| 相对接口 | 类型 | 含义 |
+| --- | --- | --- |
+| `state` | `msg/MotorState` | 反馈、阶段、模式、故障、控制权、时序和范围 |
+| `setpoint` | `msg/MotorSetpoint` | 带 token/序号/时间戳/有效期的持续目标 |
+| `control_lease` | `srv/ControlLease` | acquire / renew / release，0.3..5 秒租约 |
+| `operation` | `srv/MotorOperation` | 使能、失能、主机复位、设备清错、模式、零点、保存 |
+| `registers` | `srv/RegisterAccess` | 每批 1..16 项原始 uint32/binary32 参数事务 |
+| `get_operation` | `srv/GetOperation` | PENDING / CONFIRMED / REJECTED / UNKNOWN |
+| `get_capabilities` | `srv/GetCapabilities` | profile、后端、模式、49 项寄存器元数据 |
+| `run_task` | `action/RunTask` | 有界任务、反馈、取消和结果 |
+| `joint_states` / `diagnostics` | 标准 ROS 消息 | 每台电机自己的关节状态和诊断 |
+
+`MotorTarget` 按模式区分字段，不适用字段必须为零：
+
+| 模式 | 字段 | 单位 / 说明 |
+| --- | --- | --- |
+| 1 MIT | position、velocity、kp、kd、torque | rad、rad/s、Nm/rad、Nm·s/rad、Nm |
+| 2 位置速度 | position、velocity_limit | rad、rad/s；速度字段为非负上限幅值 |
+| 3 速度 | velocity | rad/s，允许正负 |
+| 4 力位混控 | position、velocity_limit、current_ratio | 电流比例 0..1，不是直接给定 Nm |
+
+持续目标必须晚于本次使能，时间戳/序号递增；
+`valid_for` 在 `(0, command_timeout]`，其剩余有效期到期也会 STOP。
+续租不能代替新鲜运动目标，内部任务生成目标也不能代替客户端续租。
+先等待使能确认再发布目标；命令 QoS 为 best-effort、volatile、keep-last=1。
+状态 QoS 为 reliable、volatile、keep-last=1。无效输入会明确报错，不静默截断。
+
+服务成功可能只表示已接受/发送。`operation_id` 非零时必须查异步终态，
+ID 为 0 的使能/失能以状态反馈确认。参数批次有序但非原子，超时不证明写入未发生；
+UNKNOWN 不盲目重试，不用旧缓存假装本次成功。
+旧 `command/enable/reset` 接口仍存在，但默认关闭无 token 使能；
+`legacy_control=true` 仅供迁移旧客户端，不能绕过已有明确租约。
+
+电机数据路径为：目标 → 电机节点校验/编码 → `CanTransport` →
+`can_bus/TxFrame` → 总线仲裁 → 后端写入；反馈反向解码发布。
+通用总线的注册、过滤器、心跳、epoch、维护及帧接口详见
+[can_bus 说明](src/can_bus/README.md)；其他设备应新建设备协议节点，不修改总线服务。
+
+## 9. 故障、保护与恢复
+
+### 9.1 保护职责
+
+默认 `host_protection_enabled=false`，电机固件负责物理保护。
+主机不重复实施额外测量力矩/速度/温度或合成力矩阈值，但保留：
+
+- 协议合法性和显式命令范围检查；
+- 独占控制权、目标有效期、通信失联及进程失效 STOP；
+- 显式使能、固件通信 watchdog 和不恢复旧目标。
+
+这些不替代硬件急停，也不代表断链时失能帧一定到达。
+PMAX/VMAX/TMAX 是编码映射，不是机械行程、额定性能或认证硬限矩。
+需要机构专用主机保护时才显式开启并配置相应阈值。
+
+### 9.2 设备故障与主机故障
+
+| 情况 | 处理 |
+| --- | --- |
+| `device_fault=true` | 查看原始 `status/status_text`，先排除设备原因，再执行 `clear` |
+| 设备 clear 得到新鲜 status=0 | 恢复 DISABLED；无独立主机错误时不再要求 reset，不自动使能 |
+| `host_fault=true` | 排查通信、无效目标、发布超时等；新鲜失能反馈后显式 `reset` |
+| 两类错误同时存在 | clear 不抹去独立主机错误，仍需对应恢复 |
+| 非空故障组锁定 / 总线会话失效 | 见下一节，不能仅靠单轴 reset 绕过 |
+
+设备保护出现后丢弃旧目标、发送一次 STOP 完成 CAN 活动结束握手，随后查询/报告状态；
+真正主机故障仍有 STOP 重试。未知状态码保留并报告，不当作正常状态。
+不要用重启、clear 或取消 watchdog 掩盖未排除的实际问题。
+
+### 9.3 总线失联、故障组与停机顺序
+
+空 `fault_group` 下单轴主动 STOP、设备错误或独立节点退出不改写其他轴目标。
+USB 断开、CAN 服务故障等共享资源异常仍可能影响全部设备。
+非空同名故障组使用保守分布式锁停，当前清除需重启 CAN 服务及该总线全部客户端。
+总线 epoch 变化后，旧客户端不会自动恢复会话、租约或运动。
+
+正常关闭建议：
+
+1. 分别请求两台 STOP，检查 `status=0`、反馈新鲜；正常阶段应为 DISABLED。
+2. 在网页断开控制会话，或退出任务客户端。
+3. 对组合 launch 按 `Ctrl+C`；分开启动时先停电机客户端，再停 CAN 服务。
+
+不能将 `Ctrl+C` 当成硬件急停；节点退出时会尽力 STOP，但硬件/通信失效可能无法确认。
+清理 `build/install/log`、移动源码或重新部署前，必须先停止依赖它们的运行进程。
+
+## 10. 测试、日志与常见问题
+
+### 软件验证
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/Documents/dm_motors/install/setup.bash
-ros2 launch dm_motor_dashboard dashboard.launch.py motor_id:=1 host:=0.0.0.0 port:=8080
+source install/setup.bash
+colcon test --packages-select can_bus can_bus_dashboard dm_motor_control dm_motor_dashboard
+colcon test-result --verbose
 ```
 
-两个 launch 的 `motor_id` 必须一致，范围为 1..15，命名空间为 `/motor_<ID>`。
-本机打开 `http://127.0.0.1:8080/`，其它机器打开 `http://<电机机器IP>:8080/`。
-当前这台机器的局域网 IP 是 `10.172.100.43`，因此可访问 `http://10.172.100.43:8080/`；
-IP 可能改变，请以 `ip -4 address` 查询为准。需网络路由和防火墙允许该 TCP 端口，
-程序不会自动修改防火墙。多个 dashboard 服务应使用不同端口。
+当前源码迁移后的完整回归记录为 **111 tests，0 errors，0 failures**。
+自动测试采用独立 ROS domain 和模拟后端，不打开真机、不自动进行实物运动。
+涵盖协议、参数事务、路由冲突、第三种 CAN-FD 设备、进程退出/重启、
+独立控制、故障注入/清除、dashboard API 和推流。
 
-**不需要令牌或登录。** 打开页面后会自动连接并尝试获取控制权，仍需用户显式使能才会输出。
-控制会话由页面自动维护，只用于区分同时打开的页面，不是访问鉴权。
-服务默认监听 `0.0.0.0`；只允许本机访问时设置 `host:=127.0.0.1`。
-
-**任何能够访问服务的机器都可以读取状态、获取空闲控制权和请求 STOP。**
-本服务无访问鉴权，HTTP 也不加密控制数据，只应部署在可信隔离网络，不要直接暴露公网。
-跨网访问请用 VPN 或防火墙限制来源；HTTPS 只能加密，不能替代访问控制。
-反向代理需保留原始 Host，与浏览器 Origin 一致；跨来源浏览器控制请求仍会拒绝。
-
-Dashboard 显示反馈、温度、周期统计和最近 15 秒曲线。操作步骤：
-
-顶部状态栏集中显示电机阶段、位置/速度/力矩、温度和通信统计；
-下方桌面布局为左右两列，左侧反馈曲线、右侧使能/失能及 MIT 目标控制，窄屏改为上下排列。
-
-1. 打开页面，等待自动连接并获取控制权，确认显示 `SIMULATION / DISABLED` 和新鲜反馈。
-2. 点击“使能（零目标）”，等待 **ENABLED**。使能永远清空旧目标。
-3. 用数值输入或同步滑条编辑 MIT 五个目标字段，点击“应用目标”一次发送全部五项；
-   输入框、滑条、“填入当前位置”和“恢复服务目标”都只修改草稿，不发送命令。
-4. 点击 `STOP / 失能`，等待 **DISABLED**；“断开”也会清空目标、释放控制权并请求失能。
-5. **FAULT** 时先排除原因并确认反馈为失能，再“复位主机故障”。复位不自动使能，
-   也不发送电机清错命令。
-
-每项参数下方显示驱动给出的有效范围及服务当前接受的目标；草稿有差异时高亮并计数。
-服务目标来自状态轮询，不是实测反馈，也不是电机已执行的确认；断开后标为不可用。
-无控制权、反馈过期或请求处理中不能编辑。失能时可准备草稿，但使能仍会清零所有旧目标；
-停机或控制权丢失时清空草稿。重新连接不会自动发送草稿。
-“填入当前位置”只填位置，不改变坐标零点、不设置 Kp/Kd，也不自动保持位置。
-超出允许位置范围时明确提示，不截断输入。手动输入超范围同样保留原值，由表单拒绝提交。
-
-### 参考 dashboard 参数梳理与本次优化范围
-
-参考工程 `~/Documents/DM_Motors_ref/dev` 包含多种独立实验面板，不是同一个驱动的统一配置：
-
-| 参考面板 | 可设置参数 / 功能 | 当前单电机面板 |
-| --- | --- | --- |
-| MIT_control | 模式 1..4；位置、速度、Kp、Kd、前馈力矩、速度上限、电流比例限幅；当前位置填入、设备归零 | 五项 MIT 目标、同步滑条、当前位置填入；其余未接入 |
-| lead_follow | 主从角色、方向、控制频率、从电机 Kp/Kd、可选目标变化速度/行程/反馈速度/力矩/温度保护 | 需要双电机控制器，未接入 |
-| bilateral_control / bilateral_control_simple | 频率、方向、耦合刚度或 Kp/Kd、本地阻尼、力矩估算/反馈阈值、行程、反馈年龄/配对时差、失联期限、增益恢复时间、watchdog、温度预警/停止阈值（各面板不同） | 需要双边控制器，未接入 |
-| friction_compensation | 基线/补偿/保持/起动扫描/脉冲/恒速/往复/辨识模式；运动与保护参数、软件 PD/PI、库仑/黏性摩擦、补偿比例、零速死区、方向平滑、滤波、命令变化率 | 需要专用辨识和补偿控制器，未接入 |
-| dual_motor_simulate | 主从/双边模式及参数、仿真摩擦/噪声/偏置等物理参数 | 仅参考，不作为真机功能 |
-
-本次保持单电机 MIT 与显式应用语义，没有照搬参考面板“使能后拖动滑条立即发送”的行为。
-参数说明可在控制区展开：MIT 请求为
-`Kp × (目标位置 − 反馈位置) + Kd × (目标速度 − 反馈速度) + 前馈力矩`。
-五项输入范围不等于该组合输出的硬限矩；Kp 为零时位置目标不起作用，正 Kp 配合过小 Kd
-可能振荡。当前模式只显示 MIT，不提供尚无驱动支持的模式切换或设备归零按钮。
-
-曲线通过 `/api/stream` 的 SSE 长连接接收反馈，不再等待约 10 Hz 的 HTTP 状态轮询。
-默认 ROS 状态与电机控制同为 200 Hz；绘图使用 `requestAnimationFrame`，在普通 60 Hz
-屏幕上目标为 60 FPS，采样与绘图相互独立。页面显示实测推流 Hz、绘图 FPS 和跳过的推流样本数。
-曲线按 Web 服务的单调时钟回调时间排列，用固定容量环形缓存保存约 15 秒数据；
-同一屏幕像素内保留最小/最大峰值，避免大量绘图调用和反复分配 Canvas。
-服务只保存最新待发送样本，慢客户端不积压应用层队列；推流断开会停止本页面控制会话，
-不会自动重连后恢复输出。经过反向代理时必须禁用 SSE 缓冲（如 Nginx `proxy_buffering off`）。
-控制权、故障状态和按钮信息仍以约 10 Hz 单独更新，不限制曲线刷新率。
-时间戳是 Web 节点接收 ROS 状态的主机时间，不是电机内部采样时间；网络和系统调度仍会影响延迟。
-浏览器后台标签页、不可见的 VS Code 内置浏览器容器可能主动节流绘图；
-需要高帧率时请在前台 Chrome/Edge 等浏览器中打开页面，以页面实测 FPS 为准。
-
-2026-10-14 满 15 秒窗口验证：独立 Chromium 上，仿真运动曲线约 200.04 Hz / 59.95 FPS，
-单次绘制平均约 0.535 ms；ID 1 真机只读观察约 200.25 Hz / 59.89 FPS，
-单次绘制平均约 0.555 ms。真机有效反馈实测约 200.00 帧/秒，
-Web 回调到本机 SSE 客户端的 p99 延迟约 2.55 ms。测试期间未对真机发送运动目标，
-这些结果不是硬实时保证，也不代表跨网延迟或电机内部采样延迟。
-
-同一 Web 服务只允许一个浏览器控制会话；其它浏览器可只读查看和请求 STOP，
-不能覆盖已有会话的目标。浏览器每 150 ms 发心跳，默认 `client_timeout:=0.75` 秒；
-超时后服务停止 ROS 目标发布、请求失能并释放控制权。迟到的旧会话不能恢复输出。
-页面关闭、刷新或切换到后台会尽力主动释放并停止；请求送不到时由服务器会话超时兜底。
-返回页面后需要重新连接、显式使能，不自动恢复旧目标。
-Web 服务进程本身退出/卡住时，C++ 节点的命令超时和固件通信看门狗仍然有效。
-网页只控制已 launch 的驱动，不负责远程启动/停止驱动进程。
-
-零目标为 `Kp=Kd=前馈力矩=0`，不是锁轴、抱闸或位置保持；外部负载仍可能运动。
-MIT 对称映射的零点有量化误差，不能保证物理力矩严格为零。
-
-### 接入实物（需现场确认）
-
-先独立确认电源、接线、终端电阻、机械空间和急停措施。电机必须已配置成 MIT，
-处于失能且无故障状态。电机 ID 和反馈 MST_ID 必须与 launch 参数一致；默认 MST_ID=0，
-不是自动推导为电机 ID 加某个偏移。
-
-```bash
-ros2 launch dm_motor_control motor.launch.py \
-  motor_id:=1 master_id:=0 backend:=serial \
-  port:=/dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
-```
-
-驱动使用串口 921600、8N1；适配器和电机的 CAN 速率必须事先匹配，驱动不自动改速率。
-如果串口报 `Permission denied`，可在本机终端执行
-`sudo setfacl -m "u:$(id -un):rw" /dev/ttyACM0`，仅授权当前设备；拔插后通常需要重新授权。
-请先核对实际设备路径，不要将所有串口改成全局可写。
-启动会逐台读取并验证 MST_ID、MIT 模式、PMAX/VMAX/TMAX，确认失能反馈，然后配置并回读
-电机 `TIMEOUT=4000`（50 µs/计数，即 200 ms），**不保存 Flash、不修改模式、不自动使能**。
-若发现已使能的 MIT 电机，会尝试失能并报错退出；其他启动校验失败直接报错退出。
-配置失败的结果可能未知，不能假定写入未发生。
-
-不要运行原脚本或其他程序同时占用串口。当前一个串口只能由一个控制节点管理：
-不能为同一个适配器启动多个单电机节点。未来多电机应由共享总线驱动统一调度，
-而不是多个节点争抢同一设备。
-
-默认不施加额外保守参数限幅：位置、速度、前馈力矩使用电机实际
-`[-PMAX, PMAX] / [-VMAX, VMAX] / [-TMAX, TMAX]`，
-Kp 使用 `[0, 500]`，Kd 使用 `[0, 5]`。当前 ID 1 真机对应
-位置 ±12.5 rad、速度 ±50 rad/s、前馈力矩 ±10 Nm。
-位置控制允许 Kd=0（或小到量化为零），dashboard 会提示可能振荡，但不阻止应用目标。
-
-如以后连接负载，可显式设置
-`position_limit / velocity_limit / torque_limit / kp_limit / kd_limit`。
-前三项默认 `0` 表示跟随实际电机映射，Kp/Kd 上限默认 `500 / 5`；
-非零位置/速度/力矩限值必须不超过实际映射，不能用更大的值突破协议范围。
-状态消息和 dashboard 展示的是解析后的实际允许范围，而不是 `0` 占位值。
-NaN/Inf、协议越界，以及编码后前七字节全为 FF、与特殊操作帧前缀冲突的目标仍会拒绝，
-避免运动目标误变成使能、失能、归零或清错命令。
-
-通信超时停机、反馈故障失能和显式使能/复位机制保持不变；不关闭电机固件保护。
-这些是**命令参数范围**，并不保证实际行程、速度或总输出力矩在范围内：
-MIT 的 Kp/Kd 项也产生力矩，必须结合机构风险配置固件保护和外部硬件。
-
-## 可复用 ROS 接口
-
-以 ID 1 为例：
-
-| 接口 | 类型 | 语义 |
-|---|---|---|
-| `/motor_1/command` | `dm_motor_interfaces/msg/MotorCommand` | 持续发布 MIT 目标；rad、rad/s、Nm/rad、Nm·s/rad、Nm |
-| `/motor_1/state` | `dm_motor_interfaces/msg/MotorState` | 默认 200 Hz 状态，原始故障码、反馈新鲜度、计数、安全阶段、限值和周期统计 |
-| `/motor_1/enable` | `std_srvs/srv/SetBool` | true 请求使能；false 请求失能 |
-| `/motor_1/reset` | `std_srvs/srv/Trigger` | 仅清除主机停机锁定，要求当前失能且反馈新鲜 |
-
-`enable.success=true` **仅代表请求已发送，不代表电机已确认**。
-最终结果以 `state.phase` 和 `state.status` 为准。使能/失能确认超时会锁定故障。
-其他客户端应先等待确认使能，再用当前 ROS 时钟填充 `header.stamp` 并持续发布。
-目标必须时间戳严格递增、晚于本次使能，年龄不能超过 `command_timeout`，
-未来偏差不能超过 50 ms。无效输入会报告错误并锁定停机，不静默截断。
-
-命令 QoS：best-effort、volatile、keep-last=1，避免运动目标积压或重放；状态 QoS：
-reliable、volatile、keep-last=1。每台电机**只允许一个命令发布者/操作客户端**，
-Web 服务内部有单会话租约，但电机驱动不仲裁其它 ROS 发布者，
-不能同时运行 Web dashboard 和另一个 ROS 控制源。
+### 运行观测
 
 ```bash
 ros2 topic echo /motor_1/state
-ros2 service call /motor_1/enable std_srvs/srv/SetBool '{data: false}'
-ros2 service call /motor_1/reset std_srvs/srv/Trigger '{}'
+ros2 topic echo /motor_2/state
+ros2 topic echo /can/main/status
+ros2 bag record /motor_1/state /motor_2/state \
+  /motor_1/joint_states /motor_2/joint_states /can/main/status
 ```
 
-## 时序与安全边界
+`feedback_rate` 是有效反馈统计；`period_p50_ms/period_p95_ms/period_p99_ms` 来自近期控制周期，
+最大周期/遗漏计数为累计值。普通 Linux、USB 和 DDS 不是硬实时系统。
+寄存器维护期间其他失能节点的反馈可能暂时过期；必须如实显示，不能伪造为新鲜状态。
 
-- 默认 C++ 控制循环 **200 Hz**，Web 服务在控制会话有效时发布目标 20 Hz，
-  ROS 状态和浏览器反馈推流默认 200 Hz，绘图独立按浏览器屏幕刷新率运行（通常 60 FPS）。
-  `state_rate:=0` 默认跟随 `control_rate`；可显式设置 `1..control_rate` Hz 降低 ROS 状态频率，
-  不改变电机控制周期。HTTP/SSE 不参与电机的 200 Hz 控制循环。
-  `control_rate` 可设为 20..1000 Hz；提高设置频率不代表硬件实际达到该频率。
-- 安全计时用 `steady_clock`，不受 ROS 仿真时钟停顿或系统时间跳变影响。
-  默认 `command_timeout=0.25 s`、`feedback_timeout=0.1 s`；服务不在使能中执行阻塞寄存器事务。
-- 反馈仅统计匹配 CAN ID / 电机 ID 的有效帧；USB 接收时间是主机时间，
-  不是电机内部采样时间。`feedback_age=-1` 表示从未收到反馈。
-- 反馈断链、故障码、无效命令、命令发布者超时或控制循环严重停顿均进入锁定停机，
-  清空目标、尝试失能；不自动重使能。串口发送等待有 5 ms 上限。
-- 软件不能保证断链时失能帧送达。需电机固件看门狗和硬件急停；
-  主机失能/关闭确认不等同于安全等级认证。
-- 串口是非阻塞读、有界接收解析；C++ 控制与 dashboard 在不同进程。
-  当前仍有 ROS executor、动态分配、普通 Linux 调度和 USB 延迟，**不是硬实时系统**。
-- `period_ms`、`max_period_ms` 是控制回调开始间隔；`deadline_misses` 计数
-  `>1.5 × 设定周期` 的间隔，最大值/计数从启动累计，不是电机侧时延。
-  应先在目标负载下采样 p99/最大值，再评估 PREEMPT_RT、独立 I/O 线程、
-  内存预分配及 SocketCAN/原生 CAN 等后续优化。
+### 常见问题
 
-仿真只验证接口和基本控制流程，不验证真实电气参数、机构动态或硬件看门狗。
-
-## 2026-10-14 真机验证记录
-
-现场确认安全后，对旧式 USB2CAN 上的 **ID 1 / MST_ID 0** 完成了只读检查和
-**零目标使能 → 保持约 1 秒 → 失能确认**，没有发送位置偏移或非零前馈力矩。
-
-- 实际模式为 MIT，读取映射为 PMAX=12.5、VMAX=50、TMAX=10。
-- 启动前状态为失能；TIMEOUT 原值 2000（100 ms），驱动启动配置并回读 4000（200 ms）。
-  没有保存 Flash、修改模式或归零。
-- 失能通信监测约 6 秒，实际有效反馈约 200.0 帧/秒。
-- 使能期间发送了 20 个零目标；最大位置变化约 0.000381 rad，
-  最大反馈速度幅值约 0.036630 rad/s，最大反馈力矩幅值约 0.007326 Nm。
-  反馈含协议量化误差，这不是物理零力矩的精确测量。
-- ROS 客户端观察到使能确认约 51.1 ms、失能确认约 44.3 ms；
-  包含服务调用和 20 Hz 状态发布等待，不是电机内部响应延迟。
-- 测试结束确认主机阶段 DISABLED、反馈状态 0、无锁定错误；
-  真机控制节点与 dashboard 保持运行，后续操作须重新显式使能。
-
-## 通用电机控制节点优化方案（2026-10-14，待实施）
-
-本节是在线资料与当前源码对照后的设计建议，**不代表下列功能已经实现**。
-本次仅补充方案，没有修改控制代码，没有连接硬件或发送电机命令。
-目标是将当前单电机 MIT 驱动升级为稳定的电机能力服务：以后改变电机数量、已支持型号、
-控制模式和任务参数，只需修改配置并 launch，或调用既有 ROS 接口，不修改驱动源码。
-“launch 即可”指启动后所有接口可用，不指自动使能、自动运动，也不指无需提供任务目标。
-不能承诺兼容未来所有未知协议、固件、传输设备或业务算法。
-
-### 在线资料与能力边界
-
-优先采用厂商对应型号、硬件版本的手册，再对照 SDK；不以搜索摘要或第三方示例替代协议。
-本次直接核查了以下公开来源：
-
-| 来源 | 用途 |
+| 现象 | 检查方法 |
 | --- | --- |
-| [达妙公开资料总入口](https://github.com/dmBots/dmBot) | 产品选型表、产品资料、SDK、固件和调试工具入口；用于持续维护资料索引 |
-| [J4310-2EC 官方手册目录](https://github.com/dmBots/DM-J4310-2EC/tree/2da08d236aa06743f85cde409811c005fbae0d5c/manual) | 实际下载并核对 V1.2 中文手册 V1.4（2026-09-14）；第 6 页规格，第 10–19 页控制与参数，第 26 页参数含义 |
-| [J4310-2EC 官方产品页面](https://www.damiaokeji.com/index.php?c=show&id=84) | 双编码器、一体化驱动、反馈、双温度保护与升级能力；页面型号版本不能替代 V1.2 手册 |
-| [官方电机 SDK](https://github.com/dmBots/motor-sdk) | 核查旧串口 `u2can/DM_CAN.py` 和 CAN-FD `u2canfd/damiao.py`，比较模式、参数和初始化行为 |
-| [官方设备 SDK C/C++ 说明](https://github.com/dmBots/dm-device-sdk/blob/master/C%26C%2B%2B/README.md) | USB2CANFD、双通道、LinkX4C；设备发现、通道、CAN/FD/BRS、时间戳和收发错误回调 |
+| `Package not found` | 确认在根目录构建，当前终端已 source `install/setup.bash` |
+| 串口被占用 | 停止其他适配器所有者；同一 USB 不要同时用组合启动和单独总线启动 |
+| 串口 `Permission denied` | 检查当前设备权限，按现场策略授权；不要把所有串口设为全局可写 |
+| `ready=false` | 看电机 error 和总线 status；核对设备、ID、MST_ID、模式和 CAN 速率 |
+| 控制权被占用 | 断开对应网页/退出旧控制客户端；不要强制绕过租约 |
+| 维护被拒绝 / 按钮禁用 | 让同总线设备失能，等待 `maintenance_available`；使能还需 `activity_available` |
+| 页面切回后不再控制 | 隐藏时已释放并 STOP；重新连接、显式使能，不恢复旧目标 |
+| 定位任务失败 | 查看实际误差/稳定时间、增益及负载，不把“发出了帧”当定位成功 |
+| 节点称设备故障 | 查看状态码并排除原因；clear 仅清设备错误，不能代替处理实际故障 |
 
-旧 Gitee 文档入口本次返回不可展示页面，未将其内容作为已核查证据。
-公开资料不可能穷尽，也不能将同系列其他型号的能力自动归给当前电机。
-本仓库已有 [CAN 协议归纳](DM_CAN_API.md)，可复用其中的字节布局和寄存器索引，
-但文中本地手册链接不等于本仓库已包含对应 PDF；实施时必须保留可访问的官方版本链接。
+最近一次真机测试只验证当前 ID 1/2、旧 USB2CAN 的 MIT 小行程：
+Kp=40、Kd=1 下单独及同时运动通过，单轴 STOP 时另一轴继续工作。
+设备 clear API 在健康失能真机上得到确认，真实过流/过温未人为触发；
+实际故障展示与清除路径通过模拟注入验证。其他模式、负载、型号及固件组合仍需现场认证。
 
-以本次核查的 **J4310-2EC V1.2** 为例：
-
-| 能力 | 对节点的意义与限制 |
-| --- | --- |
-| 24 V / 48 V 两种供电版本；额定 3.5 Nm、峰值 12.5 Nm、减速比 10:1 | 24 V 空载最大 200 rpm，48 V 为 450 rpm；额定转速 120 rpm。不能把峰值当持续输出能力，也不能把其他版本规格混用 |
-| 双 16 位单圈磁编码器、输出轴单圈绝对位置 | 保留电机侧与输出侧位置语义；不据此承诺断电保持多圈累计位置 |
-| MIT、位置速度、速度、力位混控四种模式 | 四种命令的字段、单位、CAN ID 偏移不同，不能只改变一个模式数字 |
-| MIT 位置、速度和前馈力矩组合 | 可实现力矩输出、阻尼、柔顺/阻抗、位置保持；实际输出还受内部电流环、标定和保护约束 |
-| 位置速度模式及梯形加减速 | 适合一般定位；速度字段是最高速度幅值，不是带符号的瞬时速度目标 |
-| 力位混控 | 位置目标加限速和电流比例限幅，不是直接给定 Nm，也不是接触力闭环 |
-| 普通反馈 | 位置、速度、力矩、MOS 温度、电机温度、状态/故障码；没有电机内部采样时间戳 |
-| 公开寄存器读写 | 该版手册列 49 项，包括映射、内部环增益、保护、看门狗、版本、电压和双位置等；只读项不能开放写入 |
-| CAN / CAN-FD | 该版手册支持 125 kbps–5 Mbps 速率代码；大于 1 Mbps 使用 FD。具体仲裁域/数据域及适配器兼容性仍需核实 |
-| 使能、失能、清错、设置零点、参数保存、固件升级 | 普通操作可提供受控接口；标定与升级可能涉及运动或专用协议，不作为正常启动步骤 |
-
-MIT 的 PMAX/VMAX/TMAX 是**编码映射**，不是物理行程、机械限速或持续力矩保证。
-当前设备在此前现场记录中回读为 12.5/50/10，不能用手册示例 12.5/30/10 覆盖它。
-电机反馈力矩不能默认视为经过认证的外部力传感器读数；精准接触力任务需要传感器、
-机构模型或经验证的估算算法。
-
-需要特别处理两处已核查差异：
-
-- 旧串口 SDK 的保存函数发送 `AA 00` 并只等待 1 ms，而该版手册定义 `AA 01`、
-  失能时保存全部参数、Flash 操作最长约 30 ms。实施以对应固件手册及实机确认结果为准，
-  不直接复制旧 SDK 的保存路径。
-- CAN-FD Python 封装构造器默认 `auto_enable=True`。新后端应使用设备 SDK 的传输层，
-  或显式禁用并验证封装的自动使能行为，不能让打开设备隐式改变输出状态。
-  SDK 中另有注释标为 JH11 谐波电机使用的 CSP 扩展，不开放为 J4310 的通用能力。
-
-### 当前实现的差距
-
-现有无 ROS 核心库、显式使能、单调时钟超时、固件 watchdog 回读、故障锁定和 dashboard
-独立部署应保留，不需要整体推倒重写。
-
-| 当前位置 | 已有能力 | 本次优化需要补齐 |
-| --- | --- | --- |
-| [协议层](dm_motor_control/src/protocol.cpp) | MIT、特殊帧、状态查询、反馈、旧串口封包 | 四模式编码、实际负载长度、参数应答分流及协议版本策略 |
-| [传输与初始化](dm_motor_control/src/transport.cpp) | serial/sim；启动同步访问少量寄存器 | 非阻塞参数事务、共享总线、SocketCAN、厂商 CAN-FD 后端 |
-| [控制器](dm_motor_control/src/controller.cpp) | 单电机安全状态机、持续 MIT 输出 | 模式切换、控制租约、有限时长任务、实测反馈保护和受控维护状态 |
-| [ROS 节点](dm_motor_control/src/motor_node.cpp) | command/state、enable/reset | 能力查询、通用参数服务、任务 action、诊断和配置更新验证 |
-| [命令消息](dm_motor_interfaces/msg/MotorCommand.msg) | MIT 五个字段 | 新的模式化目标接口；保留旧 MIT 接口作为兼容入口 |
-| [启动文件](dm_motor_control/launch/motor.launch.py) | 一个 ID 对应一个节点 | 一个配置文件启动多个适配器/通道及多台电机，每条总线唯一所有者 |
-
-目前 ROS 发布者之间没有驱动层仲裁，dashboard 租约只能约束网页内部。
-目前参数等待函数最多阻塞 0.5 s；直接把它暴露成使能期间的 ROS 服务，
-会阻塞控制且不能正确服务其他电机。
-目前反馈解码只按 Master ID 和负载低四位 ID 匹配；开放运行期读参前必须先解决应答分流，
-否则参数应答可能被误认成普通反馈或故障。单纯添加服务名称并不能解决这些问题。
-
-### 推荐架构：一条总线一个所有者，接口与任务解耦
-
-```text
-dashboard / ROS 客户端 / 上层机器人控制器
-               |
-      稳定 topics / services / actions
-               |
-  BusManager：统一收发、路由、周期调度、参数事务
-       |          |          |
-  MotorSession MotorSession MotorSession
-  安全/模式/租约/目标/任务/反馈缓存
-               |
-  serial / socketcan / dmcan / sim 传输后端
-```
-
-同一串口或 CAN 通道不能由多个单电机进程争抢。一个节点可管理一个或多个 BusManager，
-各总线拥有独立有界队列和故障状态；CAN-FD 多通道适配器可共享设备句柄，但通道分别调度。
-电机地址使用 `(bus, channel, motor_id)`，不能只用 motor_id 作为全局键。
-在当前已核查协议下保留基础 ID 1..15 的约束，完整检查运动 ID 偏移、
-反馈 ID 与保留服务 ID 的冲突；不凭 11 位 CAN ID 推断可无歧义控制 2047 台电机。
-
-沿用现有核心库组织，先补协议、事务和总线调度，再扩 ROS 接口，不引入无必要的框架。
-帧结构增加有效长度、通道、CAN/FD/BRS 等属性；传输层不负责业务模式或自动使能。
-控制路径使用单调时钟、预分配/有界缓存、最新目标覆盖旧目标，不积压运动命令。
-诊断和配置序列化不在高频控制路径内执行。
-
-### 稳定接口建议
-
-以下是**拟新增契约**，不是当前可调用接口。保留 `/motor_<ID>/command/state/enable/reset`，
-旧 MIT 输入与新输入最终进入同一租约和安全校验，不形成可绕过仲裁的第二条控制路径。
-多总线新部署使用稳定电机名称形成命名空间。
-
-| 接口类别 | 建议接口 | 契约 |
-| --- | --- | --- |
-| 能力与身份 | `get_capabilities`、`get_info` | 型号配置、版本原值、模式/参数/后端能力、证据版本及未验证项 |
-| 实时目标 | `setpoint` topic | 显式模式、SI 单位、租约 token、序号、时间戳、有效期；字段按模式验证 |
-| 状态 | 扩展状态 topic、`joint_states`、`diagnostics` | 模式、原始反馈、请求目标、有效目标、反馈年龄/序列、限值、通信与故障统计分开 |
-| 控制权 | `acquire_control`、`renew_control`、`release_control` | 每台电机仅一个有效持有者；租约过期停机，不自动移交或恢复旧目标 |
-| 普通操作 | `enable/disable`、`clear_motor_fault`、`reset_host_fault` | 区分电机清错与主机复位，均不能自动使能；长操作提供确认结果 |
-| 模式/坐标 | `set_mode`、`set_software_zero`、`set_device_zero` | 模式切换和设备归零要求失能、近零速度、新鲜反馈及明确权限 |
-| 参数 | `list_registers`、`read_registers`、`write_registers` | 名称/RID、准确类型、单位、权限、范围、缓存年龄和逐项结果 |
-| 配置维护 | `save_parameters`、配置导出/校验/应用 | 默认只改 RAM；保存明确列出全部待持久化改动；部分成功不能伪装成原子提交 |
-| 一次性任务 | `move_to`、`execute_trajectory`、`run_profile` actions | 进度、取消、超时、最终容差、停止原因和终态确认 |
-
-实时目标至少覆盖 MIT 五项、位置+速度上限、速度、位置+速度上限+电流比例；
-不要用一个 `torque` 字段同时表示 Nm 和电流比例。内部使用按模式区分的强类型目标，
-消息中未适用字段必须明确拒绝，不能悄悄忽略。
-“服务接收请求”“已经发送”“已确认”“结果未知”是不同状态；
-保留当前 enable 的异步语义，新长操作用 action 或操作 ID 提供终态，
-不得把请求发送成功等同于电机执行成功。
-
-### 参数与能力配置：避免以后逐项改代码
-
-为已支持协议建立可验证的型号/固件 profile，寄存器元数据包含：
-RID、名称、float32/uint32、单位/缩放、RO/RW、范围、支持条件、读写风险及保存语义。
-实现通用编解码和服务，不为每个参数新增一个专用回调。
-新增同协议、已验证型号主要增加 profile 和配置，不改电机节点。
-厂商保留寄存器、未知范围及未知版本不自动探测写入；型号不能仅凭保留的 hw_ver/SN 判断。
-能力报告应区分手册声明、实际回读和实机认证，未知固件默认禁止未经验证的维护操作。
-
-配置拆成三层：型号协议能力、现场总线/电机绑定、任务参数。
-总线配置包括稳定设备路径或 SN、通道、后端、仲裁/数据速率及周期；
-电机配置包括基础/反馈 ID、关节名、方向/软件偏置、模式、机构限位和故障组。
-型号额定值、协议映射、用户机械限制分别保存。
-方向/软件零点必须一致转换位置、速度、力矩及目标；电机侧 p_m 与输出侧 xout 分别发布，
-不假设两者是完全相同坐标，也不自动将单圈位置展开为可靠多圈位置。
-未来 launch 只接受配置文件和少量覆盖项；当前仍使用现有单电机 launch，不给出尚不存在的命令。
-
-只允许有契约的运行时更新：纯显示参数可即时生效，任务参数在任务边界生效，
-模式/映射/内部增益/地址等在维护状态更新。ROS 参数回调与实际配置必须一致，
-不能只让 `ros2 param set` 显示成功而控制器仍使用旧值。
-
-参数事务必须由唯一接收器分流，使用通道、目标、操作码、RID、长度和等待状态匹配；
-同一电机串行访问，队列有界。协议没有事务序号，超时后的同 RID 迟到回复仍可能有歧义，
-需隔离等待窗口及独立回读；无法确认时返回 UNKNOWN，不能拿旧缓存证明本次写入成功。
-读取仅在有总线余量、且已认证可在线读取的情况下低频调度；写入默认失能。
-一台电机维护不能阻塞其他电机控制。对格式歧义无法安全分流的固件，
-运行期访问应禁用或进入已确认失能的维护窗口，而不是牺牲反馈可信度。
-
-模式切换顺序为：停止旧任务、清目标、失能确认、确认低速、写模式并回读、
-更新命令编码/路由、准备该模式安全目标、等待显式使能；任何不确定结果进入故障/维护，
-不自动回滚后恢复运动。ID/速率迁移是单独的受控维护事务，默认不开放随意在线改动。
-Flash 保存不是周期任务，不默认重试；审查全部 RAM 改动，保留应答和回读结果，
-掉电持久化结论只能由受控重上电验证，不能只凭 ACK。
-
-### 大多数任务由稳定 primitives 完成，不把所有算法塞进驱动
-
-第一版内置有限集合：单次定位、带时限速度/力矩输出、位置保持/阻尼/阻抗目标、
-多段轨迹、正弦/往复/斜坡/阶跃测试曲线及数据记录。
-必须有最大时长、速度/加速度/目标变化率约束、取消策略和完成判据。
-内部任务在控制周期生成目标，因此一次 action 调用后无需客户端持续发布每个采样点；
-但控制租约/心跳仍独立有效，不能用内部任务持续产生目标来掩盖客户端断联。
-不同模式下的正常完成可选择已经配置并验证的保持或失能策略；
-通信/反馈故障不得继续依赖位置保持。失能不是抱闸，对重力负载需要独立机械安全措施。
-
-轨迹入口优先使用标准 `FollowJointTrajectory` 语义，并明确插值、限值、
-跟踪误差、取消及多轴故障组策略。共享队列调度可减小主机发送偏差，
-不能承诺普通 CAN 逐帧发送具有电机侧硬同步执行时间。
-ROS 2 control 集成可作为上层适配器复用同一核心和唯一总线所有者，
-不能再启动一套硬件驱动重复占用设备。
-
-主从、双边遥操作、摩擦辨识/补偿、重力补偿、机器人动力学等留在独立控制器，
-通过稳定目标和状态接口使用驱动。需要新业务算法时更新控制器，不更新电机节点；
-若要求“单个 launch 启动整套系统”，可以由组合 launch 一并启动控制器，
-不要求所有业务都成为电机节点内置分支。
-
-### 安全、时序与总线预算
-
-- 将单发布者要求真正落实到驱动租约，STOP 不依赖控制权；租约不是网络鉴权，
-  不可信 ROS 网络仍需隔离或 SROS2。旧客户端迁移到兼容适配器后才能满足统一仲裁。
-- 除命令字段范围，还检查实测位置/速度/力矩、双温度、反馈新鲜度和连续超限。
-  机构需要非对称行程、阈值滞回及可配置故障组；测量限矩与估算 MIT 合成力矩
-  都不是固件电流硬限幅或认证安全功能。
-- 安全状态机保留故障锁定、清旧目标、显式复位和不自动重使能。
-  总线断开影响该总线全部电机；单轴故障是否联动停止取决于明确配置的耦合组。
-- watchdog 从固定 4000 改为经验证 profile 支持的可配置时长，配置后回读；
-  J4310 本版单位为 50 us/计数。默认值延续当前 200 ms，
-  启动预算验证需考虑周期、最坏阻塞和总线负载，不把 TIMEOUT=0 当有效保护。
-- 控制 I/O 与 ROS 服务隔离，寄存器事务异步化；队列中 STOP 优先、运动最新值优先、
-  参数请求最低优先。限制适配器/内核队列，不能假定高优先级软件队列可抢占已提交帧。
-- 不以设定 Hz 证明性能。分别统计控制周期、每电机有效反馈 FPS、接收年龄、
-  总线负载、发送队列、错误帧、目标到发送延迟的 p50/p95/p99/最大值。
-  状态的发布时刻与最近反馈接收时刻分别提供，电机内部采样时间标为未知。
-
-经典 CAN 1 Mbps 下，用每台每周期 1 个命令和 1 个反馈、每帧约 135 bit
-（含保守填充/间隔估算）计算，负载约 `270 × 电机数 × Hz / 1e6`：
-10 台 200 Hz 约 54%，尚未包含读参、错误重传及其他设备。
-这是容量估算，不是实测保障；建议设计目标保留余量，例如正常负载不超过约 60%。
-旧串口 921600、8N1、30 字节发送包下，主机发送占用约
-`30 × 10 × 电机数 × Hz / 921600`，接收方向按 16 字节包另算，
-全双工不能将两个方向简单相加为一个串口上限。
-因此 1000 Hz 配置并不代表多电机总线能达到 1000 Hz；
-启动前检查理论预算，实测不足时明确拒绝相应配置或要求用户重新配置，不静默降频。
-CAN-FD、设备 SDK 和普通 Linux 调度也不自动构成硬实时保证。
-
-### 实施顺序与验收
-
-按依赖推进，不以先做更多 dashboard 按钮替代底层完整性：
-
-1. **协议与事务基础**：四模式、帧长度、类型化寄存器、应答分流、能力 profile、
-   仿真与故障注入；保留当前 MIT 回归测试。
-2. **总线与稳定接口**：共享总线、多电机状态机、租约、模式维护、
-   通用参数读写/保存、配置文件；这是“以后只需 launch”的核心交付。
-3. **任务与机器人接入**：有限时长 primitives、轨迹 action、标准状态/诊断、
-   配置导出和记录；dashboard 仅调用已经实现的接口。
-4. **后端与认证**：按现场需求增加 SocketCAN / 厂商 CAN-FD，
-   对型号、固件、适配器、台数和频率形成认证矩阵；未知组合不标为已支持。
-
-完成判据不是“可以启动”，而是：
-
-- 已支持设备的数量、命名、模式、限制、任务参数变化仅改配置/请求，不改源码、不重新编译；
-  四模式端点、NaN/Inf、uint32/float32、负载长度和特殊帧冲突都有 golden-frame 测试。
-- sim 覆盖所有新接口与任务状态机，并注入乱序/迟到应答、参数与反馈交错、
-  部分写入、保存未知结果、断线、重复 ID 和客户端租约丢失；仿真通过不等于硬件认证。
-- 同总线多电机控制中读参不能阻塞其他轴；参数包不计入反馈计数、不刷新反馈年龄；
-  两个控制源不能交替覆盖目标，过期租约/旧目标不能重新开始输出。
-- 服务/action 逐项报告接收、发送、确认、未知和拒绝原因；模式切换、取消、恢复通信
-  都不自动使能；设备归零和参数保存仅按已验证固件契约执行。
-- 200 Hz 的已认证组合在目标负载下连续运行至少 30 分钟，
-  每台平均有效反馈率在目标 ±5% 内；以 p99 控制回调间隔不超过 1.5 周期为初始工程目标，
-  并记录最大值、遗漏、队列上限和停机表现。阈值是拟验收目标，未在本次测量。
-- 真机验证从只读/失能开始，再经现场安全确认验证中性使能、各模式小幅运动、
-  保护与故障恢复；持久化经受控断电回读。不能为完成自动测试擅自移动电机、
-  改 ID/速率/零点、保存 Flash 或升级固件。
-
-预期结果是**底层能力一次性补齐，日常任务靠配置和稳定接口组合**，
-而不是承诺节点永远无需维护。新协议、未支持固件和缺陷修复仍需版本更新。
-
-本次未验证位置运动、非零力矩输出、断链/断电保护或固件看门狗触发。
-该结果只适用于本次设备和连接条件，不代表所有型号/固件或负载场景已验证。
+协议资料另见 [DM_CAN_API.md](DM_CAN_API.md)。该文包含特定型号/版本的协议归纳及历史记录，
+不替代当前启动配置，也不意味着本仓库附带其引用的所有厂商手册。

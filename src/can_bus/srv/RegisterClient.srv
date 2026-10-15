@@ -1,0 +1,14 @@
+string client_name
+can_bus/FrameFilter[] filters_rx
+can_bus/FrameFilter[] filters_tx
+can_bus/Frame[] stop_frames
+builtin_interfaces/Duration lease_duration
+float64 rate_hz
+float64 max_tx_hz
+string fault_group
+---
+bool success
+string token
+uint64 epoch
+string rx_topic
+string message

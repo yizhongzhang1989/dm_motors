@@ -1,0 +1,16 @@
+uint8 ENABLE=1
+uint8 DISABLE=2
+uint8 RESET_HOST_FAULT=3
+uint8 SET_MODE=4
+uint8 CLEAR_MOTOR_FAULT=5
+uint8 SET_DEVICE_ZERO=6
+uint8 SET_SOFTWARE_ZERO=7
+uint8 SAVE_PARAMETERS=8
+uint8 operation
+string token
+uint8 mode
+float64 value
+---
+bool success
+uint64 operation_id
+string message

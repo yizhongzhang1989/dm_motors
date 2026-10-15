@@ -1,0 +1,7 @@
+string token
+uint64 epoch
+bool acquire
+builtin_interfaces/Duration duration
+---
+bool success
+string message

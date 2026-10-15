@@ -1,0 +1,38 @@
+/**:
+  ros__parameters:
+    control_rate: 200.0
+    state_rate: 200.0
+    max_task_duration: 60.0
+    bus_names: [main]
+    motor_names: [motor_1, motor_2]
+    buses:
+      main:
+        backend: sim
+        port: ""
+        can_fd: false
+        can_bitrate: 1000000.0
+    motors:
+      motor_1:
+        bus: main
+        motor_id: 1
+        master_id: 0
+        profile: j4310_v12
+        mode: 1
+        direction: 1.0
+        software_offset: 0.0
+        watchdog_timeout: 0.2
+        command_timeout: 0.25
+        feedback_timeout: 0.1
+        legacy_control: false
+      motor_2:
+        bus: main
+        motor_id: 2
+        master_id: 0
+        profile: j4310_v12
+        mode: 1
+        direction: -1.0
+        software_offset: 0.0
+        watchdog_timeout: 0.2
+        command_timeout: 0.25
+        feedback_timeout: 0.1
+        legacy_control: false

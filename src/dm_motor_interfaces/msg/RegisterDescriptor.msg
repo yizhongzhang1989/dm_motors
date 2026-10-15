@@ -1,0 +1,12 @@
+uint8 address
+string name
+bool integer
+bool writable
+bool raw_write_allowed
+string unit
+bool has_minimum
+bool has_maximum
+float64 minimum
+float64 maximum
+bool minimum_inclusive
+bool maximum_inclusive

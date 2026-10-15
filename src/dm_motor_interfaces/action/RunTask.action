@@ -1,0 +1,29 @@
+uint8 MOVE=1
+uint8 VELOCITY=2
+uint8 TORQUE=3
+uint8 HOLD=4
+uint8 SINE=5
+uint8 RAMP=6
+uint8 TRAJECTORY=7
+string token
+uint8 kind
+MotorTarget target
+float64 duration
+float64 amplitude
+float64 frequency
+float64 max_velocity
+float64 max_acceleration
+float64 tolerance
+float64 settling_time
+float64 ramp_time
+float64[] times
+float64[] positions
+---
+bool success
+string message
+float64 final_position
+---
+float64 elapsed
+float64 progress
+float64 position_error
+uint8 phase

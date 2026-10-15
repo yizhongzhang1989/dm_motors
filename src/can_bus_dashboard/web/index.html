@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Generic CAN dashboard</title><link rel="stylesheet" href="/dashboard.css"></head>
+<body>
+<header><h1>CAN bus monitor</h1><span id="connection">Connecting…</span></header>
+<p>Transport-only observation. Written means driver-write observed, not CAN acknowledgment or device execution.</p>
+<section><h2>Bus status</h2><div id="status" class="grid"></div><p id="notice"></p></section>
+<section><h2>Frames by ID</h2><p>Rates: trailing one-second observed window, capped at 1000 samples per key.
+Up to 512 recent ID/direction keys. Status counters are authoritative broker totals.</p>
+<div class="scroll"><table><thead><tr><th>Direction</th><th>ID</th><th>Channel</th><th>Flags</th><th>Count</th><th>Hz</th><th>Latest bytes</th></tr></thead><tbody id="ids"></tbody></table></div></section>
+<section><h2>Recent bounded frame log</h2><label>ID filter (hex or decimal) <input id="filter" placeholder="0x600"></label>
+<label>Direction <select id="direction"><option value="">All</option><option value="rx">Received</option><option value="written">Written</option><option value="submitted">Submitted</option></select></label>
+<p>Latest 1000 server frames; this view displays at most 200 matching frames. Error frames are marked ERROR separately.</p>
+<div class="scroll log"><table><thead><tr><th>#</th><th>Direction</th><th>ID</th><th>Channel</th><th>Flags</th><th>Data</th></tr></thead><tbody id="frames"></tbody></table></div></section>
+<section class="danger"><h2>Exclusive manual debugging — potentially destructive</h2>
+<p>Raw frames can activate devices, move machinery, or change firmware. No device opcode is interpreted.
+Never use this to bypass a motor client. A conflicting route is refused by the broker.
+Active sends require your own device-safe opaque stop frames; the dashboard cannot verify their effect.</p>
+<label><input type="checkbox" id="confirm"> I explicitly authorize hardware debugging and understand the consequences.</label>
+<fieldset id="debug" disabled>
+<label>Owner <input id="owner" value="operator" maxlength="64"></label>
+<label>Duration (1–300 seconds) <input id="duration" type="number" min="1" max="300" value="30"></label>
+<label>Exact CAN ID <input id="canid" value="0x600"></label>
+<label>Channel <input id="channel" type="number" min="0" max="0" value="0"></label>
+<label><input id="extended" type="checkbox"> Extended ID</label>
+<label>Optional exact payload prefix (hex bytes) <input id="prefix" placeholder="empty matches all payloads on ID"></label>
+<label><input id="readonly" type="checkbox"> Explicit read-only claim (sends active=false; still exclusive)</label>
+<label>Opaque stop frames (JSON array; same claimed ID/channel/prefix)
+<textarea id="stops" rows="3">[{"can_id":1536,"channel":0,"extended":false,"data":[0,0,0,0,0,0,0,0]}]</textarea></label>
+<button id="claim">Claim route</button><button id="release" disabled>Release (expiry, not immediate)</button>
+<p id="session">No debug session</p>
+<label>Single frame data (hex bytes) <input id="data" value="01 02 03 04 05 06 07 08"></label>
+<label><input id="fd" type="checkbox"> FD</label><label><input id="brs" type="checkbox"> BRS</label>
+<label><input id="rtr" type="checkbox"> RTR (classical only)</label>
+<button id="send" disabled>Submit exactly one frame</button>
+<p>Legacy adapter: channel 0, standard classical, only 4/8 bytes; four bytes are zero-padded to eight.
+No automatic repeat. Browser heartbeat expires after 1s; broker heartbeat is 50ms, lease 0.3s.
+Release/shutdown stops heartbeats; opaque stops are dispatched on broker lease expiry.</p>
+</fieldset><p id="result" role="status"></p></section>
+<script src="/dashboard.js"></script>
+</body></html>
