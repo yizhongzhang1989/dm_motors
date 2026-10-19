@@ -49,7 +49,9 @@ not wait for the next periodic tick. Pending priority STOP frames precede other
 clients' normal frames within a drain batch.
 
 Private filtered RX is forwarded directly to device clients before optional
-public observation. Public `rx` and `tx_observed` publication runs on a separate
+public observation. Each received frame is observed exactly once on public `rx`,
+including when there are no registered clients; observer counts must not scale
+with the number of registrations. Public `rx` and `tx_observed` publication runs on a separate
 bounded worker queue, so slow public recorders do not directly block the physical
 I/O callback. Its 8192-entry backlog discards the oldest observation on overflow,
 logs a warning, and reports `observer_dropped` / `observer_queue_depth` in status.
@@ -67,14 +69,35 @@ reliable RX delivery can still experience middleware backpressure. Avoid dynamic
 registration/configuration during latency-critical motion. No OS scheduler
 priority, physical baud rate or CAN bitrate is changed by these optimizations.
 
+Sourcing this workspace selects the installed [Fast DDS UDPv4 profile](config/fastdds_udp.xml)
+when Fast DDS is the selected/default RMW and no explicit DDS profile is set.
+It disables the built-in SHM transport, not DDS reliability or the physical CAN backend.
+Explicit `FASTRTPS_DEFAULT_PROFILES_FILE` / `FASTDDS_DEFAULT_PROFILES_FILE` values
+and other `RMW_IMPLEMENTATION` choices are preserved. All participating processes
+must load the workspace environment; already running processes do not inherit a new profile.
+
+With Humble / Fast DDS 2.6.12, repeated abrupt motor-process exits exposed intermittent
+peer communication timeouts under default SHM; the unchanged failure-isolation test
+passed 20 consecutive runs with UDPv4. The
+[Fast DDS SHM documentation](https://fast-rtps.docs.eprosima.com/en/2.6.x/fastdds/transport/shared_memory/shared_memory.html)
+describes crashed-port recovery with a default 1000 ms health-check timeout.
+This deployment default avoids that recovery path instead of relaxing application
+watchdogs or deleting shared-memory objects belonging to other processes.
+Custom middleware profiles need their own process-failure and latency qualification.
+
 ## Interface
 
 * `register_client` (`RegisterClient`): submit `client_name`, `filters_rx`,
-  `filters_tx`, opaque `stop_frames`, `lease_duration` (0.3–1 seconds),
+  `filters_tx`, opaque `stop_frames`, optional `poll_frames`, `lease_duration` (0.3–1 seconds),
   `rate_hz`, `max_tx_hz` (actual transmit ceiling), and optional `fault_group`.
   The response contains `success`, `token`, `epoch`, `rx_topic`, `message`.
   Tokens are epoch-scoped routing capabilities, not a network authentication
   boundary; secure the ROS domain separately.
+  Registration initially reserves routes for at most two seconds. Normal TX
+  is held (with its original TTL still advancing) and maintenance is unavailable
+  until the first fresh heartbeat activates the requested 0.3–1 second lease.
+  Exact STOPs remain available before activation. Subsequent heartbeat loss
+  uses the requested lease duration, not the startup reservation budget.
 * `FrameFilter` matches `can_id & mask`, exact `extended`/`channel`, and
   masked payload `prefix`/`prefix_mask`. Prefix arrays must have equal lengths.
   All transmit filters are exclusive across clients. A fresh, explicitly
@@ -90,6 +113,10 @@ priority, physical baud rate or CAN bitrate is changed by these optimizations.
 * Priority 0 is normal; 1 must exactly equal a registered stop; 2 requires
   bus maintenance ownership. Stops bypass rate limiting, clear old normal
   work, and are never synthesized by interpreting a device opcode.
+  An exact registered `poll_frames` match with priority 0 and `active=false`
+  may pass another client's maintenance lock. Clients certify these templates
+  as read-only; the broker remains protocol-neutral. Unregistered frames,
+  active traffic and priority-two parameter traffic do not get this exception.
 * Publish `Heartbeat` on `heartbeat` every 50 ms: `token`, `epoch`, separate
   monotonic `sequence`, `quiet`, `fault`, `sent_steady`. Quiet means physically
   disabled, not merely that the sender has no queued command. Activity
@@ -117,6 +144,8 @@ It includes `epoch`, `ready`, `endpoint_ready`, `backend`, `error`, counters, qu
   acknowledge each client's most recently processed heartbeat. The bridge
   uses that acknowledgment before allowing activity after an ungrouped
   explicit fault reset, avoiding a cross-topic heartbeat/TX race.
+  Revoked leases are reported explicitly in `client_errors`, so their clients
+  fail immediately rather than waiting for an unrelated startup probe timeout.
 
 The monotonic timestamps used for heartbeat/activity and acquisition age
 assume clients and the bus owner share the same host monotonic clock.
@@ -126,7 +155,8 @@ unrelated monotonic clocks.
 ## Failure and boundedness
 
 There are at most 128 registrations per epoch, 32 TX/RX filters per client,
-16 stop frames, 32 pending TX frames per client, and 64-message DDS histories.
+16 stop frames, 16 read-only poll templates, 32 pending TX frames per client,
+and 64-message DDS histories.
 Normal work coalesces to the latest frame per matching route and CAN ID.
 Each client can transmit at most its registered `max_tx_hz`; emergency stops
 are exempt. TTL is measured from publication, including DDS and local queues.
@@ -165,6 +195,11 @@ that hold. Maintenance acquisition likewise waits for the client's receive
 path to match. No fixed startup sleep is used. Loss of an
 established virtual endpoint latches the motor bridge instead of freezing
 its pending operations silently.
+The bridge waits for TX/heartbeat topic discovery before requesting registration,
+and for a broker heartbeat acknowledgment before probing the device. Graph
+matching alone does not prove data delivery. The broker starts the bounded
+registration window after preparing private RX, so entity setup does not consume
+the client's activation budget.
 The DM bridge additionally proves an actual status round trip with
 read-only `0xCC` polls before reporting ready. DDS graph discovery alone
 does not prove the first response will meet an operation deadline. Parameter
@@ -182,11 +217,15 @@ bridge's asynchronous maintenance release; enable during that short interval
 must be rejected as a precondition, not converted into a transport fault.
 `CanTransport::activity_available()` requires release completion and an
 unlocked bus status, while `ready()` remains true throughout normal maintenance.
-The motor bridge treats read-only status polls as replaceable observations:
-polls suppressed by another client's maintenance, acquisition, or release are
-dropped and subsequent polling resumes normally. Poll expiry is not a
-transport failure; motion expiry and parameter-operation deadlines retain
-their fail-safe behavior.
+The motor bridge registers only its exact read-only `0xCC` status request as
+a maintenance-safe poll. Other axes continue receiving real feedback while a
+client performs a long parameter batch, including while their own maintenance
+request is waiting. The runtime still suppresses its own status queries during
+an ambiguous parameter transaction; parameter exclusivity is unchanged.
+Expired polls are replaceable observations rather than transport failures;
+motion expiry and parameter-operation deadlines retain their fail-safe behavior.
+`RegisterClient` now includes `poll_frames`; rebuild and restart the broker and
+all CAN clients together after this interface change.
 At transaction stage zero, the runtime must call
 `Transport::prepare_maintenance()` before starting the operation's response
 deadline or transmitting its first frame. The bridge starts asynchronous
@@ -201,3 +240,11 @@ acquisition/release. Quiet clients arbitrate through reservation acquisition;
 explicit queued operations can reject when activity blocks maintenance,
 while startup may wait. An acknowledged local reservation takes
 precedence over older cached bus status, including for query transmission.
+
+The motor bridge applies its configured `can_fd` framing to every runtime frame,
+including queries, parameter requests and STOPs. The transmitted STOP format must
+match its registered opaque stop frames exactly. FD is not supported by the legacy
+serial backend; native SocketCAN FD framing does not configure physical bit timing
+or imply that a particular motor/adapter combination has been hardware-certified.
+Motor feedback age retains host acquisition time through the receive queue; it is
+not refreshed when a control cycle processes the frame.

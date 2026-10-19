@@ -67,10 +67,21 @@ class MotorClient(Node):
         return response
 
     def capabilities(self):
-        response = self.call("get_capabilities", GetCapabilities.Request())
-        if not response.ready:
-            raise RuntimeError(f"Driver not ready: {response.message}")
-        return response
+        attempts = 0
+        while True:
+            try:
+                response = self.call("get_capabilities", GetCapabilities.Request())
+            except TimeoutError:
+                attempts += 1
+                if attempts >= 3:
+                    raise
+                self.get_logger().warning(
+                    f"Read-only capability handshake timed out; retrying discovery ({attempts + 1}/3). "
+                    "No enable or write operation has been issued.")
+                continue
+            if not response.ready:
+                raise RuntimeError(f"Driver not ready: {response.message}")
+            return response
 
     def acquire(self):
         self.token = self.call("control_lease", ControlLease.Request(

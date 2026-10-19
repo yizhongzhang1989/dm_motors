@@ -23,6 +23,15 @@ bool allowed(const Client & c, const Frame & f)
 {
   return std::any_of(c.tx.begin(), c.tx.end(), [&](const auto & filter) {return matches(filter, f);});
 }
+bool polling(const Client & c, const Frame & f)
+{
+  return std::any_of(c.polls.begin(), c.polls.end(), [&](const auto & poll) {return same(poll, f);});
+}
+bool expired(const Client & c, double now)
+{
+  // Discovery reserves routes, not motion authority; the first heartbeat activates the lease.
+  return now - c.last_heartbeat > (c.heartbeat_sequence ? c.lease : 2.0);
+}
 }
 bool matches(const Filter & filter, const Frame & f)
 {
@@ -56,7 +65,7 @@ std::string Router::add(Client c, double now)
     [&](const auto & item) {return item.second.name == c.name && item.second.revoked;});
   if ((clients.size() >= 128 && previous == clients.end()) ||
     c.name.empty() || c.name.size() > 96 || c.group.size() > 96 ||
-    c.rx.size() > 32 || c.tx.size() > 32 || c.stops.size() > 16 ||
+    c.rx.size() > 32 || c.tx.size() > 32 || c.stops.size() > 16 || c.polls.size() > 16 ||
     !std::isfinite(c.lease) || c.lease < .3 || c.lease > 1 ||
     !std::isfinite(c.max_tx_hz) || c.max_tx_hz <= 0 || c.max_tx_hz > 10000)
   {throw std::invalid_argument("invalid registration or bus client capacity reached");}
@@ -74,6 +83,10 @@ std::string Router::add(Client c, double now)
   for (const auto & f : c.stops) {
     validate_frame(f, allow_fd);
     if (!allowed(c, f)) {throw std::invalid_argument("stop frame outside transmit ownership");}
+  }
+  for (const auto & f : c.polls) {
+    validate_frame(f, allow_fd);
+    if (!allowed(c, f)) {throw std::invalid_argument("poll frame outside transmit ownership");}
   }
   c.token = "c" + std::to_string(epoch) + "_" + std::to_string(++next_token_);
   c.last_heartbeat = now;
@@ -94,7 +107,7 @@ void Router::heartbeat(const std::string & token, uint64_t e, uint64_t seq,
   bool quiet, bool fault, double now, uint64_t sent_steady)
 {
   auto & c = authenticate(token, e);
-  if (now - c.last_heartbeat > c.lease) {revoke(c); throw std::invalid_argument("lease expired");}
+  if (expired(c, now)) {revoke(c); throw std::invalid_argument("lease expired");}
   if (seq <= c.heartbeat_sequence) {throw std::invalid_argument("nonmonotonic heartbeat");}
   c.heartbeat_sequence = seq; c.last_heartbeat = now;
   if (!sent_steady) {sent_steady = static_cast<uint64_t>(now * 1e9);}
@@ -120,7 +133,7 @@ void Router::enqueue(const std::string & token, uint64_t e, uint64_t seq,
   double ttl, uint8_t priority, const Frame & f, double now, bool active, uint64_t sent_steady)
 {
   auto & c = authenticate(token, e);
-  if (now - c.last_heartbeat > c.lease) {revoke(c); throw std::invalid_argument("lease expired");}
+  if (expired(c, now)) {revoke(c); throw std::invalid_argument("lease expired");}
   validate_frame(f, allow_fd);
   if (seq <= c.tx_sequence || !std::isfinite(ttl) || ttl <= 0 || ttl > .25 ||
     priority > 2 || !allowed(c, f)) {throw std::invalid_argument("invalid TX sequence, TTL, priority or route");}
@@ -132,8 +145,9 @@ void Router::enqueue(const std::string & token, uint64_t e, uint64_t seq,
     c.pending.erase(std::remove_if(c.pending.begin(), c.pending.end(),
       [&](const auto & p) {return p.priority != 1 || same(p.frame, f);}), c.pending.end());
   } else {
+    const bool maintenance_poll = priority == 0 && !active && polling(c, f);
     if ((!c.group.empty() && group_faults.count(c.group)) ||
-      (!maintenance_owner.empty() && maintenance_owner != token) ||
+      (!maintenance_owner.empty() && maintenance_owner != token && !maintenance_poll) ||
       (priority == 2 && maintenance_owner != token) ||
       (active && (!maintenance_owner.empty() || c.fault)))
     {throw std::invalid_argument("fault group latched or bus maintenance locked");}
@@ -160,7 +174,7 @@ bool Router::maintenance(const std::string & token, uint64_t e,
   bool acquire, double duration, double now)
 {
   auto & owner = authenticate(token, e);
-  if (now - owner.last_heartbeat > owner.lease) {revoke(owner); return false;}
+  if (expired(owner, now)) {revoke(owner); return false;}
   if (!acquire) {
     if (maintenance_owner == token) {maintenance_owner.clear();}
     return true;
@@ -169,7 +183,7 @@ bool Router::maintenance(const std::string & token, uint64_t e,
   if (!maintenance_owner.empty() && maintenance_owner != token) {return false;}
   for (const auto & item : clients) {
     const auto & c = item.second;
-    if (!c.revoked && (!c.quiet || now - c.last_heartbeat > c.lease)) {return false;}
+    if (!c.revoked && (!c.heartbeat_sequence || !c.quiet || expired(c, now))) {return false;}
   }
   if (maintenance_owner.empty()) {
     for (auto & item : clients) {
@@ -189,7 +203,7 @@ std::vector<Frame> Router::drain(double now, bool transmit_ready)
   }
   for (auto & item : clients) {
     auto & c = item.second;
-    if (!c.revoked && now - c.last_heartbeat > c.lease) {revoke(c);}
+    if (!c.revoked && expired(c, now)) {revoke(c);}
   }
   // Group failure independently stops every group member, even before status delivery.
   for (auto & item : clients) {
@@ -224,8 +238,11 @@ std::vector<Frame> Router::drain(double now, bool transmit_ready)
       if (c.activity_requires_stop) {c.stop_dispatched_steady = static_cast<uint64_t>(now * 1e9);}
       continue;
     }
-    if (!c.receive_ready) {continue;}
-    if ((!maintenance_owner.empty() && maintenance_owner != c.token) || now < c.next_tx) {continue;}
+    if (!c.heartbeat_sequence || !c.receive_ready) {continue;}
+    const auto & pending = c.pending.front();
+    const bool maintenance_poll = pending.priority == 0 && !pending.active && polling(c, pending.frame);
+    if ((!maintenance_owner.empty() && maintenance_owner != c.token && !maintenance_poll) ||
+      now < c.next_tx) {continue;}
     const auto frame = c.pending.front().frame;
     if (result.capacity() == 0) {result.reserve(clients.size());}
     result.push_back(frame); c.pending.pop_front();

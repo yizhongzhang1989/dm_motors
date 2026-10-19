@@ -2,6 +2,8 @@ string client_name
 can_bus/FrameFilter[] filters_rx
 can_bus/FrameFilter[] filters_tx
 can_bus/Frame[] stop_frames
+# Exact, client-certified read-only polls allowed during another client's maintenance.
+can_bus/Frame[<=16] poll_frames
 builtin_interfaces/Duration lease_duration
 float64 rate_hz
 float64 max_tx_hz

@@ -142,7 +142,7 @@ def test_standalone_dashboard_ports_match_composition(monkeypatch, package, moto
       "buses": {"main": {"backend": "sim"}},
       "motors": {"one": {"motor_id": 1}, "two": {"motor_id": 1}}}, "Duplicate motor ID"),
     ({"motor_names": ["one"], "bus_names": ["main"],
-      "buses": {"main": {"backend": "sim"}}, "motors": {"one": {"bus": "missing"}}}, "unused"),
+      "buses": {"main": {"backend": "sim"}}, "motors": {"one": {"bus": "missing"}}}, "unknown bus"),
     ({"motor_names": ["invalid/name"], "bus_names": ["main"]}, "unique"),
     ({"motor_names": ["one", "two"], "bus_names": ["a", "b"],
       "buses": {"a": {"backend": "serial", "port": "/dev/example"},
@@ -161,5 +161,57 @@ def test_repeated_motor_id_on_separate_buses_is_valid():
         "buses": {"a": {"backend": "sim"}, "b": {"backend": "sim"}},
         "motors": {"one": {"bus": "a", "motor_id": 1},
                    "two": {"bus": "b", "motor_id": 1}},
+    })
+    assert len(nodes) == 6
+
+
+@pytest.mark.parametrize("master", [2, 0x102, 0x202, 0x302, 0x7ff])
+def test_feedback_ids_cannot_address_another_motor_or_parameter_port(monkeypatch, master):
+    monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
+    with pytest.raises(ValueError, match="master_id|feedback.*control"):
+        compose({
+            "motor_names": ["one", "two"], "bus_names": ["main"],
+            "buses": {"main": {"backend": "sim"}},
+            "motors": {"one": {"motor_id": 1, "master_id": master}, "two": {"motor_id": 2}},
+        })
+
+
+@pytest.mark.parametrize("invalid", [
+    {"motor_id": True}, {"motor_id": 0}, {"motor_id": 16},
+    {"motor_id": 1.5}, {"motor_id": "1"},
+    {"master_id": -1}, {"master_id": True},
+    {"mode": True}, {"mode": 0}, {"mode": 5},
+])
+def test_motor_identity_and_mode_are_validated_before_creating_nodes(monkeypatch, invalid):
+    monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
+    with pytest.raises(ValueError, match="motor_id|master_id|mode"):
+        compose({
+            "motor_names": ["one"], "bus_names": ["main"],
+            "buses": {"main": {"backend": "sim"}},
+            "motors": {"one": invalid},
+        })
+
+
+def test_shared_motor_defaults_reach_simulator_and_motor_consistently(monkeypatch):
+    monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
+    nodes = compose({
+        "motor_names": ["one"], "bus_names": ["main"],
+        "motor_id": 3, "master_id": 32, "mode": 2,
+        "buses": {"main": {"backend": "sim"}}, "motors": {"one": {}},
+    })
+    simulator = next(node["parameters"][0] for node in nodes
+                     if node["executable"] == "can_motor_simulator")
+    motor = next(node["parameters"][0] for node in nodes if node["executable"] == "motor_node")
+    for field in ("motor_id", "master_id", "mode"):
+        assert simulator[f"motors.one.{field}"] == motor[field]
+
+
+def test_feedback_id_collision_check_is_scoped_to_each_bus(monkeypatch):
+    monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
+    nodes = compose({
+        "motor_names": ["one", "two"], "bus_names": ["a", "b"],
+        "buses": {"a": {"backend": "sim"}, "b": {"backend": "sim"}},
+        "motors": {"one": {"bus": "a", "motor_id": 1, "master_id": 2},
+                   "two": {"bus": "b", "motor_id": 2}},
     })
     assert len(nodes) == 6

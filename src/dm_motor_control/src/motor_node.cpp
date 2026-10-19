@@ -157,7 +157,8 @@ struct Axis
   bool held_target{false};
   int64_t stamp{0};
   std::optional<rmw_gid_t> legacy_gid;
-  Target requested, active;
+  Target requested, active, applied;
+  bool applied_target_active{false};
   std::shared_ptr<GoalHandle> task;
   double task_start{0}, task_duration{0}, task_start_position{0};
   double settled_since{-1}, task_feedback_time{0};
@@ -406,6 +407,7 @@ private:
     axis->legacy_allowed = parameter<bool>(prefix, "legacy_control", false);
     axis->requested.mode = axis->config.mode;
     axis->active.mode = axis->config.mode;
+    axis->applied.mode = axis->config.mode;
     return axis;
   }
 
@@ -463,10 +465,12 @@ private:
     std::atomic_store(&axis.latest_target, api::msg::MotorSetpoint::ConstSharedPtr{});
     axis.streamed_target = false;
     axis.held_target = false;
+    axis.applied_target_active = false;
     axis.stamp = now().nanoseconds();
-    axis.requested = {}; axis.active = {};
+    axis.requested = {}; axis.active = {}; axis.applied = {};
     axis.requested.mode = axis.bus->snapshot(axis.config.name, steady_seconds()).mode;
     axis.active.mode = axis.requested.mode;
+    axis.applied.mode = axis.requested.mode;
     axis.legacy_gid.reset();
   }
 
@@ -627,9 +631,9 @@ private:
         msg.native_position = sample.feedback.p; msg.absolute_position = sample.absolute_position;
         msg.absolute_position_valid = sample.absolute_position_valid; msg.position_wraps = sample.position_wraps;
         msg.mos_temperature = sample.feedback.mos; msg.rotor_temperature = sample.feedback.rotor;
-        msg.target_active = sample.phase == Phase::Enabled && (axis.streamed_target || axis.task);
-        msg.target_position = axis.active.position; msg.target_velocity = axis.active.velocity;
-        msg.target_torque = axis.active.torque;
+        msg.target_active = sample.phase == Phase::Enabled && axis.applied_target_active;
+        msg.target_position = axis.applied.position; msg.target_velocity = axis.applied.velocity;
+        msg.target_torque = axis.applied.torque;
         msg.applied_target_sequence = axis.applied_sequence;
         msg.target_accept_latency_ms = axis.applied_target_age_ms;
         pending_feedback_.emplace_back(axis.feedback_publisher, std::move(msg));
@@ -781,9 +785,7 @@ private:
             if (item == catalog.end()) {throw std::invalid_argument("unknown/unpublished register address");}
             if (!req->write) {continue;}
             if (!item->writable) {throw std::invalid_argument("register is read-only");}
-            if (std::find(std::begin(protected_registers_), std::end(protected_registers_), item->rid) !=
-              std::end(protected_registers_))
-            {
+            if (!raw_register_write_allowed(item->rid)) {
               throw std::invalid_argument("register requires specialized maintenance; raw write prohibited");
             }
             double value = req->raw_values[i];
@@ -855,9 +857,7 @@ private:
           api::msg::RegisterDescriptor descriptor;
           descriptor.address = item.rid; descriptor.name = item.name;
           descriptor.integer = item.integer; descriptor.writable = item.writable;
-          descriptor.raw_write_allowed = item.writable &&
-            std::find(std::begin(protected_registers_), std::end(protected_registers_), item.rid) ==
-            std::end(protected_registers_);
+          descriptor.raw_write_allowed = raw_register_write_allowed(item.rid);
           descriptor.unit = item.unit; descriptor.has_minimum = item.minimum.has_value();
           descriptor.has_maximum = item.maximum.has_value();
           descriptor.minimum = item.minimum.value_or(0); descriptor.maximum = item.maximum.value_or(0);
@@ -1311,9 +1311,13 @@ private:
                   }
                   catch (const std::exception & error) {
                     ++axis->rejected;
-                    if (!incoming->hold_until_lease_expiry) {axis->bus->fail(axis->config.name, error.what());}
+                    const auto phase = axis->bus->snapshot(axis->config.name, time).phase;
+                    if (!incoming->hold_until_lease_expiry &&
+                      (phase == Phase::Enabled || phase == Phase::Enabling))
+                    {axis->bus->fail(axis->config.name, error.what());}
                     target_reply(*axis, *incoming, false, error.what());
-                    RCLCPP_ERROR(get_logger(), "Topic target rejected: %s", error.what());
+                    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+                      "Topic target rejected: %s", error.what());
                   }
                 }
               }
@@ -1357,11 +1361,13 @@ private:
           try {
             bus->tick(time);
             for (auto & axis : axes_) {
-              if (axis->bus == bus.get() && axis->streamed_target && !axis->task &&
-                bus->snapshot(axis->config.name, time).phase == Phase::Enabled)
-              {
-                axis->applied_sequence = axis->sequence;
-                axis->applied_target_age_ms = axis->accepted_target_age_ms;
+              if (axis->bus != bus.get()) {continue;}
+              axis->applied_target_active = (axis->streamed_target || axis->task) &&
+                bus->snapshot(axis->config.name, time).phase == Phase::Enabled;
+              if (axis->applied_target_active) {
+                axis->applied = axis->active;
+                axis->applied_sequence = axis->task ? 0 : axis->sequence;
+                axis->applied_target_age_ms = axis->task ? 0 : axis->accepted_target_age_ms;
               }
             }
           }
@@ -1576,7 +1582,6 @@ private:
   std::array<double, 2048> periods_{};
   size_t period_index_{0}, period_count_{0};
   std::array<double, 3> percentiles_{};
-  static constexpr uint8_t protected_registers_[]{0x07, 0x08, 0x09, 0x0a, 0x15, 0x16, 0x17, 0x23};
   rclcpp::TimerBase::SharedPtr state_timer_, diagnostics_timer_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;

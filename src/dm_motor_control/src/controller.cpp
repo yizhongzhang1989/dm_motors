@@ -1,5 +1,6 @@
 #include "dm_motor_control/core.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -77,7 +78,7 @@ void Controller::tick(double now)
     auto fb = decode_feedback(f, id_, master_, mapping_);
     if (!fb) {continue;}
     feedback_ = *fb;
-    last_feedback_ = now;
+    last_feedback_ = f.received_steady ? std::min(now, f.received_steady * 1e-9) : now;
     ++feedback_count_;
     if (fb->status > 1) {fail("motor fault code " + std::to_string(fb->status));}
     else if (phase_ == Phase::Enabling && fb->status == 1) {phase_ = Phase::Enabled;}

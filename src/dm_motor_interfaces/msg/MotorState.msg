@@ -15,6 +15,7 @@ float64 velocity
 float64 torque
 uint8 mos_temperature
 uint8 rotor_temperature
+# Seconds since host acquisition, including local receive queue delay.
 float64 feedback_age
 uint64 feedback_count
 string error
@@ -51,6 +52,7 @@ float64 direction
 float64 software_offset
 float64 position_min
 float64 position_max
+# Host monotonic seconds; header.stamp instead uses the node's ROS clock.
 float64 feedback_receive_time
 float64 feedback_rate
 uint64 rejected_commands

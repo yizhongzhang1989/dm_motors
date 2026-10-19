@@ -1,12 +1,47 @@
 """Topic transport contracts, without starting ROS or opening hardware."""
 
 from types import SimpleNamespace
+import importlib.util
+from pathlib import Path
 import unittest
 from unittest.mock import Mock
 
 from rclpy.time import Time
 from dm_motor_interfaces.msg import MotorRequest, MotorReply, MotorSetpoint, MotorTask, MotorTaskEvent, MotorTaskResult
 from dm_motor_control.topic_client import motor_topics, TopicTaskClient
+
+
+spec = importlib.util.spec_from_file_location(
+    "motor_cli_handshake_test", Path(__file__).resolve().parents[1] / "scripts/motor_client.py")
+motor_cli = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(motor_cli)
+
+
+class CliHandshakeTests(unittest.TestCase):
+    def test_capability_handshake_retries_only_the_readonly_query(self):
+        logger = Mock()
+        response = SimpleNamespace(ready=True)
+        client = SimpleNamespace(
+            call=Mock(side_effect=[TimeoutError("reply not discovered"), response]),
+            get_logger=lambda: logger)
+        self.assertIs(motor_cli.MotorClient.capabilities(client), response)
+        self.assertEqual(client.call.call_count, 2)
+        self.assertTrue(all(call.args[0] == "get_capabilities" for call in client.call.call_args_list))
+        logger.warning.assert_called_once()
+
+    def test_capability_handshake_has_a_finite_retry_budget(self):
+        client = SimpleNamespace(call=Mock(side_effect=TimeoutError("no reply")),
+                                 get_logger=lambda: Mock())
+        with self.assertRaisesRegex(TimeoutError, "no reply"):
+            motor_cli.MotorClient.capabilities(client)
+        self.assertEqual(client.call.call_count, 3)
+
+    def test_real_driver_failure_is_not_retried_or_hidden(self):
+        client = SimpleNamespace(call=Mock(return_value=SimpleNamespace(
+            ready=False, message="hardware initialization failed")), get_logger=lambda: Mock())
+        with self.assertRaisesRegex(RuntimeError, "hardware initialization failed"):
+            motor_cli.MotorClient.capabilities(client)
+        client.call.assert_called_once()
 
 
 class TopicTransportTests(unittest.TestCase):

@@ -6,6 +6,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("can_dashboard",
     Path(__file__).parents[1] / "scripts" / "dashboard.py")
@@ -66,11 +67,39 @@ class Validation(unittest.TestCase):
         self.assertEqual(snapshot["error_frames"], 1)
         self.assertEqual(snapshot["sequence"], 100)
 
+    def test_rates_above_1000_hz_do_not_saturate_at_history_capacity(self):
+        with patch.object(dashboard.time, "monotonic", return_value=0.0) as clock:
+            history = dashboard.History(capacity=10, id_capacity=3)
+            frame = {"can_id": 3, "channel": 0, "extended": False, "error": False, "data": [0]}
+            for _ in range(2000):
+                history.add("rx", frame)
+            clock.return_value = 1.0
+            snapshot = history.snapshot()
+            self.assertEqual(snapshot["rates"]["rx"], 2000.0)
+            self.assertEqual(snapshot["ids"][0]["rate"], 2000.0)
+            self.assertEqual(len(history.frames), 10)
+            clock.return_value = 2.0
+            idle = history.snapshot()
+            self.assertEqual(idle["rates"]["rx"], 0.0)
+            self.assertEqual(idle["ids"][0]["rate"], 0.0)
+
     def test_confirm_requires_true(self):
         for value in (False, 1, "true", None):
             with self.assertRaises(dashboard.ApiError):
                 dashboard.Dashboard.confirm({"confirm": value})
         dashboard.Dashboard.confirm({"confirm": True})
+
+    def test_release_accounts_for_unactivated_registration(self):
+        for confirmed, timeout in ((False, 2.0), (True, 0.3)):
+            node = SimpleNamespace(token="test-token", session={"id": "browser"},
+                                   heartbeat_confirmed=confirmed, expiry_until=0, notice="")
+            started = time.monotonic()
+            dashboard.Dashboard.clear_session(node, "released")
+            self.assertGreaterEqual(node.expiry_until, started + timeout)
+            self.assertLessEqual(node.expiry_until, time.monotonic() + timeout)
+            self.assertIsNone(node.session)
+            self.assertEqual(node.token, "")
+            self.assertFalse(node.heartbeat_confirmed)
 
     def test_public_epoch_exact_decimal_string(self):
         epoch = 3759903052227772295

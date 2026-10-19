@@ -119,6 +119,10 @@ TEST(RuntimeProtocol, CatalogExactlyMatchesPublishedItems)
   EXPECT_FALSE(c[29].maximum);
   EXPECT_FALSE(c[3].minimum_inclusive);
   EXPECT_FALSE(c[3].maximum_inclusive);
+  const std::set<uint8_t> allowed_writes{24, 25, 26, 27, 28, 31, 32, 33, 34};
+  for (const auto & r : c) {
+    EXPECT_EQ(raw_register_write_allowed(r.rid), allowed_writes.count(r.rid) != 0) << unsigned(r.rid);
+  }
 }
 TEST(RuntimeProtocol, FourModesUseGoldenBytesAndLengths)
 {
@@ -250,6 +254,37 @@ TEST_F(RuntimeTest, FeedbackObserverPreservesEveryFrameInOneReceiveBatch)
   ASSERT_GE(counts.size(), 10u);
   EXPECT_EQ(counts.size(), bus->snapshot("a", now).feedback_count - before);
   for (size_t i = 0; i < counts.size(); ++i) {EXPECT_EQ(counts[i], before + i + 1);}
+}
+TEST_F(RuntimeTest, FeedbackQueueDelayDoesNotRefreshAcquisitionTimeOrWatchdog)
+{
+  ready(); enable("a");
+  transport->receive();
+  transport->sim.drop_replies(true);
+  const auto state = bus->snapshot("a", now);
+  auto frame = feedback_frame(1, 0, state.feedback, state.mapping);
+  frame.received_steady = static_cast<uint64_t>(std::llround((now + 0.005) * 1e9));
+  transport->injected.push_back(frame);
+  now += 0.095;
+  bus->tick(now);
+  EXPECT_NEAR(bus->snapshot("a", now).feedback_age, 0.09, 1e-8);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Enabled);
+  now += 0.02;
+  bus->tick(now);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Fault);
+  EXPECT_EQ(bus->snapshot("a", now).error, "feedback timeout");
+}
+TEST_F(RuntimeTest, FeedbackAcquiredDuringCurrentCycleIsNotFalselyStale)
+{
+  ready(); enable("a");
+  transport->receive();
+  transport->sim.drop_replies(true);
+  const auto state = bus->snapshot("a", now);
+  auto frame = feedback_frame(1, 0, state.feedback, state.mapping);
+  frame.received_steady = static_cast<uint64_t>(std::llround((now + 0.006) * 1e9));
+  transport->injected.push_back(frame);
+  step();
+  EXPECT_DOUBLE_EQ(bus->snapshot("a", now).feedback_age, 0);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Enabled);
 }
 TEST_F(RuntimeTest, MultiMotorLatestTargetsAndIndependentStop)
 {

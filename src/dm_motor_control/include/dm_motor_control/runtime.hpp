@@ -23,6 +23,7 @@ struct RegisterInfo
   bool minimum_inclusive{true}, maximum_inclusive{true};
 };
 const std::vector<RegisterInfo> & register_catalog();
+bool raw_register_write_allowed(uint8_t rid);
 struct MotorConfig
 {
   std::string name;

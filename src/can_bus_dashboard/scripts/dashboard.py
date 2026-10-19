@@ -93,13 +93,12 @@ class History:
         self.error_frames = 0
         self.started = time.monotonic()
         self.totals = {"rx": 0, "written": 0, "submitted": 0}
-        self.events = {key: deque(maxlen=1000) for key in self.totals}
+        self.rate_windows = {key: self.rate_window(self.started) for key in self.totals}
 
     def add(self, direction, frame):
         now = time.monotonic()
         self.sequence += 1
         self.totals[direction] += 1
-        self.events[direction].append(now)
         self.error_frames += int(direction == "rx" and frame["error"])
         item = {"sequence": self.sequence, "time": now, "direction": direction, **frame}
         self.frames.append(item)
@@ -107,24 +106,34 @@ class History:
         if key not in self.ids:
             if len(self.ids) >= self.id_capacity:
                 self.ids.popitem(last=False)
-            self.ids[key] = {"count": 0, "times": deque(maxlen=1000)}
+            self.ids[key] = {"count": 0, "rate_window": self.rate_window(now)}
         record = self.ids[key]
         record["count"] += 1
-        record["times"].append(now)
         record["last"] = item
         self.ids.move_to_end(key)
 
     @staticmethod
-    def rate(times, now):
-        return sum(now - value <= 1 for value in times)
+    def rate_window(now):
+        return {"time": now, "count": 0, "value": 0.0}
+
+    @staticmethod
+    def rate(window, count, now):
+        elapsed = now - window["time"]
+        if elapsed >= 1.0:
+            window["value"] = (count - window["count"]) / elapsed
+            window["count"] = count
+            window["time"] = now
+        return round(window["value"], 1)
 
     def snapshot(self):
         now = time.monotonic()
         return {"capacity": self.frames.maxlen, "id_capacity": self.id_capacity,
                 "sequence": self.sequence, "error_frames": self.error_frames,
                 "totals": dict(self.totals),
-                "rates": {key: self.rate(times, now) for key, times in self.events.items()},
-                "ids": [{"count": value["count"], "rate": self.rate(value["times"], now),
+                "rates": {key: self.rate(window, self.totals[key], now)
+                          for key, window in self.rate_windows.items()},
+                "ids": [{"count": value["count"],
+                         "rate": self.rate(value["rate_window"], value["count"], now),
                          "last": value["last"]} for value in self.ids.values()]}
 
 
@@ -156,6 +165,7 @@ class Dashboard(Node):
         self.epoch = 0
         self.tx_sequence = 0
         self.hb_sequence = 0
+        self.heartbeat_confirmed = False
         self.last_browser = 0.0
         self.deadline = 0.0
         self.expiry_until = 0.0
@@ -188,6 +198,12 @@ class Dashboard(Node):
                 self.clear_session("Bus epoch changed; debug claim discarded.")
                 self.capabilities_known = False
                 self.can_fd = False
+            if self.token:
+                self.heartbeat_confirmed = self.heartbeat_confirmed or any(
+                    token == self.token and sequence > 0
+                    for token, sequence in zip(msg.client_tokens, msg.heartbeat_sequences, strict=True))
+                if any(error.startswith(self.token + ": ") for error in msg.client_errors):
+                    self.clear_session("Bus rejected or revoked this debug client; claim again after expiry.")
             # Capability tokens and token-bearing diagnostics never cross HTTP.
             errors = [item.partition(": ")[2] or "client rejection" for item in msg.client_errors]
             self.status = {key: getattr(msg, key) for key in
@@ -212,9 +228,10 @@ class Dashboard(Node):
 
     def clear_session(self, reason):
         if self.token:
-            self.expiry_until = time.monotonic() + 0.3
+            self.expiry_until = time.monotonic() + (0.3 if self.heartbeat_confirmed else 2.0)
         self.session = None
         self.token = ""
+        self.heartbeat_confirmed = False
         self.notice = reason
 
     def require_session(self, body):
@@ -232,7 +249,7 @@ class Dashboard(Node):
             now = time.monotonic()
             if self.session and (now - self.last_browser > 1 or now >= self.deadline
                                  or not self.connected() or not self.status["ready"]):
-                self.clear_session("Session ended; broker stop frames run on lease expiry (<=0.3s).")
+                self.clear_session("Session ended; active lease expires within 0.3s; unactivated routes within 2s.")
             if self.session:
                 self.hb_sequence += 1
                 self.heartbeat.publish(Heartbeat(token=self.token, epoch=self.epoch,
@@ -321,6 +338,8 @@ class Dashboard(Node):
                     raise ApiError(400, "stop_frames must match the exact claimed route/prefix")
                 if not self.registration.service_is_ready():
                     raise ApiError(503, "Registration service unavailable")
+                if not self.tx.get_subscription_count() or not self.heartbeat.get_subscription_count():
+                    raise ApiError(503, "CAN transmit/heartbeat discovery is not complete")
                 expected_epoch = self.status["epoch"]
                 req = RegisterClient.Request(client_name=self.client_name,
                     filters_rx=[], filters_tx=[FrameFilter(can_id=route["can_id"],
@@ -345,11 +364,12 @@ class Dashboard(Node):
             with self.lock:
                 if (self.closing or not self.connected() or response.epoch != expected_epoch
                         or time.monotonic() - started > 0.25):
-                    self.expiry_until = time.monotonic() + 0.3
+                    self.expiry_until = time.monotonic() + 2.0
                     raise ApiError(409, "Bus epoch/readiness changed or registration already too old")
                 self.token = response.token
                 self.epoch = response.epoch
                 self.tx_sequence = self.hb_sequence = 0
+                self.heartbeat_confirmed = False
                 self.active_sent = False
                 self.last_browser = time.monotonic()
                 self.deadline = self.last_browser + duration
@@ -370,8 +390,9 @@ class Dashboard(Node):
                 self.last_browser = time.monotonic()
                 return {"ok": True}
             if path == "/api/release":
-                self.clear_session("Released locally; broker expires within 0.3s and sends opaque stops.")
-                return {"ok": True, "immediate": False, "lease_expiry_seconds": 0.3}
+                expiry = 0.3 if self.heartbeat_confirmed else 2.0
+                self.clear_session(f"Released locally; broker expires within {expiry:g}s and sends opaque stops.")
+                return {"ok": True, "immediate": False, "lease_expiry_seconds": expiry}
             if path != "/api/send":
                 raise ApiError(404, "Unknown endpoint")
             self.confirm(body)

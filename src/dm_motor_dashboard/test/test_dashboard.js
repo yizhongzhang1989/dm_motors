@@ -151,7 +151,14 @@ async function runDashboardTests(html, source, css) {
   const el = (id) => doc.getElementById(id);
   const settle = async () => {
     for (let i = 0; i < 4; i += 1) {
-      await new Promise(r => setTimeout(r, 0));
+      // Yield a task without hidden-tab timer throttling delaying the mock harness.
+      await new Promise(resolve => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+          channel.port1.close(); channel.port2.close(); resolve();
+        };
+        channel.port2.postMessage(null);
+      });
       if (acceptConfirmations && doc.getElementById("confirmation").open) {
         doc.getElementById("confirmation-accept").click();
       }

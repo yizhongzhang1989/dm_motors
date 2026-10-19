@@ -141,15 +141,19 @@ class BusNode final : public rclcpp::Node
     s.all_quiet = std::all_of(router_.clients.begin(), router_.clients.end(),
       [](const auto & item) {
         const auto & c = item.second;
-        return c.revoked || (c.quiet && can_bus::steady_seconds() - c.last_heartbeat <= c.lease);
+        return c.revoked || (c.heartbeat_sequence && c.quiet &&
+          can_bus::steady_seconds() - c.last_heartbeat <= c.lease);
       });
     s.group_faults.assign(router_.group_faults.begin(), router_.group_faults.end());
     for (const auto & item : client_errors_) {s.client_errors.push_back(item.first + ": " + item.second);}
     for (const auto & item : router_.clients) {
+      if (item.second.revoked) {
+        s.client_errors.push_back(item.first + ": client lease revoked; relaunch required");
+      }
       s.client_names.push_back(item.second.name);
       s.client_tokens.push_back(item.first);
       s.heartbeat_sequences.push_back(item.second.heartbeat_sequence);
-      s.client_quiet.push_back(item.second.quiet);
+      s.client_quiet.push_back(item.second.heartbeat_sequence && item.second.quiet);
       s.client_faults.push_back(item.second.fault);
       const auto publisher = client_rx_.find(item.first);
       s.client_rx_ready.push_back(item.second.rx.empty() ||
@@ -170,8 +174,8 @@ class BusNode final : public rclcpp::Node
         [&](const auto & route) {return can_bus::matches(route, f);})) {
         client_rx_.at(item.first)->publish(m);
       }
-      observe(rx_pub_, m);
     }
+    observe(rx_pub_, m);
   }
   void transmit(const can_bus::Frame & f)
   {
@@ -297,6 +301,7 @@ public:
     registration_ = create_service<can_bus::srv::RegisterClient>("register_client",
       [this](const std::shared_ptr<can_bus::srv::RegisterClient::Request> req,
       std::shared_ptr<can_bus::srv::RegisterClient::Response> res) {
+        const double started = can_bus::steady_seconds();
         try {
           if (!ready_) {throw std::runtime_error("bus unavailable: " + error_);}
           can_bus::Client c; c.name = req->client_name; c.group = req->fault_group;
@@ -308,6 +313,11 @@ public:
             if (backend_ == "serial") {can_bus::serial_packet(can_bus::legacy_serial_frame(frame));}
             c.stops.push_back(frame);
           }
+          for (const auto & f : req->poll_frames) {
+            auto frame = decode(f);
+            if (backend_ == "serial") {can_bus::serial_packet(can_bus::legacy_serial_frame(frame));}
+            c.polls.push_back(frame);
+          }
           res->token = router_.add(std::move(c), can_bus::steady_seconds());
           for (auto it = client_rx_.begin(); it != client_rx_.end();) {
             if (!router_.clients.count(it->first)) {
@@ -318,6 +328,12 @@ public:
           client_rx_[res->token] = create_publisher<Wire>(relative, rclcpp::QoS(64).reliable());
           res->rx_topic = client_rx_[res->token]->get_topic_name();
           res->epoch = router_.epoch; res->success = true;
+          const double prepared = can_bus::steady_seconds();
+          router_.clients.at(res->token).last_heartbeat = prepared;
+          if (prepared - started > seconds(req->lease_duration) / 2) {
+            RCLCPP_WARN(get_logger(), "CAN registration %s took %.3f s; lease starts after RX setup",
+              req->client_name.c_str(), prepared - started);
+          }
         } catch (const std::exception & e) {res->message = e.what();}
       });
     maintenance_ = create_service<can_bus::srv::Maintenance>("maintenance",

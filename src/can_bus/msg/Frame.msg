@@ -8,4 +8,5 @@ bool fd
 bool brs
 uint8 length
 uint8[<=64] data
+# Host monotonic acquisition nanoseconds; preserved when routing physical RX.
 uint64 received_steady

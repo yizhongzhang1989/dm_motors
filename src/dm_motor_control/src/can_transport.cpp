@@ -97,6 +97,7 @@ struct CanTransport::Impl
   bool quiet_confirmed{false};
   bool endpoint_ready{false}, endpoint_seen{false};
   bool broker_rx_ready{false};
+  bool heartbeat_confirmed{false};
   bool receive_verified{false};
   double last_probe{0};
   bool activity_requires_stop{false}, stop_published{false};
@@ -114,7 +115,8 @@ struct CanTransport::Impl
   }
   bool channels_ready() const
   {
-    return registered && status_ready && endpoint_ready && broker_rx_ready && failure.empty() && rx_sub &&
+    return registered && status_ready && endpoint_ready && broker_rx_ready && heartbeat_confirmed &&
+      failure.empty() && rx_sub &&
       rx_sub->get_publisher_count() > 0 && tx->get_subscription_count() > 0 &&
       heartbeat->get_subscription_count() > 0 &&
       can_bus::steady_seconds() - last_status < std::max(timeout, .5);
@@ -162,6 +164,8 @@ struct CanTransport::Impl
       auto stop_frame = special_frame(command_id, 0xfd); stop_frame.fd = fd;
       request.stop_frames.push_back(encode(stop_frame));
     }
+    auto poll_frame = query_frame(id); poll_frame.fd = fd;
+    request.poll_frames.push_back(encode(poll_frame));
     request.filters_rx = {filter(master, {id}, {15})};
     for (uint8_t opcode : {0x33, 0x55, 0xaa}) {
       request.filters_rx.push_back(filter(master, {id, 0, opcode}, {255, 255, 255}));
@@ -184,6 +188,7 @@ struct CanTransport::Impl
           s->group_faults.end()) {fail("CAN fault group latched; relaunch required: " + group);}
         if (registered) {
           quiet_confirmed = false;
+          heartbeat_confirmed = false;
           for (size_t i = 0; i < s->client_tokens.size(); ++i) {
             if (s->client_tokens[i] == token && i < s->client_rx_ready.size()) {
               broker_rx_ready = s->client_rx_ready[i];
@@ -191,6 +196,7 @@ struct CanTransport::Impl
             if (s->client_tokens[i] == token && i < s->heartbeat_sequences.size() &&
               i < s->client_quiet.size())
             {
+              heartbeat_confirmed = s->heartbeat_sequences[i] > 0;
               quiet_confirmed = s->client_quiet[i] && s->heartbeat_sequences[i] >= quiet_sequence;
             }
           }
@@ -269,7 +275,8 @@ struct CanTransport::Impl
     }
     if (!registered && !registering) {
       if (now - started > 10) {fail("CAN bus registration service unavailable"); return;}
-      if (!status_ready || !registration->service_is_ready()) {return;}
+      if (!status_ready || !registration->service_is_ready() ||
+        tx->get_subscription_count() == 0 || heartbeat->get_subscription_count() == 0) {return;}
       registering = true; registration_started = now;
       auto future = registration->async_send_request(std::make_shared<Register::Request>(request),
         [this](rclcpp::Client<Register>::SharedFuture result) {
@@ -277,6 +284,10 @@ struct CanTransport::Impl
           registering = false;
           if (!failure.empty()) {return;}
           try {
+            RCLCPP_DEBUG(node->get_logger(),
+              "CAN registration reply after %.3f s; TX matches=%zu, heartbeat matches=%zu",
+              can_bus::steady_seconds() - registration_started,
+              tx->get_subscription_count(), heartbeat->get_subscription_count());
             const auto reply = result.get();
             if (!reply->success) {fail("CAN registration rejected: " + reply->message); return;}
             if (reply->epoch != seen_epoch) {fail("CAN epoch changed during registration"); return;}
@@ -295,8 +306,7 @@ struct CanTransport::Impl
         fail("CAN initial read-only status round trip timed out; inspect device and RX/TX channels");
         return;
       }
-      if (channels_ready() && now - last_probe >= .05 && !external_maintenance_locked() &&
-        !maintenance_pending && !maintenance_owned && !releasing)
+      if (channels_ready() && now - last_probe >= .05)
       {
         can_bus::msg::TxFrame probe;
         probe.token = token; probe.epoch = epoch; probe.sequence = ++sequence;
@@ -323,12 +333,10 @@ struct CanTransport::Impl
   }
   void flush_outgoing(double now)
   {
-    // Polls are replaceable observations, not operations: expected bus-wide
-    // maintenance suppression must never become a motor transport fault.
-    const bool suppress_queries = maintenance_pending || releasing ||
-      external_maintenance_locked();
+    // The runtime suppresses its own polls during ambiguous parameter transactions.
+    // Other clients' maintenance must not starve this motor's absolute-position tracking.
     outgoing.erase(std::remove_if(outgoing.begin(), outgoing.end(), [&](const auto & pending) {
-      return query(pending.first) && (suppress_queries || now - pending.second > .1);
+      return query(pending.first) && now - pending.second > .1;
     }), outgoing.end());
     if (outgoing.empty()) {return;}
     auto & pending = outgoing.front();
@@ -336,7 +344,7 @@ struct CanTransport::Impl
       fail("remote CAN send expired before transmission"); return;
     }
     const auto & f = pending.first;
-    if (!stop(f) && (maintenance_pending || releasing ||
+    if (!stop(f) && !query(f) && (maintenance_pending || releasing ||
       external_maintenance_locked() || (maintenance_frame(f) && !maintenance_owned))) {return;}
     can_bus::msg::TxFrame m;
     m.token = token; m.epoch = epoch; m.sequence = ++sequence;
@@ -398,14 +406,13 @@ CanTransport::~CanTransport() = default;
 void CanTransport::send(const Frame & f)
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (f.length > 8 || f.id > 0x7ff || f.channel || (f.brs && !f.fd)) {
+  const bool fd = impl_->request.stop_frames.front().fd;
+  if (f.length > 8 || f.id > 0x7ff || f.channel || (f.brs && !f.fd) || (f.fd && !fd)) {
     throw std::invalid_argument("invalid DM remote CAN frame");
   }
   if (!impl_->ready_locked() && !stop(f)) {
     throw std::runtime_error(impl_->failure.empty() ? "CAN transport not registered/ready" : impl_->failure);
   }
-  if (query(f) && (impl_->maintenance_pending || impl_->releasing ||
-    impl_->external_maintenance_locked())) {return;}
   if (!stop(f) && !maintenance_frame(f) && f.id != 0x7ff &&
     (impl_->maintenance_owned || impl_->maintenance_pending || impl_->releasing ||
     !impl_->owner.empty() || impl_->fault || impl_->fault_clear_pending)) {
@@ -435,7 +442,9 @@ void CanTransport::send(const Frame & f)
     }), queue.end());
   }
   if (impl_->outgoing.size() >= 32) {throw std::runtime_error("remote CAN transmit queue full");}
-  impl_->outgoing.emplace_back(f, can_bus::steady_seconds());
+  auto wire_frame = f;
+  wire_frame.fd = fd;
+  impl_->outgoing.emplace_back(wire_frame, can_bus::steady_seconds());
   if (!maintenance_frame(f) && impl_->registered && !impl_->shutting_down &&
     impl_->failure.empty())
   {

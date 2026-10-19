@@ -76,6 +76,8 @@ class SplitProcesses(unittest.TestCase):
             command += ["-p", "fault_group:=paired"]
         if self._testMethodName == "test_startup_multiturn_mode_and_following_across_both_boundaries":
             command += ["-p", "mode:=2", "-p", "configure_mode_on_startup:=true"]
+        if self._testMethodName == "test_fd_motor_uses_native_frames_and_registered_stops":
+            command += ["-p", "can_fd:=true"]
         self.start(name, command)
 
     def wait(self, predicate, timeout=5, action=None):
@@ -135,6 +137,25 @@ class SplitProcesses(unittest.TestCase):
         self.node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
+    def test_fd_motor_uses_native_frames_and_registered_stops(self):
+        frames = []
+        subscription = self.node.create_subscription(
+            Frame, self.bus_namespace + "/wire_tx", frames.append, 512)
+        try:
+            self.enable("one")
+            self.publish("one")
+            self.wait(lambda: any(frame.can_id == 1 for frame in frames))
+            self.call(self.operations["one"], MotorOperation.Request(operation=MotorOperation.Request.DISABLE))
+            self.wait(lambda: self.states["one"].phase == MotorState.DISABLED
+                      and self.states["one"].status == 0 and self.states["one"].feedback_fresh)
+            self.assertFalse(self.states["one"].host_fault)
+            self.assertTrue(frames)
+            self.assertTrue(all(frame.fd and not frame.brs for frame in frames))
+            self.assertTrue(any(frame.can_id == 1 and list(frame.data) == [255] * 7 + [253]
+                                for frame in frames))
+        finally:
+            self.node.destroy_subscription(subscription)
 
     def test_motor_process_death_does_not_take_down_other_motor_or_bus(self):
         self.enable("one")

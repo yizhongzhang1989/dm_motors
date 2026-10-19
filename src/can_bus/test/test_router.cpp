@@ -37,11 +37,55 @@ TEST(Router, EpochSequenceTtlAndBudget)
   EXPECT_TRUE(router.drain(.2).empty());
   EXPECT_EQ(router.rejected, 1u);
 }
+TEST(Router, RegistrationNeedsFreshHeartbeatBeforeNormalTrafficOrMaintenance)
+{
+  can_bus::Router router(42);
+  auto c = client("discovering", 3); c.group.clear();
+  const auto token = router.add(c, 0);
+  can_bus::Frame command; command.id = 3;
+  router.enqueue(token, 42, 1, .1, 0, command, .01, true, 10000000);
+  EXPECT_TRUE(router.drain(.02).empty());
+  EXPECT_FALSE(router.maintenance(token, 42, true, .6, .03));
+  EXPECT_TRUE(router.drain(.2).empty());
+  EXPECT_EQ(router.rejected, 1u);
+  EXPECT_TRUE(router.drain(.6).empty());
+  EXPECT_FALSE(router.clients.at(token).revoked);
+  ASSERT_NO_THROW(router.heartbeat(token, 42, 1, false, false, .7, 700000000));
+  router.enqueue(token, 42, 2, .1, 0, command, .71, true, 710000000);
+  EXPECT_EQ(router.drain(.72).size(), 1u);
+  EXPECT_EQ(router.drain(1.21).size(), 1u);
+  EXPECT_TRUE(router.clients.at(token).revoked);
+}
+TEST(Router, UnactivatedRegistrationIsBoundedAndStopsStillBypassTheHandshake)
+{
+  can_bus::Router router(42);
+  auto c = client("missing_heartbeat", 3); c.group.clear();
+  const auto token = router.add(c, 0);
+  router.enqueue(token, 42, 1, .1, 1, c.stops.front(), .01);
+  ASSERT_EQ(router.drain(.02).size(), 1u);
+  EXPECT_TRUE(router.drain(1.9).empty());
+  EXPECT_FALSE(router.clients.at(token).revoked);
+  EXPECT_EQ(router.drain(2.01).size(), 1u);
+  EXPECT_TRUE(router.clients.at(token).revoked);
+  EXPECT_THROW(router.heartbeat(token, 42, 1, true, false, 2.02), std::invalid_argument);
+}
+TEST(Router, MaintenanceWaitsForEveryClientHeartbeatHandshake)
+{
+  can_bus::Router router(42);
+  const auto a = router.add(client("a", 3), 0);
+  EXPECT_FALSE(router.maintenance(a, 42, true, .6, .01));
+  router.heartbeat(a, 42, 1, true, false, .02);
+  const auto b = router.add(client("b", 4), .02);
+  EXPECT_FALSE(router.maintenance(a, 42, true, .6, .03));
+  router.heartbeat(b, 42, 1, true, false, .04);
+  EXPECT_TRUE(router.maintenance(a, 42, true, .6, .05));
+}
 TEST(Router, HeartbeatExpiryStopsAndLatchesGroup)
 {
   can_bus::Router router(42);
   const auto a = router.add(client("a", 3), 0);
   const auto b = router.add(client("b", 4), 0);
+  router.heartbeat(a, 42, 1, true, false, 0);
   router.heartbeat(b, 42, 1, true, false, .3);
   const auto frames = router.drain(.51);
   ASSERT_EQ(frames.size(), 2u);
@@ -55,6 +99,7 @@ TEST(Router, ExplicitRelaunchGetsNewTokenAndCannotReviveOldEpochLease)
   can_bus::Router router(42);
   auto c = client("device", 3); c.group.clear();
   const auto first = router.add(c, 0);
+  router.heartbeat(first, 42, 1, true, false, 0);
   router.drain(.6);
   const auto second = router.add(c, .7);
   EXPECT_NE(first, second);
@@ -96,6 +141,7 @@ TEST(Router, MaintenanceRequiresFreshQuietClients)
   can_bus::Router router(42);
   const auto a = router.add(client("a", 3), 0);
   const auto b = router.add(client("b", 4), 0);
+  router.heartbeat(a, 42, 1, true, false, 0);
   router.heartbeat(b, 42, 1, false, false, .01);
   EXPECT_FALSE(router.maintenance(a, 42, true, .6, .02));
   router.heartbeat(b, 42, 2, true, false, .03);
@@ -105,11 +151,49 @@ TEST(Router, MaintenanceRequiresFreshQuietClients)
   EXPECT_FALSE(router.maintenance(b, 42, true, .6, .05));
   EXPECT_TRUE(router.maintenance(a, 42, false, .6, .06));
 }
+TEST(Router, MaintenanceAllowsOnlyExactDeclaredInactivePollsFromOtherClients)
+{
+  can_bus::Router router(42);
+  const auto a = router.add(client("owner", 3), 0);
+  auto device = client("polling_device", 4);
+  can_bus::Frame poll; poll.id = 4; poll.data[0] = 0x42;
+  device.polls = {poll};
+  const auto b = router.add(device, 0);
+  router.heartbeat(a, 42, 1, true, false, 0);
+  router.heartbeat(b, 42, 1, true, false, 0);
+  ASSERT_TRUE(router.maintenance(a, 42, true, .6, .01));
+  EXPECT_NO_THROW(router.enqueue(b, 42, 1, .1, 0, poll, .02));
+  const auto sent = router.drain(.03);
+  ASSERT_EQ(sent.size(), 1u);
+  EXPECT_EQ(sent.front().id, 4u);
+  EXPECT_EQ(sent.front().data, poll.data);
+  EXPECT_TRUE(router.clients.at(b).quiet);
+  EXPECT_EQ(router.maintenance_owner, a);
+  auto changed = poll; changed.data[0] ^= 1;
+  EXPECT_THROW(router.enqueue(b, 42, 2, .1, 0, changed, .04), std::invalid_argument);
+  EXPECT_THROW(router.enqueue(b, 42, 2, .1, 0, poll, .04, true), std::invalid_argument);
+  EXPECT_THROW(router.enqueue(b, 42, 2, .1, 2, poll, .04), std::invalid_argument);
+}
+TEST(Router, DeclaredPollsMustBeValidBoundedAndWithinOwnedRoutes)
+{
+  can_bus::Router router(42);
+  auto c = client("invalid_poll", 3);
+  can_bus::Frame poll; poll.id = 4;
+  c.polls = {poll};
+  EXPECT_THROW(router.add(c, 0), std::invalid_argument);
+  poll.id = 3; poll.length = 9;
+  c.polls = {poll};
+  EXPECT_THROW(router.add(c, 0), std::invalid_argument);
+  poll.length = 8;
+  c.polls.assign(17, poll);
+  EXPECT_THROW(router.add(c, 0), std::invalid_argument);
+}
 TEST(Router, ActivityAndStaleQuietHeartbeatCannotRaceMaintenance)
 {
   can_bus::Router router(42);
   const auto a = router.add(client("a", 3), 0);
   const auto b = router.add(client("b", 4), 0);
+  router.heartbeat(a, 42, 1, true, false, 0);
   can_bus::Frame f; f.id = 4;
   router.enqueue(b, 42, 1, .1, 0, f, .02, true, 20000000);
   router.heartbeat(b, 42, 1, true, false, .03, 10000000);
@@ -133,19 +217,21 @@ TEST(Router, FreshQuietHeartbeatRequiresDispatchedStopAfterActivity)
   const auto a = router.add(client("observer", 3), 0);
   const auto device = client("active_device", 4);
   const auto b = router.add(device, 0);
+  router.heartbeat(a, 42, 1, true, false, 0);
+  router.heartbeat(b, 42, 1, true, false, 0);
   can_bus::Frame command; command.id = 4;
   router.enqueue(b, 42, 1, .1, 0, command, .01, true, 10000000);
   router.drain(.02);
-  router.heartbeat(b, 42, 1, true, false, .03, 30000000);
+  router.heartbeat(b, 42, 2, true, false, .03, 30000000);
   EXPECT_FALSE(router.clients.at(b).quiet);
   EXPECT_FALSE(router.maintenance(a, 42, true, .6, .04));
   router.enqueue(b, 42, 2, .1, 1, device.stops.front(), .05);
-  router.heartbeat(b, 42, 2, true, false, .06, 60000000);
+  router.heartbeat(b, 42, 3, true, false, .06, 60000000);
   EXPECT_FALSE(router.maintenance(a, 42, true, .6, .07));
   router.drain(.08);
-  router.heartbeat(b, 42, 3, true, false, .09, 60000000);
+  router.heartbeat(b, 42, 4, true, false, .09, 60000000);
   EXPECT_FALSE(router.maintenance(a, 42, true, .6, .10));
-  router.heartbeat(b, 42, 4, true, false, .11, 110000000);
+  router.heartbeat(b, 42, 5, true, false, .11, 110000000);
   EXPECT_TRUE(router.clients.at(b).quiet);
   EXPECT_TRUE(router.maintenance(a, 42, true, .6, .12));
 }
@@ -153,6 +239,7 @@ TEST(Router, MaintenanceFifoHasBoundedCapacity)
 {
   can_bus::Router router(42);
   const auto token = router.add(client("device", 3), 0);
+  router.heartbeat(token, 42, 1, true, false, 0);
   ASSERT_TRUE(router.maintenance(token, 42, true, .6, .01));
   can_bus::Frame f; f.id = 0x7ff; f.data[0] = 3;
   for (unsigned i = 1; i <= 32; ++i) {
@@ -195,6 +282,8 @@ TEST(Router, PrivateReceiveReadinessHoldsOnlyItsOwnNormalTraffic)
   const auto device = client("late_receiver", 3);
   const auto a = router.add(device, 0);
   const auto b = router.add(client("ready_receiver", 4), 0);
+  router.heartbeat(a, 42, 1, true, false, 0);
+  router.heartbeat(b, 42, 1, true, false, 0);
   router.clients.at(a).receive_ready = false;
   can_bus::Frame command; command.id = 3;
   router.enqueue(a, 42, 1, .1, 0, command, .01);
@@ -230,6 +319,8 @@ TEST(Router, StopsPrecedeOtherClientsNormalTraffic)
   auto b = client("b", 4);
   const auto first = router.add(a, 0);
   const auto second = router.add(b, 0);
+  router.heartbeat(first, 42, 1, true, false, 0);
+  router.heartbeat(second, 42, 1, true, false, 0);
   can_bus::Frame normal; normal.id = 3;
   router.enqueue(first, 42, 1, .1, 0, normal, .01);
   router.enqueue(second, 42, 1, .1, 1, b.stops.front(), .01);

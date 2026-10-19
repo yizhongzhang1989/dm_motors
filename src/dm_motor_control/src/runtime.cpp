@@ -151,6 +151,11 @@ const std::vector<RegisterInfo> & register_catalog()
   return catalog;
 }
 
+bool raw_register_write_allowed(uint8_t rid)
+{
+  return info(rid).writable && ((rid >= 24 && rid <= 28) || (rid >= 31 && rid <= 34));
+}
+
 uint16_t control_id(uint8_t id, Mode mode)
 {
   if (id < 1 || id > 15 || unsigned(mode) < 1 || unsigned(mode) > 4) {
@@ -613,7 +618,8 @@ struct Bus::Impl
           m.tracking_time = received;
         }
       }
-      m.state.feedback = *fb; m.last_feedback = now; ++m.state.feedback_count;
+      // A concurrent RX may be newer than the cycle start, but queued RX must retain its age.
+      m.state.feedback = *fb; m.last_feedback = std::min(now, received); ++m.state.feedback_count;
       if (fb->status > 1) {
         if (!m.state.device_fault) {m.last_stop = -1;}
         m.state.device_fault = true;
@@ -877,11 +883,8 @@ uint64_t Bus::write_register(const std::string & name, uint8_t rid, uint32_t raw
   std::string rejection;
   try {
     validate_raw(rid, raw);
-    if (rid == 7 || rid == 8 || rid == 9 || rid == 10 || (rid >= 21 && rid <= 23) ||
-      rid == 35) {throw std::invalid_argument("reserved maintenance register; specialized path required");}
-    // Protection and motor-identity constants need an audited commissioning workflow.
-    if (rid <= 6 || rid == 29 || rid == 30) {
-      throw std::invalid_argument("high-risk commissioning write not supported by generic service");
+    if (!raw_register_write_allowed(rid)) {
+      throw std::invalid_argument("register requires specialized maintenance; raw write prohibited");
     }
   } catch (const std::exception & e) {rejection = e.what();}
   return b.enqueue(i, Impl::Kind::Write, rid, raw, now, rejection);

@@ -273,6 +273,21 @@ TEST(Controller, StartupRequiresFreshFeedback)
   EXPECT_THROW(c.enable(0.12), std::runtime_error);
   EXPECT_EQ(c.phase(), Phase::Disabled);
 }
+TEST(Controller, FeedbackAgeAndTimeoutUseAcquisitionTime)
+{
+  FakeTransport t;
+  Controller c(t, 7, 0, {}, {}, 0.25, 0.1);
+  t.feedback(0); c.tick(1.0);
+  c.enable(1.001);
+  t.feedback(1);
+  t.incoming.back().received_steady = 1005000000;
+  c.tick(1.095);
+  EXPECT_NEAR(c.age(1.095), 0.09, 1e-9);
+  EXPECT_EQ(c.phase(), Phase::Enabled);
+  c.tick(1.115);
+  EXPECT_EQ(c.phase(), Phase::Fault);
+  EXPECT_EQ(c.error(), "feedback timeout");
+}
 TEST(Controller, ConfirmationStopResetAndNoOldTarget)
 {
   FakeTransport t;

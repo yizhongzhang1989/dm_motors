@@ -52,6 +52,32 @@ def compose(context):
         if any(port < 1 or port > 65535 for port in ports) or len(set(ports)) != len(ports):
             raise ValueError("Dashboard ports must be unique and within 1..65535")
     identities = set()
+    motor_options = {}
+    command_ids = {bus_name: set() for bus_name in buses}
+    for name in names:
+        if name not in motor_config or not isinstance(motor_config[name], dict):
+            raise ValueError(f"Missing motor configuration: {name}")
+        values = {**shared, **motor_config[name]}
+        bus_name = values.get("bus", "main")
+        if bus_name not in buses:
+            raise ValueError(f"Motor {name} refers to unknown bus {bus_name}")
+        values["bus"] = bus_name
+        for field, default, low, high in (("motor_id", 1, 1, 15),
+                                         ("master_id", 0, 0, 0x7fe), ("mode", 1, 1, 4)):
+            value = values.get(field, default)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"motors.{name}.{field} must be an integer in {low}..{high}")
+            values[field] = value
+        identity = (bus_name, values["motor_id"])
+        if identity in identities:
+            raise ValueError("Duplicate motor ID on the same bus")
+        identities.add(identity)
+        command_ids[bus_name].update(values["motor_id"] + offset for offset in (0, 0x100, 0x200, 0x300))
+        motor_options[name] = values
+    for name, values in motor_options.items():
+        if values["master_id"] in command_ids[values["bus"]]:
+            raise ValueError(f"Motor {name} feedback master_id collides with a motor control CAN ID "
+                             f"on bus {values['bus']}")
     hardware_paths = set()
     for bus_name in buses:
         if bus_name not in bus_config or not isinstance(bus_config[bus_name], dict):
@@ -81,37 +107,27 @@ def compose(context):
                 namespace=bus_namespace,
                 parameters=[{"bus_namespace": bus_namespace, "host": host,
                              "port": can_port + buses.index(bus_name)}], output="screen"))
-        selected = [
-            name for name in names if isinstance(motor_config.get(name), dict)
-            and motor_config[name].get("bus", "main") == bus_name]
+        selected = [name for name in names if motor_options[name]["bus"] == bus_name]
         if not selected:
             raise ValueError(f"Bus {bus_name} is unused by this motor configuration; launch it separately")
         if backend == "sim":
             sim_parameters = {"motor_names": selected, "can_bus_namespace": bus_namespace}
             for name in selected:
-                values = motor_config[name]
+                values = motor_options[name]
                 sim_parameters.update({
-                    f"motors.{name}.motor_id": values.get("motor_id", 1),
-                    f"motors.{name}.master_id": values.get("master_id", 0),
-                    f"motors.{name}.mode": values.get("mode", 1),
+                    f"motors.{name}.motor_id": values["motor_id"],
+                    f"motors.{name}.master_id": values["master_id"],
+                    f"motors.{name}.mode": values["mode"],
                 })
             nodes.append(Node(
                 package="dm_motor_control", executable="can_motor_simulator",
                 name="motor_simulator", namespace=bus_namespace,
                 parameters=[sim_parameters], output="screen"))
     for name in names:
-        if name not in motor_config or not isinstance(motor_config[name], dict):
-            raise ValueError(f"Missing motor configuration: {name}")
-        values = dict(motor_config[name])
-        bus_name = values.pop("bus", "main")
-        if bus_name not in buses:
-            raise ValueError(f"Motor {name} refers to unknown bus {bus_name}")
-        identity = (bus_name, values.get("motor_id", 1))
-        if identity in identities:
-            raise ValueError("Duplicate motor ID on the same bus")
-        identities.add(identity)
+        values = dict(motor_options[name])
+        bus_name = values.pop("bus")
         bus_namespace = "/" + "/".join(part for part in (root, "can", bus_name) if part)
-        values = {**shared, **values, "motor_name": name, "can_bus_namespace": bus_namespace,
+        values = {**values, "motor_name": name, "can_bus_namespace": bus_namespace,
                   "can_fd": bus_config[bus_name].get("can_fd", False)}
         if rate is not None:
             values["control_rate"] = rate

@@ -18,7 +18,7 @@ struct Client
 {
   std::string name, token, group;
   std::vector<Filter> rx, tx;
-  std::vector<Frame> stops;
+  std::vector<Frame> stops, polls;
   double lease{0.5}, last_heartbeat{0}, max_tx_hz{1000}, next_tx{0};
   uint64_t tx_sequence{0}, heartbeat_sequence{0};
   uint64_t last_activity_steady{0};

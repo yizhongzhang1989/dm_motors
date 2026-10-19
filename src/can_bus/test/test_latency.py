@@ -18,7 +18,7 @@ from can_bus.msg import Frame, FrameFilter, Heartbeat, Status, TxFrame
 from can_bus.srv import RegisterClient
 
 
-class BrokerLatency(unittest.TestCase):
+class BrokerFixture(unittest.TestCase):
     def setUp(self):
         os.environ["ROS_DOMAIN_ID"] = str(30 + os.getpid() % 40)
         rclpy.init()
@@ -52,6 +52,8 @@ class BrokerLatency(unittest.TestCase):
         self.registration = self.node.create_client(RegisterClient, "register_client")
         self.wait(lambda: self.state is not None and self.state.ready and self.state.endpoint_ready)
         self.assertTrue(self.registration.wait_for_service(timeout_sec=2))
+
+    def register_probe(self):
         request = RegisterClient.Request(
             client_name="latency_probe", filters_tx=[FrameFilter(can_id=0x321, mask=0x7ff)],
             stop_frames=[Frame(can_id=0x321, length=8, data=[255] * 7 + [253])],
@@ -107,6 +109,12 @@ class BrokerLatency(unittest.TestCase):
         self.tx.publish(message)
         return sent
 
+
+class BrokerLatency(BrokerFixture):
+    def setUp(self):
+        super().setUp()
+        self.register_probe()
+
     def test_sparse_tx_does_not_wait_for_the_50ms_io_poll(self):
         ages = []
         for _ in range(12):
@@ -145,6 +153,33 @@ class BrokerLatency(unittest.TestCase):
         future = getter.call_async(GetParameters.Request(names=["io_rate"]))
         self.wait(future.done)
         self.assertEqual(future.result().values[0].double_value, 20.0)
+
+
+class BrokerObservation(BrokerFixture):
+    def test_public_rx_is_once_per_frame_with_zero_one_and_two_clients(self):
+        received = []
+        subscription = self.node.create_subscription(Frame, "rx", received.append, 64)
+        self.addCleanup(self.node.destroy_subscription, subscription)
+        self.wait(lambda: self.node.count_publishers(subscription.topic_name) > 0
+                  and self.virtual_rx.get_subscription_count() > 0)
+        for clients in range(3):
+            if clients:
+                future = self.registration.call_async(RegisterClient.Request(
+                    client_name=f"observer_{clients}", lease_duration=Duration(sec=1),
+                    max_tx_hz=1000.0))
+                self.wait(future.done)
+                self.assertTrue(future.result().success, future.result().message)
+                self.wait(lambda: self.state.clients == clients)
+            before = len(received)
+            bus_count = self.state.rx_count
+            self.virtual_rx.publish(Frame(can_id=0x456, length=8, data=[clients] * 8))
+            self.wait(lambda: self.state.rx_count > bus_count)
+            deadline = time.monotonic() + 0.05
+            while time.monotonic() < deadline:
+                self.spin()
+            with self.subTest(clients=clients):
+                self.assertEqual([list(frame.data) for frame in received[before:]],
+                                 [[clients] * 8])
 
 
 if __name__ == "__main__":

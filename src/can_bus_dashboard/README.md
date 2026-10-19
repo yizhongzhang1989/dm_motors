@@ -35,8 +35,11 @@ acknowledgment. Error-frame observations are distinct from broker errors;
 hardware errors may instead latch `ready=false` before an RX frame is emitted.
 Actual status counters remain authoritative if monitoring loses DDS samples.
 
-Frame history: 1000 entries; per-ID/direction recent table: 512 keys, 1000
-timestamps per key; trailing-one-second rates cap at 1000 samples/s. Old keys
+Frame history: 1000 entries; per-ID/direction recent table: 512 keys. Rates use
+counter differences over completed measurement windows of at least one second,
+with zero during initial warm-up. Slower polling lengthens the measurement window;
+rates are not capped by retained frame history. Only constant-size rate state is
+kept per direction/key, rather than one timestamp per observed frame. Old keys
 evict least recently observed. DDS histories are bounded (64, status 1).
 HTTP permits at most 16 concurrent handlers, 16 pending connections, two-second
 socket read timeouts and 16 KiB JSON bodies. Browser polls sequentially at up to
@@ -91,7 +94,8 @@ oversized bodies and cross-site requests are rejected. Errors are
   epoch, ROS publication stamp, monotonic activity stamp and 200ms TTL.
   `active=true` unless the claim explicitly selected read-only.
 * `POST /api/release {"session":"..."}`: `ok`, `immediate:false`,
-  `lease_expiry_seconds:0.3`. Broker has no unregister API; local release stops
+  `lease_expiry_seconds:0.3` after heartbeat activation, or `2.0` while the
+  initial registration is still unconfirmed. Broker has no unregister API; local release stops
   renewal, then broker expiry clears work and dispatches opaque stops once.
   Reclaim waits for expiry. Process death follows the same expiry mechanism.
   The current broker retains revoked route reservations until same-name

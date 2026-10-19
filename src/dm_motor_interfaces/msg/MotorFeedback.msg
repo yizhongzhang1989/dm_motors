@@ -1,5 +1,6 @@
 uint8 motor_id
 uint64 feedback_count
+# Host monotonic acquisition seconds, not ROS time or a device sampling timestamp.
 float64 receive_time
 float64 position
 float64 velocity
@@ -11,6 +12,7 @@ int64 position_wraps
 uint8 mos_temperature
 uint8 rotor_temperature
 bool target_active
+# Latest software-dispatched target at feedback processing, not a device acknowledgement.
 float64 target_position
 float64 target_velocity
 float64 target_torque
