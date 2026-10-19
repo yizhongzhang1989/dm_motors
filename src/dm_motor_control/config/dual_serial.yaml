@@ -1,5 +1,5 @@
 # Site-specific independent motors. Firmware owns physical protection.
-# No motion or automatic enable is performed by launch.
+# MIT mode is verified/configured in RAM while disabled; no enable or Flash save.
 /**:
   ros__parameters:
     control_rate: 200.0
@@ -20,6 +20,7 @@
         master_id: 0
         profile: j4310_v12
         mode: 1
+        configure_mode_on_startup: true
         direction: 1.0
         host_protection_enabled: false
         fault_group: ""
@@ -33,6 +34,7 @@
         master_id: 0
         profile: j4310_v12
         mode: 1
+        configure_mode_on_startup: true
         direction: 1.0
         host_protection_enabled: false
         fault_group: ""

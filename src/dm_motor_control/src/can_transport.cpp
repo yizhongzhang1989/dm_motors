@@ -89,10 +89,12 @@ struct CanTransport::Impl
   std::deque<Frame> incoming;
   std::string token, group, failure, physical_backend, owner;
   uint64_t epoch{0}, seen_epoch{0}, sequence{0}, heartbeat_sequence{0};
+  uint64_t quiet_sequence{0};
   uint8_t id;
   uint16_t master;
   bool registered{false}, registering{false}, status_ready{false}, quiet{true}, fault{false};
   bool all_quiet{false};
+  bool quiet_confirmed{false};
   bool endpoint_ready{false}, endpoint_seen{false};
   bool broker_rx_ready{false};
   bool receive_verified{false};
@@ -140,6 +142,7 @@ struct CanTransport::Impl
     rclcpp::NodeOptions options;
     options.context(parent.get_node_base_interface()->get_context());
     options.use_global_arguments(false);
+    options.start_parameter_services(false);
     node = std::make_shared<rclcpp::Node>(
       safe_name(client_name) + "_" + std::to_string(++unique), "/", options);
     const auto qos = rclcpp::QoS(64).reliable();
@@ -149,7 +152,9 @@ struct CanTransport::Impl
     maintenance = node->create_client<Maintenance>(bus + "/maintenance");
     request.client_name = client_name; request.fault_group = group;
     request.lease_duration.sec = 0; request.lease_duration.nanosec = 500000000;
-    request.rate_hz = rate; request.max_tx_hz = std::min(10000.0, std::max(100.0, rate * 3));
+    request.rate_hz = rate;
+    // Runtime motor rates may increase to 1000 Hz without re-registering the bus client.
+    request.max_tx_hz = std::min(10000.0, std::max(3000.0, rate * 3));
     request.filters_tx = {filter(0x7ff, {id, 0}, {255, 255})};
     for (unsigned mode = 0; mode < 4; ++mode) {
       const auto command_id = static_cast<uint16_t>(id + mode * 0x100);
@@ -172,17 +177,24 @@ struct CanTransport::Impl
           fail("CAN virtual endpoint disconnected; relaunch required");
         }
         endpoint_seen = endpoint_seen || endpoint_ready;
-        all_quiet = s->all_quiet;
+        all_quiet = s->all_quiet && quiet;
         if (registered && s->epoch != epoch) {fail("CAN bus restarted; relaunch required");}
         if (!s->ready) {fail("CAN bus unavailable: " + s->error);}
         if (!group.empty() && std::find(s->group_faults.begin(), s->group_faults.end(), group) !=
           s->group_faults.end()) {fail("CAN fault group latched; relaunch required: " + group);}
         if (registered) {
+          quiet_confirmed = false;
           for (size_t i = 0; i < s->client_tokens.size(); ++i) {
             if (s->client_tokens[i] == token && i < s->client_rx_ready.size()) {
               broker_rx_ready = s->client_rx_ready[i];
             }
+            if (s->client_tokens[i] == token && i < s->heartbeat_sequences.size() &&
+              i < s->client_quiet.size())
+            {
+              quiet_confirmed = s->client_quiet[i] && s->heartbeat_sequences[i] >= quiet_sequence;
+            }
           }
+          if (!quiet_confirmed) {all_quiet = false;}
           for (const auto & issue : s->client_errors) {
             if (issue.rfind(token + ": ", 0) == 0) {fail("CAN transmit rejected: " + issue);}
           }
@@ -307,6 +319,10 @@ struct CanTransport::Impl
       [](const auto & p) {return maintenance_frame(p.first);});
     if (maintenance_owned && !parameters_queued && now - last_parameter >= .1 &&
       !service_pending) {request_maintenance(false, now);}
+    flush_outgoing(now);
+  }
+  void flush_outgoing(double now)
+  {
     // Polls are replaceable observations, not operations: expected bus-wide
     // maintenance suppression must never become a motor transport fault.
     const bool suppress_queries = maintenance_pending || releasing ||
@@ -400,6 +416,10 @@ void CanTransport::send(const Frame & f)
     impl_->maintenance_pending = true; impl_->maintenance_started = can_bus::steady_seconds();
   }
   if (active(f)) {
+    if (impl_->quiet) {
+      impl_->quiet_sequence = impl_->heartbeat_sequence + 1;
+      impl_->quiet_confirmed = false; impl_->all_quiet = false; impl_->last_heartbeat = 0;
+    }
     impl_->quiet = false; impl_->activity_requires_stop = true; impl_->stop_published = false;
   }
   if (stop(f)) {
@@ -416,6 +436,11 @@ void CanTransport::send(const Frame & f)
   }
   if (impl_->outgoing.size() >= 32) {throw std::runtime_error("remote CAN transmit queue full");}
   impl_->outgoing.emplace_back(f, can_bus::steady_seconds());
+  if (!maintenance_frame(f) && impl_->registered && !impl_->shutting_down &&
+    impl_->failure.empty())
+  {
+    impl_->flush_outgoing(can_bus::steady_seconds());
+  }
 }
 std::vector<Frame> CanTransport::receive()
 {
@@ -439,7 +464,8 @@ bool CanTransport::simulated() const {return backend() == "sim";}
 bool CanTransport::maintenance_available() const
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (!impl_->ready_locked() || impl_->releasing) {return false;}
+  if (!impl_->ready_locked() || impl_->releasing || !impl_->quiet ||
+    !impl_->quiet_confirmed) {return false;}
   return impl_->maintenance_owned ||
     (impl_->all_quiet && (impl_->owner.empty() || impl_->owner == impl_->token));
 }
@@ -447,7 +473,7 @@ bool CanTransport::maintenance_blocked() const
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->registered || !impl_->status_ready || impl_->seen_epoch != impl_->epoch ||
-    impl_->maintenance_owned) {return false;}
+    impl_->maintenance_owned || (impl_->quiet && !impl_->quiet_confirmed)) {return false;}
   return !impl_->all_quiet;
 }
 bool CanTransport::activity_available() const
@@ -476,6 +502,12 @@ void CanTransport::set_quiet(bool value)
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (value && impl_->activity_requires_stop && !impl_->stop_published) {return;}
+  if (impl_->quiet != value) {
+    impl_->quiet_sequence = impl_->heartbeat_sequence + 1;
+    impl_->quiet_confirmed = false;
+    impl_->all_quiet = false;
+    impl_->last_heartbeat = 0;
+  }
   impl_->quiet = value;
   if (value) {impl_->activity_requires_stop = false;}
 }

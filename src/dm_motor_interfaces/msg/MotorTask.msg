@@ -18,12 +18,3 @@ float64 settling_time
 float64 ramp_time
 float64[] times
 float64[] positions
----
-bool success
-string message
-float64 final_position
----
-float64 elapsed
-float64 progress
-float64 position_error
-uint8 phase

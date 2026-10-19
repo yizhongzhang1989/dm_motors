@@ -15,5 +15,9 @@ if(BUILD_TESTING)
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/test_integration.py"
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 60)
+  ament_add_test(test_http_logging
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/test_http_logging.py"
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 15)
 endif()
 ament_package()

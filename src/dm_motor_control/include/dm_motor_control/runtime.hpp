@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dm_motor_control/core.hpp"
+#include <functional>
 
 namespace dm_motor
 {
@@ -28,6 +29,7 @@ struct MotorConfig
   uint8_t id{1};
   uint16_t master{0};
   Mode mode{Mode::Mit};
+  bool configure_mode_on_startup{false};
   Mapping mapping{};
   Limits limits{};
   double command_timeout{0.25}, feedback_timeout{0.1}, watchdog{0.2};
@@ -37,8 +39,12 @@ struct MotorSnapshot
   Phase phase{Phase::Disabled};
   Mode mode{Mode::Mit};
   Mapping mapping{};
+  // Mapping-resolved limits; float-position command range uses position_command_limit.
   Limits limits{};
   Feedback feedback{};
+  double absolute_position{0};
+  bool absolute_position_valid{false};
+  int64_t position_wraps{0};
   double feedback_age{-1};
   uint64_t feedback_count{0};
   std::string error;
@@ -61,6 +67,7 @@ struct RegisterOperation
 Frame target_frame(uint8_t id, const Target & target, const Mapping & mapping,
   const Limits & limits = {});
 uint16_t control_id(uint8_t id, Mode mode);
+double position_command_limit(Mode mode, const Mapping & mapping, const Limits & limits);
 class Bus
 {
 public:
@@ -68,6 +75,8 @@ public:
   ~Bus();
   void tick(double now);
   MotorSnapshot snapshot(const std::string & name, double now) const;
+  void set_feedback_callback(
+    std::function<void(const std::string &, const MotorSnapshot &, double)> callback);
   void enable(const std::string & name, double now);
   void disable(const std::string & name, double now);
   void reset(const std::string & name, double now);
@@ -102,6 +111,7 @@ public:
   void inject_fault(uint8_t id, uint8_t status);
   void drop_replies(bool drop);
   void inject_frame(const Frame & frame);
+  void set_position(uint8_t id, double position);
   void power_cycle(uint8_t id);
   uint32_t register_value(uint8_t id, uint8_t rid) const;
 private:

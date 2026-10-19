@@ -21,3 +21,6 @@ string[] client_tokens
 uint64[] heartbeat_sequences
 bool[] client_faults
 bool[] client_rx_ready
+bool[] client_quiet
+uint64 observer_dropped
+uint32 observer_queue_depth

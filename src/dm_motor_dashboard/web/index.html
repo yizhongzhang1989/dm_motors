@@ -3,16 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>达妙单电机控制台</title>
+  <title>达妙电机 · 监控与控制</title>
   <link rel="stylesheet" href="/dashboard.css">
   <script src="/dashboard.js" defer></script>
 </head>
 <body>
   <main>
     <header>
-      <div><div class="eyebrow">DAMIAO / ROS 2 / UNIVERSAL DRIVER</div><h1>单电机控制台 <span id="motor-id"></span></h1></div>
-      <span id="connection" class="badge">未连接</span>
+      <div><div class="eyebrow">DAMIAO / MOTOR OPERATIONS</div><h1>电机监控与控制 <span id="motor-id"></span></h1></div>
+      <div class="row"><span id="connection" class="badge">未连接</span><button id="quick-stop" class="danger" disabled>STOP / 失能 · Esc</button></div>
     </header>
+    <nav class="section-nav" aria-label="控制台导航">
+      <a href="#status-panel">实时概览</a><a href="#monitor-panel">完整监控</a><a href="#plot-panel">反馈曲线</a>
+      <a href="#control-panel">手动控制</a><a href="#task-panel">运动任务</a><a href="#maintenance-panel">参数维护</a><a href="#events-panel">事件记录</a>
+    </nav>
+    <div id="health-banner" class="health-banner" role="status">等待驱动连接；不会自动使能或运动。</div>
     <section id="status-panel" class="panel status-panel" aria-label="电机状态栏">
       <div class="section-heading"><h2>电机状态</h2><span id="phase" class="badge">等待反馈</span></div>
       <div class="metrics">
@@ -20,6 +25,13 @@
         <div class="metric"><div class="eyebrow">速度 / rad·s⁻¹</div><div class="value" id="velocity">--</div></div>
         <div class="metric"><div class="eyebrow">反馈力矩 / Nm</div><div class="value" id="torque">--</div></div>
         <div class="metric"><div class="eyebrow">MOS / 转子温度 · °C</div><div class="value temperature" id="temperature">--</div></div>
+      </div>
+      <div class="position-strip">
+        <span>累计圈数 <strong id="position-turns">--</strong></span>
+        <span>角度 <strong id="position-degrees">--</strong></span>
+        <span>紧凑反馈 <strong id="compact-position">--</strong> rad</span>
+        <span id="absolute-valid" class="badge">连续位置待确认</span>
+        <span id="control-owner" class="subtle">无控制权</span>
       </div>
       <div id="telemetry" class="subtle">连接后显示实际反馈频率、CAN ID 和控制周期。</div>
       <div class="status-footer">
@@ -31,28 +43,68 @@
         </div>
       </div>
     </section>
+    <section id="monitor-panel" class="panel" aria-label="完整电机监控">
+      <div class="section-heading"><h2>完整监控</h2><div class="row"><button id="export-state" class="secondary" disabled>导出状态 JSON</button><span id="state-age" class="subtle">等待状态</span></div></div>
+      <div class="monitor-grid">
+        <div><h3>位置与坐标</h3><dl id="position-data" class="data-grid"></dl></div>
+        <div><h3>设备与控制健康</h3><dl id="health-data" class="data-grid"></dl></div>
+        <div><h3>通信与周期</h3><dl id="timing-data" class="data-grid"></dl></div>
+      </div>
+      <details><summary>目标跟踪与全部状态字段</summary>
+        <div class="table-scroll"><table><thead><tr><th>字段</th><th>请求目标</th><th>活动目标</th><th>实测反馈</th></tr></thead><tbody id="target-comparison"></tbody></table></div>
+        <pre id="driver-targets" class="subtle"></pre>
+      </details>
+    </section>
     <div id="workspace" class="workspace">
     <section id="plot-panel" class="panel plot-panel" aria-label="电机反馈曲线">
-      <div class="section-heading"><h2>实时反馈</h2><span class="subtle">最近 15 秒 · 各曲线独立量程</span></div>
-      <div id="plot-stats" class="subtle">等待实时反馈流 · 绘图独立刷新</div>
+      <div class="section-heading"><h2>实时反馈</h2><span class="subtle">独立量程 · 主机接收时间</span></div>
+      <div class="chart-tools">
+        <label>窗口 <select id="chart-window"><option value="5">5 秒</option><option value="15" selected>15 秒</option><option value="60">60 秒</option></select></label>
+        <label>位置源 <select id="chart-position"><option value="position">连续关节位置</option><option value="absolute_position">原生连续位置</option><option value="native_position">紧凑反馈</option></select></label>
+        <label class="check-label"><input id="chart-targets" type="checkbox" checked>活动目标（虚线）</label>
+        <button id="pause-chart" class="secondary" aria-pressed="false">暂停绘图</button>
+        <button id="clear-chart" class="secondary">清空曲线</button>
+        <button id="export-csv" class="secondary" disabled>导出 CSV</button>
+      </div>
+      <div id="plot-stats" class="subtle">等待完整逐帧反馈流 · 图表按 50 Hz 重绘，保留所有收到的采样点</div>
       <canvas id="chart" width="1100" height="450" aria-label="位置、速度、力矩反馈曲线"></canvas>
     </section>
     <section id="control-panel" class="panel control-panel" aria-label="电机控制">
       <div class="section-heading"><h2>电机控制</h2><span id="current-mode" class="subtle">等待模式</span></div>
       <p id="capabilities" class="subtle">等待驱动能力发现。</p>
+      <label for="mode-select">驱动模式（仅失能时可切换，选择后直接切换）</label>
+      <div class="actions">
+        <select id="mode-select" disabled aria-describedby="mode-status mode-operation-status"></select>
+      </div>
+      <p id="mode-status" class="subtle" role="status">等待驱动确认模式。</p>
+      <p id="mode-operation-status" class="subtle" role="status">尚无模式切换操作。</p>
       <div class="motor-actions">
         <button id="enable" disabled>使能（中性目标）</button>
         <button id="stop" class="danger" disabled>STOP / 失能</button>
         <button id="reset" class="secondary" disabled>复位主机故障</button>
       </div>
+      <label for="control-rate">电机控制频率 / Hz（20–1000，修改后立即提交）</label>
+      <input id="control-rate" type="number" min="20" max="1000" step="any" value="200" disabled>
+      <p id="control-rate-status" class="subtle" role="status">等待设定频率与实测频率。</p>
       <h3>控制目标</h3>
-      <p class="subtle target-hint">数值与滑条同步；所有编辑仅修改草稿，点击“应用目标”才发送当前模式的参数。</p>
+      <label class="check"><input id="live-targets" type="checkbox" checked>实时手动目标：已使能时，修改立即生效</label>
+      <p class="subtle target-hint">已使能并拥有控制权时，位置、速度、Kp、Kd、力矩等有效输入一经修改立即提交，在下一控制周期采用；无需点击应用。未使能时只编辑草稿，使能不回放草稿。滚轮可连续累计正负位置，松手保持，不回中、不回零。</p>
       <form id="target-form">
         <div class="fields">
-          <div>
+          <div class="wide-field">
             <label for="target-position">位置 / rad</label>
             <input id="target-position" name="position" type="number" step="any" value="0" aria-describedby="range-position applied-position" required disabled>
-            <input id="slider-position" type="range" step="any" aria-label="目标位置滑条" disabled>
+            <div id="position-scroll" class="position-wheel" role="spinbutton" tabindex="-1"
+              aria-label="连续旋转目标位置滚轮" aria-controls="target-position"
+              aria-describedby="position-wheel-help position-scroll-status"
+              aria-valuenow="0" aria-disabled="true">
+              <div id="position-wheel-rotor" class="position-wheel-rotor" aria-hidden="true"></div>
+              <div class="position-wheel-hub" aria-hidden="true"><span>目标位置 / rad</span><output id="position-scroll-value">--</output><span id="position-wheel-turns">-- 圈</span></div>
+              <div class="position-wheel-marker" aria-hidden="true"></div>
+            </div>
+            <div class="position-scroll-scale" aria-hidden="true"><span id="position-scroll-min">--</span><span id="position-scroll-max">--</span></div>
+            <small id="position-wheel-help">沿外圈顺时针 ＋ / 逆时针 − 拖动，也可滚动鼠标滚轮或用方向键微调；到达当前模式/行程限位后停止旋转，反向即可离开边界。</small>
+            <small id="position-scroll-status" role="status">等待当前位置；未使能时只修改草稿。</small>
             <small id="range-position">等待范围</small><small id="applied-position" class="applied">服务目标：--</small>
           </div>
           <div>
@@ -106,16 +158,44 @@
         <summary>参数含义与支持范围</summary>
         <p>MIT 力矩请求 = Kp ×（目标位置 − 反馈位置）+ Kd ×（目标速度 − 反馈速度）+ 前馈力矩。</p>
         <p>Kp 为位置刚度，Kd 为速度误差增益。Kp=0 时位置目标不起作用；Kp=Kd=0 时仅前馈力矩起作用。正 Kp 配合过小 Kd 可能振荡。</p>
+        <p>本机实测 Kd 大于 1 容易振荡，应用层上限固定为 1；驱动配置可进一步降低，不能提高。协议编码尺度仍为 0～5。</p>
+        <p>位置显示为启动时读取 p_m 后由软件累计的连续关节位置，不是回绕后的紧凑反馈；位置基准无效时禁止使能，需检查错误并重启节点。</p>
         <p>范围来自驱动反馈的有效限制，不是建议实验值，也不代表最终输出力矩的硬限幅。请从小幅目标和小增益开始。</p>
+        <p>位置控件为真正的旋转滚轮：外圈刻度随目标转动，可连续绕圈拖动，没有滑块和轨道。每转一整圈累计 2π rad，松手保持角度，不回中、不回零；方向键为 0.01 rad，Shift 为 0.1 rad。</p>
+        <p>滚轮按当前模式的编码范围与已配置行程限位停止在边界，不再继续累计或旋转。位置速度/力位模式默认允许多圈浮点目标；MIT 通常受 ±PMAX 限制。手动输入超范围数值仍会明确拒绝发送，不静默改值、回绕、切换模式或设置增益。</p>
         <p>“填入当前位置”只修改位置草稿，不归零、不使能、不自动设定增益。“应用零目标”清零当前模式各项，不是锁轴或抱闸。</p>
         <p>模式 1：MIT 五参数；模式 2：位置和非负速度上限；模式 3：有符号速度；模式 4：位置、非负速度上限和 0～1 电流比例。只显示驱动声明支持的模式。</p>
       </details>
-      <details>
-        <summary>失能配置与参数只读查询</summary>
+      <div id="notice" role="status" aria-live="polite">启动时不自动使能。零目标不等于锁轴或抱闸。</div>
+    </section>
+    </div>
+    <section id="task-panel" class="panel" aria-label="有界运动任务">
+      <div class="section-heading"><h2>有界运动任务</h2><span id="task-state" class="badge">无任务</span></div>
+      <p class="subtle">准备任务终点时，请先关闭“实时手动目标”，再编辑上方目标草稿，避免编辑时提前运动。任务需显式使能并确认提交；执行期间禁止手动目标更新，结束或取消后保持失能，不恢复旧目标。驱动再次校验行程、速度、加速度和时长。</p>
+      <p id="task-hint" class="subtle"></p>
+      <form id="task-form">
+        <div class="task-fields">
+          <label>任务类型<select id="task-kind"><option value="move">MOVE · 平滑定位</option><option value="hold">HOLD · 当前位置保持</option><option value="velocity">VELOCITY · 有界速度</option><option value="torque">TORQUE · 有界力矩</option><option value="sine">SINE · 正弦位置</option><option value="ramp">RAMP · 平滑位置过渡</option><option value="trajectory">TRAJECTORY · 多点轨迹</option></select></label>
+          <label>总时长 / s（另受驱动上限限制）<input id="task-duration" type="number" value="5" min="0.01" max="3600" step="any" required></label>
+          <label>最大速度 / rad·s⁻¹<input id="task-max_velocity" type="number" value="0.5" min="0.001" step="any" required></label>
+          <label>最大加速度 / rad·s⁻²<input id="task-max_acceleration" type="number" value="1" min="0.001" step="any" required></label>
+          <label>位置容差 / rad<input id="task-tolerance" type="number" value="0.03" min="0.000001" step="any" required></label>
+          <label>稳定时间 / s<input id="task-settling_time" type="number" value="1" min="0.000001" step="any" required></label>
+          <label data-task-kinds="velocity torque">斜坡时间 / s<input id="task-ramp_time" type="number" value="1" min="0.001" step="any"></label>
+          <label data-task-kinds="sine">幅值 / rad<input id="task-amplitude" type="number" value="0.1" step="any"></label>
+          <label data-task-kinds="sine">频率 / Hz<input id="task-frequency" type="number" value="0.2" min="0.001" step="any"></label>
+        </div>
+        <label data-task-kinds="trajectory">轨迹点：每行「时间(s), 位置(rad)」，2～256 点，第一点须为当前关节位置<textarea id="task-points" rows="5" placeholder="0, 0&#10;3, 0.1"></textarea></label>
+        <div class="actions"><button id="start-task" type="submit" disabled>确认并提交任务</button><button id="cancel-task" type="button" class="danger" disabled>取消任务并失能</button></div>
+      </form>
+      <progress id="task-progress" max="1" value="0" aria-label="任务进度"></progress>
+      <p id="task-feedback" class="subtle" role="status">尚未提交任务。</p>
+    </section>
+    <section id="maintenance-panel" class="panel" aria-label="参数与设备维护">
+      <div class="section-heading"><h2>参数与设备维护</h2><span class="subtle">显式确认 · 异步回读 · 不自动保存</span></div>
+      <details open>
+        <summary>失能配置与参数访问</summary>
         <p class="subtle">配置必须在新鲜、已失能状态下显式提交；不会恢复使能。电机故障清除也允许新鲜、非使能故障反馈，之后仍需单独复位主机故障。操作提交不等于确认，以下显示驱动操作 ID 的最终结果。</p>
-        <label for="mode-select">驱动模式</label>
-        <select id="mode-select" disabled></select>
-        <button id="set-mode" class="secondary" disabled>提交模式切换</button>
         <div class="actions">
           <button id="clear-fault" class="secondary" disabled>清除电机故障</button>
           <button id="device-zero" class="secondary" disabled>设置设备零点</button>
@@ -124,18 +204,34 @@
         </div>
         <p id="operation-status" class="subtle" role="status">尚无操作。</p>
         <p class="subtle">参数读取也是维护事务：共享总线的所有轴必须有新鲜、已确认失能反馈。异步拒绝会明确显示，不会因此发送 STOP。</p>
-        <label for="parameter-select">驱动参数（只读）</label>
+        <label for="parameter-select">驱动参数</label>
         <select id="parameter-select" disabled></select>
-        <button id="read-parameter" class="secondary" disabled>异步读取参数</button>
+        <p id="parameter-info" class="subtle">等待参数定义。</p>
+        <div class="parameter-actions">
+          <button id="read-parameter" class="secondary" disabled>读取所选参数</button>
+          <button id="read-all-parameters" class="secondary" disabled>读取全部参数</button>
+          <button id="export-parameters" class="secondary" disabled>导出已读参数</button>
+          <label>写入数值<input id="parameter-input" type="number" step="any" disabled></label>
+          <button id="write-parameter" class="danger" disabled>确认写入并回读</button>
+        </div>
         <p id="parameter-value" class="subtle" role="status">等待参数列表。</p>
-        <pre id="driver-targets" class="subtle"></pre>
+        <div class="table-scroll"><table><thead><tr><th>地址</th><th>参数</th><th>读取值</th><th>单位</th><th>确认时间</th></tr></thead><tbody id="parameter-results"></tbody></table></div>
       </details>
-      <div id="notice" role="status" aria-live="polite">启动时不自动使能。零目标不等于锁轴或抱闸。</div>
     </section>
-    </div>
+    <section id="events-panel" class="panel" aria-label="事件记录">
+      <div class="section-heading"><h2>事件记录</h2><button id="clear-events" class="secondary">清空记录</button></div>
+      <p class="subtle">仅保留本页面最近 100 条事件；不是设备持久化日志。重复通知不重复刷屏。</p>
+      <ol id="event-log" class="event-log" aria-label="最近事件"></ol>
+    </section>
     <footer>浏览器失联、页面关闭或隐藏会停止本会话输出并请求失能。软件停止不是硬件急停。
       本服务无登录鉴权，任何能够访问的机器都可以控制，仅用于可信隔离网络。
       跨网访问请用 VPN 或防火墙限制来源；HTTPS 仅加密，不提供访问控制。浏览器控制权绑定驱动租约，其它 ROS 控制源必须先取得同一驱动的独占租约。</footer>
   </main>
+  <dialog id="confirmation" aria-labelledby="confirmation-title">
+    <h2 id="confirmation-title">确认操作</h2>
+    <p id="confirmation-message"></p>
+    <p class="subtle">确认期间通信心跳继续，当前输出不会因打开此窗口而改变。取消仅放弃本次操作；需要停止时使用 STOP / Esc。</p>
+    <div class="actions dialog-actions"><button id="confirmation-stop" type="button" class="danger">STOP / 失能</button><button id="confirmation-cancel" type="button" class="secondary">取消</button><button id="confirmation-accept" type="button">确认执行</button></div>
+  </dialog>
 </body>
 </html>

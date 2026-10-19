@@ -61,26 +61,30 @@ std::vector<Frame> SerialParser::feed(const uint8_t * bytes, size_t size)
   }
   if (size) {buffer_.insert(buffer_.end(), bytes, bytes + size);}
   std::vector<Frame> result;
-  while (buffer_.size() >= 16) {
-    if (buffer_[0] != 0xaa || buffer_[15] != 0x55) {
-      buffer_.erase(buffer_.begin()); continue;
+  result.reserve(buffer_.size() / 16);
+  size_t consumed = 0;
+  while (buffer_.size() - consumed >= 16) {
+    const auto start = buffer_.begin() + consumed;
+    if (start[0] != 0xaa || start[15] != 0x55) {
+      ++consumed; continue;
     }
-    const auto cmd = buffer_[1];
+    const auto cmd = start[1];
     if (cmd == 1 || cmd == 2 || cmd == 3 || cmd == 0xee) {
-      buffer_.erase(buffer_.begin(), buffer_.begin() + 16);
+      buffer_.erase(buffer_.begin(), start + 16);
       throw std::runtime_error("USB2CAN adapter reported error " + std::to_string(cmd));
     }
-    if (cmd == 0x11 && buffer_[2] == 8) {
+    if (cmd == 0x11 && start[2] == 8) {
       Frame f;
-      for (unsigned i = 0; i < 4; ++i) {f.id |= uint32_t(buffer_[3 + i]) << (8 * i);}
+      for (unsigned i = 0; i < 4; ++i) {f.id |= uint32_t(start[3 + i]) << (8 * i);}
       if (f.id <= CAN_SFF_MASK) {
-        std::copy_n(buffer_.begin() + 7, 8, f.data.begin());
+        std::copy_n(start + 7, 8, f.data.begin());
         f.received_steady = static_cast<uint64_t>(steady_seconds() * 1e9);
         result.push_back(f);
       }
     }
-    buffer_.erase(buffer_.begin(), buffer_.begin() + 16);
+    consumed += 16;
   }
+  if (consumed) {buffer_.erase(buffer_.begin(), buffer_.begin() + consumed);}
   return result;
 }
 namespace

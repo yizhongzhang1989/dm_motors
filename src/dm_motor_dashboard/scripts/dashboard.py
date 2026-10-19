@@ -7,6 +7,7 @@ from pathlib import Path
 import secrets
 import signal
 import socket
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,12 +15,14 @@ from urllib.parse import urlsplit
 
 from ament_index_python.packages import get_package_share_directory
 import rclpy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.signals import SignalHandlerOptions
-from dm_motor_interfaces.msg import MotorSetpoint, MotorState, MotorTarget
-from dm_motor_interfaces.srv import ControlLease, GetCapabilities, GetOperation, MotorOperation, RegisterAccess
-from std_srvs.srv import SetBool
+from dm_motor_interfaces.msg import MotorState, MotorTarget, MotorFeedback, MotorRequest
+from dm_motor_control.topic_client import (
+    ControlLease, GetCapabilities, GetOperation, MotorOperation, RegisterAccess, SetTarget,
+    RunTask, TopicTaskClient, motor_topics,
+)
 
 
 FIELDS = ("position", "velocity", "kp", "kd", "torque")
@@ -32,6 +35,8 @@ def plain_message(value):
     if hasattr(value, "get_fields_and_field_types"):
         return {name: plain_message(getattr(value, name))
                 for name in value.get_fields_and_field_types()}
+    if isinstance(value, dict):
+        return {key: plain_message(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)) or hasattr(value, "tolist"):
         return [plain_message(item) for item in value]
     return value
@@ -43,18 +48,30 @@ class ApiError(Exception):
         self.status = status
 
 
+def finite_number(value, name):
+    if type(value) not in (int, float):
+        raise ApiError(400, f"{name} must be a finite number.")
+    try:
+        number = float(value)
+    except OverflowError as error:
+        raise ApiError(400, f"{name} exceeds numeric range.") from error
+    if not math.isfinite(number):
+        raise ApiError(400, f"{name} must be finite.")
+    return number
+
+
 class Dashboard(Node):
     def __init__(self, **kwargs):
-        super().__init__("dashboard", **kwargs)
+        super().__init__("dashboard", start_parameter_services=False, **kwargs)
         self.motor_id = self.declare_parameter("motor_id", 1).value
+        if type(self.motor_id) is not int or not 1 <= self.motor_id <= 15:
+            raise ValueError("motor_id must be an integer in 1..15")
         self.host = self.declare_parameter("host", "0.0.0.0").value
-        self.port = self.declare_parameter("port", 8080).value
+        self.port = self.declare_parameter("port", 8080 + self.motor_id).value
         self.client_timeout = self.declare_parameter("client_timeout", 0.75).value
         self.command_timeout = self.declare_parameter("command_timeout", 0.25).value
         if not math.isfinite(self.command_timeout) or self.command_timeout < 0.05:
             raise ValueError("command_timeout must be at least 0.05 seconds and match the driver")
-        if type(self.motor_id) is not int or not 1 <= self.motor_id <= 15:
-            raise ValueError("motor_id must be an integer in 1..15")
         if not self.host or type(self.port) is not int or not 1 <= self.port <= 65535:
             raise ValueError("host must be nonempty and port must be in 1..65535")
         if not math.isfinite(self.client_timeout) or not 0.3 <= self.client_timeout <= 5:
@@ -63,6 +80,9 @@ class Dashboard(Node):
         self.stream_condition = threading.Condition(self.lock)
         self.stream_version = 0
         self.stream_sample = None
+        self.stream_samples = [None] * 65536
+        self.last_feedback_count = None
+        self.source_skipped_samples = 0
         self.operation_lock = threading.Lock()
         self.state = None
         self.received = 0.0
@@ -79,20 +99,29 @@ class Dashboard(Node):
         self.renew_pending = False
         self.last_renew = 0.0
         self.sequence = 0
+        self.target_sequence = 0
         self.capabilities = None
         self.capabilities_pending = False
         self.target = self.neutral_target()
+        self.task = {"state": "idle", "message": "No task submitted.", "feedback": None, "result": None}
+        self.task_handle = None
+        self.task_deadline = 0.0
+        self.task_client = TopicTaskClient(self)
         self.notice = "Starts disabled. Claim control, explicitly enable, then apply targets."
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
-                         durability=DurabilityPolicy.VOLATILE)
-        self.publisher = self.create_publisher(MotorSetpoint, "setpoint", qos)
+        self.topic_transport = motor_topics(self)
+        self.topic_transport.target_listener = self.on_target_result
+        self.target_client = self.topic_transport.endpoint("target")
+        self.rate_client = self.topic_transport.endpoint("control_rate")
         self.subscription = self.create_subscription(MotorState, "state", self.on_state, 1)
-        self.enable_client = self.create_client(SetBool, "enable")
-        self.lease_client = self.create_client(ControlLease, "control_lease")
-        self.operation_client = self.create_client(MotorOperation, "operation")
-        self.register_client = self.create_client(RegisterAccess, "registers")
-        self.get_operation_client = self.create_client(GetOperation, "get_operation")
-        self.capabilities_client = self.create_client(GetCapabilities, "get_capabilities")
+        self.feedback_subscription = self.create_subscription(
+            MotorFeedback, "feedback", self.on_feedback,
+            QoSProfile(depth=4096, reliability=ReliabilityPolicy.RELIABLE))
+        self.enable_client = self.topic_transport.endpoint("operation")
+        self.lease_client = self.topic_transport.endpoint("control_lease")
+        self.operation_client = self.topic_transport.endpoint("operation")
+        self.register_client = self.topic_transport.endpoint("registers")
+        self.get_operation_client = self.topic_transport.endpoint("get_operation")
+        self.capabilities_client = self.topic_transport.endpoint("get_capabilities")
         self.create_timer(0.05, self.tick)
 
     def neutral_target(self):
@@ -113,11 +142,6 @@ class Dashboard(Node):
             self.state = {name: plain_message(getattr(msg, name)) for name in msg.get_fields_and_field_types()
                           if name != "header"}
             self.received = time.monotonic()
-            self.stream_version += 1
-            self.stream_sample = {"sequence": self.stream_version, "time": self.received,
-                                  "feedback_count": msg.feedback_count,
-                                  "position": msg.position, "velocity": msg.velocity, "torque": msg.torque}
-            self.stream_condition.notify_all()
             if msg.phase in (MotorState.ENABLING, MotorState.ENABLED):
                 self.waiting_enable = False
             if msg.phase in (MotorState.STOPPING, MotorState.FAULT) or (
@@ -126,6 +150,43 @@ class Dashboard(Node):
                 self.target = self.neutral_target()
             if msg.error:
                 self.notice = msg.error
+
+    def on_feedback(self, msg):
+        if msg.motor_id != self.motor_id:
+            self.stop_async("Wrong motor ID on feedback topic; check namespace/remapping.", release=True)
+            return
+        with self.stream_condition:
+            if self.last_feedback_count is not None:
+                missing = msg.feedback_count - self.last_feedback_count - 1
+                if missing > 0:
+                    self.source_skipped_samples += missing
+                    self.get_logger().warning(f"Feedback topic lost {missing} decoded motor samples.")
+                elif missing < 0:
+                    self.get_logger().warning("Feedback source counter restarted or repeated.")
+            self.last_feedback_count = msg.feedback_count
+            self.stream_version += 1
+            self.stream_sample = {
+                "sequence": self.stream_version, "time": msg.receive_time,
+                "feedback_count": msg.feedback_count,
+                "source_skipped_samples": self.source_skipped_samples,
+                **{name: getattr(msg, name) for name in (
+                    "position", "velocity", "torque", "native_position",
+                    "absolute_position", "absolute_position_valid", "position_wraps",
+                    "mos_temperature", "rotor_temperature",
+                    "applied_target_sequence", "target_accept_latency_ms")}}
+            for field in ("position", "velocity", "torque"):
+                self.stream_sample[f"target_{field}"] = (
+                    getattr(msg, f"target_{field}") if msg.target_active else None)
+            self.stream_samples[self.stream_version % len(self.stream_samples)] = self.stream_sample
+            self.stream_condition.notify_all()
+
+    def on_target_result(self, msg):
+        with self.lock:
+            if (not self.armed or self.task_busy() or self.state.get("task_active", False)
+                    or msg.token != self.driver_token or msg.target_sequence < self.sequence):
+                return
+            if not msg.success:
+                self.stop_async(f"Driver rejected topic target: {msg.message}", release=True)
 
     def snapshot(self, session):
         with self.lock:
@@ -138,7 +199,8 @@ class Dashboard(Node):
                     "target": dict(self.target), "armed": self.armed,
                     "has_control": owns, "control_busy": self.owner is not None,
                     "notice": self.notice, "client_timeout": self.client_timeout,
-                    "capabilities": self.capabilities}
+                    "capabilities": self.capabilities, "task": plain_message(self.task),
+                    "control_generation": self.generation, "target_sequence": self.target_sequence}
 
     def require_session(self, session):
         if self.closing:
@@ -153,7 +215,7 @@ class Dashboard(Node):
 
     def claim(self):
         if not self.operation_lock.acquire(blocking=False):
-            raise ApiError(409, "Another service operation is pending.")
+            raise ApiError(409, "Another control command is pending.")
         try:
             with self.lock:
                 if self.closing:
@@ -165,7 +227,7 @@ class Dashboard(Node):
                 generation = self.generation
                 started = time.monotonic()
                 lease_generation = self.lease_generation
-            response = self.service_response(self.lease_client, ControlLease.Request(
+            response = self.command_response(self.lease_client, ControlLease.Request(
                 operation=ControlLease.Request.ACQUIRE, owner=self.get_fully_qualified_name(),
                 duration=1.0), generation)
             with self.lock:
@@ -194,8 +256,13 @@ class Dashboard(Node):
     def disarm(self, reason, release=False):
         with self.lock:
             self.generation += 1
+            self.target_sequence = 0
             self.armed = False
             self.waiting_enable = False
+            if self.task_busy():
+                self.task["state"] = "stopped"
+                self.task["message"] = reason
+            self.task_handle = None
             self.target = self.neutral_target()
             if release:
                 self.owner = None
@@ -208,7 +275,7 @@ class Dashboard(Node):
             self.notice = reason
 
     def release_driver(self, token):
-        if token and self.lease_client.service_is_ready():
+        if token and self.lease_client.is_ready():
             future = self.lease_client.call_async(ControlLease.Request(
                 operation=ControlLease.Request.RELEASE, token=token))
             future.add_done_callback(self.log_release)
@@ -224,7 +291,7 @@ class Dashboard(Node):
     def renew_driver(self, now):
         if self.renew_pending or now - self.last_renew < 0.2:
             return
-        if not self.lease_client.service_is_ready():
+        if not self.lease_client.is_ready():
             return
         token, generation = self.driver_token, self.lease_generation
         self.renew_pending = True
@@ -255,7 +322,7 @@ class Dashboard(Node):
         future.add_done_callback(renewed)
 
     def discover(self):
-        if self.capabilities_pending or not self.capabilities_client.service_is_ready():
+        if self.capabilities_pending or not self.capabilities_client.is_ready():
             return
         self.capabilities_pending = True
         future = self.capabilities_client.call_async(GetCapabilities.Request())
@@ -273,10 +340,10 @@ class Dashboard(Node):
     def stop_async(self, reason, release=False):
         self.disarm(reason, release)
         self.get_logger().warning(reason)
-        if not self.enable_client.service_is_ready():
-            self.get_logger().error("Disable unconfirmed: controller service unavailable; watchdog is required.")
+        if not self.enable_client.is_ready():
+            self.get_logger().error("Disable unconfirmed: controller command topic unavailable; watchdog is required.")
             return None
-        future = self.enable_client.call_async(SetBool.Request(data=False))
+        future = self.enable_client.call_async(MotorOperation.Request(operation=MotorOperation.Request.DISABLE))
         self.stop_future = future
 
         def done(result):
@@ -298,54 +365,48 @@ class Dashboard(Node):
             expired = self.owner is not None and (
                 now - self.last_heartbeat > self.client_timeout or now >= self.driver_deadline)
             disconnected = self.armed and not self.connected()
+            task_expired = self.task_busy() and now >= self.task_deadline
             if self.owner is not None and not expired and not disconnected and not self.closing:
                 self.renew_driver(now)
-            if (not self.closing and not expired and not disconnected and self.armed
-                    and self.state["phase"] == MotorState.ENABLED):
-                command = MotorSetpoint()
-                command.header.stamp = self.get_clock().now().to_msg()
-                command.token = self.driver_token
-                self.sequence += 1
-                command.sequence = self.sequence
-                command.valid_for = min(0.1, self.command_timeout)
-                for field, value in self.target.items():
-                    setattr(command.target, field, value)
-                self.publisher.publish(command)
         if expired:
             self.stop_async("Browser heartbeat expired; target cleared and disable requested.", release=True)
         elif disconnected:
             self.stop_async("Motor state disconnected; target cleared and disable requested.", release=True)
+        elif task_expired:
+            self.stop_async("Task acknowledgement/result timeout; outcome unknown, disable requested.")
+            with self.lock:
+                self.task["state"] = "unknown"
 
-    def service_response(self, client, request, generation=None):
+    def command_response(self, client, request, generation=None):
         event = threading.Event()
         with self.lock:
             if generation is not None and generation != self.generation:
                 raise ApiError(409, "Operation superseded by STOP or session expiry.")
-            if not client.service_is_ready():
-                raise ApiError(503, "Controller service is unavailable.")
+            if not client.is_ready():
+                raise ApiError(503, "Controller command topic is unavailable.")
             future = client.call_async(request)
         future.add_done_callback(lambda _: event.set())
         if not event.wait(0.8):
             if client is self.lease_client and request.operation == ControlLease.Request.ACQUIRE:
                 future.add_done_callback(lambda result: self.release_driver(result.result().token)
                                          if result.result() and result.result().success else None)
-            raise ApiError(504, "Service response timeout; result unknown, not confirmed.")
+            raise ApiError(504, "Topic result timeout; outcome unknown, not confirmed.")
         try:
             response = future.result()
         except Exception as error:
-            raise ApiError(503, f"Service request failed: {error}") from error
+            raise ApiError(503, f"Topic command failed: {error}") from error
         if hasattr(response, "success") and not response.success and client is not self.get_operation_client:
             raise ApiError(409, response.message)
         return response
 
-    def call_service(self, client, request, generation=None):
-        response = self.service_response(client, request, generation)
+    def call_command(self, client, request, generation=None):
+        response = self.command_response(client, request, generation)
         return {"message": response.message,
                 **({"operation_id": response.operation_id} if hasattr(response, "operation_id") else {})}
 
     def enable(self, session):
         if not self.operation_lock.acquire(blocking=False):
-            raise ApiError(409, "Another service operation is pending.")
+            raise ApiError(409, "Another control command is pending.")
         try:
             with self.lock:
                 self.require_session(session)
@@ -362,10 +423,24 @@ class Dashboard(Node):
                 generation = self.generation
                 token = self.driver_token
             try:
-                result = self.call_service(self.operation_client, MotorOperation.Request(
+                result = self.call_command(self.operation_client, MotorOperation.Request(
                     operation=MotorOperation.Request.ENABLE, token=token), generation)
+                deadline = time.monotonic() + 0.5
+                while True:
+                    with self.lock:
+                        if generation != self.generation:
+                            raise ApiError(409, "Enable superseded by STOP or session expiry.")
+                        confirmed = self.state["phase"] == MotorState.ENABLED and self.state["status"] == 1
+                        neutral = self.neutral_target()
+                    if confirmed:
+                        self.apply(session, {field: neutral[field] for field in MODE_FIELDS[neutral["mode"]]})
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ApiError(504, "Enable feedback timeout; disable requested.")
+                    time.sleep(0.005)
             except ApiError:
-                self.stop_async("Enable failed or unconfirmed; target cleared and disable requested.")
+                self.stop_async("Enable failed or unconfirmed; target cleared and disable requested.",
+                                release=generation != self.generation)
                 raise
             with self.lock:
                 if generation != self.generation:
@@ -376,42 +451,208 @@ class Dashboard(Node):
         finally:
             self.operation_lock.release()
 
-    def apply(self, session, body):
+    def apply(self, session, body, generation=None, sequence=None):
         with self.lock:
             self.require_session(session)
-            if (not self.armed or not self.connected() or not self.state["feedback_fresh"]
-                    or self.state["phase"] != MotorState.ENABLED):
-                raise ApiError(409, "Apply requires this session to own a confirmed enable.")
-            mode = self.state["mode"]
-            fields = MODE_FIELDS.get(mode)
-            if fields is None or set(body) != set(fields):
-                raise ApiError(400, f"Mode {mode} target must contain exactly {', '.join(fields or ())}.")
-            target = self.neutral_target()
-            for field in fields:
-                value = body[field]
-                maximum = (1.0 if field == "current_ratio" else
-                           self.state["velocity_limit"] if field == "velocity_limit" else
-                           self.state[f"{field}_limit"])
-                minimum = 0.0 if field in ("kp", "kd", "velocity_limit", "current_ratio") else -maximum
-                if field == "position":
-                    offset = self.state.get("software_offset", 0.0)
-                    minimum = max(offset - maximum, self.state["position_min"])
-                    maximum = min(offset + maximum, self.state["position_max"])
-                if field == "velocity_limit" and mode == 4:
-                    maximum = min(maximum, 100.0)
-                if type(value) not in (int, float):
-                    raise ApiError(400, f"{field} must be a finite number.")
-                try:
-                    value = float(value)
-                except OverflowError as error:
-                    raise ApiError(400, f"{field} must be a finite number.") from error
-                if not math.isfinite(value) or not minimum <= value <= maximum:
-                    raise ApiError(400, f"{field} must be finite in [{minimum}, {maximum}].")
-                target[field] = value
+            if (generation is None) != (sequence is None):
+                raise ApiError(400, "Target ordering requires both generation and sequence.")
+            if generation is not None and (
+                    generation != self.generation or sequence is None or sequence <= self.target_sequence):
+                raise ApiError(409, "Stale target: control generation changed or a newer target was accepted.")
+            target = self.validate_target(body)
+            control_generation = self.generation
+            self.sequence += 1
+            request = SetTarget.Request(
+                token=self.driver_token, sequence=self.sequence,
+                valid_for=min(0.1, self.command_timeout), target=MotorTarget(**target),
+                hold_until_lease_expiry=True)
+            request.header.stamp = self.get_clock().now().to_msg()
+        try:
+            self.topic_transport.publish_target(request)
+        except RuntimeError as error:
+            self.stop_async("Target publication failed; control lease revoked.", release=True)
+            raise ApiError(503, str(error)) from error
+        with self.lock:
+            self.require_session(session)
+            if control_generation != self.generation:
+                raise ApiError(409, "Target superseded by STOP or session expiry.")
+            if sequence is not None and sequence <= self.target_sequence:
+                raise ApiError(409, "A newer target was accepted while waiting for the driver.")
             self.target = target
-            self.notice = ("Target applied. WARNING: Kd quantizes to zero; position control may oscillate."
-                           if mode == 1 and target["kp"] > 0 and target["kd"] < 5.0 / 4095 else "Target applied.")
-            return {"message": self.notice}
+            if sequence is not None:
+                self.target_sequence = sequence
+            self.notice = ("Target published. WARNING: Kd quantizes to zero; position control may oscillate."
+                           if target["mode"] == 1 and target["kp"] > 0 and target["kd"] < 5.0 / 4095
+                           else "Target published; acceptance/application is reported in driver state and feedback.")
+            return {"message": self.notice, "target": dict(self.target),
+                    "control_generation": self.generation, "target_sequence": self.target_sequence}
+
+    def validate_target(self, body):
+        if (not self.armed or not self.connected() or not self.state["feedback_fresh"]
+                or self.state["phase"] != MotorState.ENABLED):
+            raise ApiError(409, "Apply requires this session to own a confirmed enable.")
+        if self.task_busy() or self.state.get("task_active", False):
+            raise ApiError(409, "Stop the active task before changing a manual target.")
+        mode = self.state["mode"]
+        fields = MODE_FIELDS.get(mode)
+        if fields is None or set(body) != set(fields):
+            raise ApiError(400, f"Mode {mode} target must contain exactly {', '.join(fields or ())}.")
+        target = self.neutral_target()
+        for field in fields:
+            value = body[field]
+            maximum = (1.0 if field == "current_ratio" else
+                       self.state["velocity_limit"] if field == "velocity_limit" else
+                       self.state[f"{field}_limit"])
+            minimum = 0.0 if field in ("kp", "kd", "velocity_limit", "current_ratio") else -maximum
+            if field == "position":
+                offset = self.state.get("software_offset", 0.0)
+                minimum = max(offset - maximum, self.state["position_min"])
+                maximum = min(offset + maximum, self.state["position_max"])
+            if field == "velocity_limit" and mode == 4:
+                maximum = min(maximum, 100.0)
+            if type(value) not in (int, float):
+                raise ApiError(400, f"{field} must be a finite number.")
+            try:
+                value = float(value)
+            except OverflowError as error:
+                raise ApiError(400, f"{field} must be a finite number.") from error
+            if not math.isfinite(value) or not minimum <= value <= maximum:
+                raise ApiError(400, f"{field} must be finite in [{minimum}, {maximum}].")
+            target[field] = value
+        return target
+
+    def set_control_rate(self, session, body):
+        if set(body) != {"control_rate"}:
+            raise ApiError(400, "Expected control_rate in Hz.")
+        rate = finite_number(body["control_rate"], "control_rate")
+        if not 20 <= rate <= 1000:
+            raise ApiError(400, "control_rate must be in 20..1000 Hz.")
+        if not self.operation_lock.acquire(blocking=False):
+            raise ApiError(409, "Another operation is pending.")
+        try:
+            with self.lock:
+                self.require_session(session)
+                if not self.connected() or not self.state["ready"]:
+                    raise ApiError(409, "Control frequency requires a ready controller.")
+                if self.task_busy() or self.state.get("task_active", False):
+                    raise ApiError(409, "Finish or stop the active task before changing frequency.")
+                generation = self.generation
+            request = MotorRequest(token=self.driver_token, value=rate)
+            response = self.command_response(self.rate_client, request, generation)
+            return {"message": response.message, "control_rate": response.control_rate}
+        finally:
+            self.operation_lock.release()
+
+    def task_busy(self):
+        return self.task["state"] in ("submitting", "running")
+
+    def start_task(self, session, body):
+        kinds = {"move": RunTask.Goal.MOVE, "velocity": RunTask.Goal.VELOCITY,
+                 "torque": RunTask.Goal.TORQUE, "hold": RunTask.Goal.HOLD,
+                 "sine": RunTask.Goal.SINE, "ramp": RunTask.Goal.RAMP,
+                 "trajectory": RunTask.Goal.TRAJECTORY}
+        scalars = ("duration", "max_velocity", "max_acceleration", "tolerance",
+                   "settling_time", "ramp_time", "amplitude", "frequency")
+        expected = {"kind", "target", "times", "positions", *scalars}
+        if set(body) != expected or type(body.get("kind")) is not str or body["kind"] not in kinds:
+            raise ApiError(400, "Expected a supported task kind, target, bounds and trajectory arrays.")
+        for key in scalars:
+            finite_number(body[key], f"Task {key}")
+        if (not 0 < body["duration"] <= 3600 or body["max_velocity"] <= 0
+                or body["max_acceleration"] <= 0 or body["tolerance"] <= 0
+                or not 0 < body["settling_time"] < body["duration"]
+                or not 0 <= body["ramp_time"] <= body["duration"] / 2
+                or body["frequency"] < 0):
+            raise ApiError(400, "Invalid task duration, bounds, tolerance or ramp.")
+        if body["kind"] != "sine" and (body["amplitude"] != 0 or body["frequency"] != 0):
+            raise ApiError(400, "Amplitude/frequency only apply to sine tasks.")
+        for key in ("times", "positions"):
+            values = body[key]
+            if not isinstance(values, list) or len(values) > 256:
+                raise ApiError(400, "Trajectory arrays require at most 256 finite numbers.")
+            for value in values:
+                finite_number(value, "Trajectory point")
+        if (len(body["times"]) != len(body["positions"])
+                or (body["kind"] == "trajectory" and len(body["times"]) < 2)
+                or (body["kind"] != "trajectory" and body["times"])):
+            raise ApiError(400, "Only trajectory tasks accept matching arrays of 2..256 points.")
+        if not isinstance(body["target"], dict):
+            raise ApiError(400, "Task target must be an object.")
+        if not self.operation_lock.acquire(blocking=False):
+            raise ApiError(409, "Another operation is pending.")
+        try:
+            with self.lock:
+                self.require_session(session)
+                if not self.connected() or self.state is None:
+                    raise ApiError(409, "Task requires connected motor feedback.")
+                if self.task_busy() or self.state.get("task_active", False):
+                    raise ApiError(409, "A task is already active.")
+                if not self.task_client.is_ready():
+                    raise ApiError(503, "Driver task command topics are unavailable.")
+                target = MotorTarget(**self.validate_target(body["target"]))
+                goal = RunTask.Goal(token=self.driver_token, kind=kinds[body["kind"]], target=target,
+                                    **{key: float(body[key]) for key in scalars},
+                                    times=body["times"], positions=body["positions"])
+                self.generation += 1
+                self.target_sequence = 0
+                generation = self.generation
+                self.target = self.neutral_target()
+                self.task = {"state": "submitting", "kind": body["kind"],
+                             "message": "Waiting for driver acceptance.", "feedback": None, "result": None}
+                self.task_deadline = time.monotonic() + 0.8
+                self.notice = "Task submitted; waiting for driver acceptance."
+
+                def feedback(message):
+                    with self.lock:
+                        if generation == self.generation and self.task_busy():
+                            self.task["feedback"] = plain_message(message.feedback)
+
+                future = self.task_client.send_goal_async(goal, feedback_callback=feedback)
+
+                def accepted(response):
+                    with self.lock:
+                        try:
+                            handle = response.result()
+                            if generation != self.generation:
+                                if handle.accepted:
+                                    self.stop_async("Late task acceptance after STOP; disable requested.")
+                                return
+                            if not handle.accepted:
+                                self.stop_async("Driver rejected task; inspect limits and task parameters.")
+                                self.task["state"] = "rejected"
+                                return
+                            self.task_handle = handle
+                            self.task["state"] = "running"
+                            self.task_deadline = time.monotonic() + body["duration"] + 3
+                            self.task["message"] = "Driver accepted task."
+                            self.notice = self.task["message"]
+                            handle.get_result_async().add_done_callback(completed)
+                        except Exception as error:
+                            self.stop_async(f"Task acceptance failed: {error}")
+                            self.task["state"] = "failed"
+
+                def completed(response):
+                    with self.lock:
+                        if generation != self.generation:
+                            return
+                        try:
+                            result = response.result().result
+                            self.task["result"] = plain_message(result)
+                            self.task["state"] = "succeeded" if result.success else "failed"
+                            self.task["message"] = result.message
+                            self.armed = False
+                            self.waiting_enable = False
+                            self.target = self.neutral_target()
+                            self.task_handle = None
+                            self.notice = result.message
+                        except Exception as error:
+                            self.stop_async(f"Task result failed: {error}")
+                            self.task["state"] = "failed"
+
+                future.add_done_callback(accepted)
+                return {"message": "Task submitted; acceptance and result are reported in task status."}
+        finally:
+            self.operation_lock.release()
 
     def stop(self, session, release=False):
         if release:
@@ -420,11 +661,11 @@ class Dashboard(Node):
                 self.disarm("Control released; target cleared and disable requested.", release=True)
         else:
             self.disarm("STOP requested; target cleared. Check state for disabled confirmation.")
-        return self.call_service(self.enable_client, SetBool.Request(data=False))
+        return self.call_command(self.enable_client, MotorOperation.Request(operation=MotorOperation.Request.DISABLE))
 
     def reset(self, session):
         if not self.operation_lock.acquire(blocking=False):
-            raise ApiError(409, "Another service operation is pending.")
+            raise ApiError(409, "Another control command is pending.")
         try:
             with self.lock:
                 self.require_session(session)
@@ -433,7 +674,7 @@ class Dashboard(Node):
                     raise ApiError(409, "Reset requires a host fault and fresh disabled motor feedback.")
                 self.disarm("Reset requested; motor remains disabled.")
                 token, generation = self.driver_token, self.generation
-            return self.call_service(self.operation_client, MotorOperation.Request(
+            return self.call_command(self.operation_client, MotorOperation.Request(
                 operation=MotorOperation.Request.RESET_HOST_FAULT, token=token), generation)
         finally:
             self.operation_lock.release()
@@ -451,7 +692,7 @@ class Dashboard(Node):
         if name == "mode" and (type(mode) is not int or not self.capabilities or mode not in self.capabilities["modes"]):
             raise ApiError(400, "Mode is not supported by this driver.")
         if not self.operation_lock.acquire(blocking=False):
-            raise ApiError(409, "Another service operation is pending.")
+            raise ApiError(409, "Another control command is pending.")
         try:
             with self.lock:
                 self.require_session(session)
@@ -466,7 +707,7 @@ class Dashboard(Node):
                                    "only motor-fault clear also accepts fresh non-enabled Fault feedback.")
                 self.disarm("Configuration requested; motor remains disabled.")
                 token, generation = self.driver_token, self.generation
-            return self.call_service(self.operation_client, MotorOperation.Request(
+            return self.call_command(self.operation_client, MotorOperation.Request(
                 operation=operations[name], token=token, mode=mode), generation)
         finally:
             self.operation_lock.release()
@@ -478,14 +719,47 @@ class Dashboard(Node):
         if (set(body) != {"addresses"} or not isinstance(addresses, list) or not 1 <= len(addresses) <= 16
                 or any(type(address) is not int or address not in allowed for address in addresses)):
             raise ApiError(400, "Select 1..16 advertised parameter addresses for read-only access.")
-        response = self.service_response(self.register_client, RegisterAccess.Request(
+        response = self.command_response(self.register_client, RegisterAccess.Request(
             write=False, addresses=addresses))
         return {"message": response.message, "operation_ids": list(response.operation_ids)}
+
+    def write_register(self, session, body):
+        if set(body) != {"address", "value"} or type(body["address"]) is not int:
+            raise ApiError(400, "Expected an advertised parameter address and numeric value.")
+        descriptor = next((item for item in (self.capabilities or {}).get("registers", [])
+                           if item["address"] == body["address"]), None)
+        if not descriptor or not descriptor["raw_write_allowed"]:
+            raise ApiError(400, "Parameter is read-only or requires a specialized commissioning operation.")
+        value = finite_number(body["value"], "Parameter value")
+        if descriptor["integer"]:
+            if value != int(value) or not 0 <= value <= 0xFFFFFFFF:
+                raise ApiError(400, "Integer parameter requires uint32.")
+            raw = int(value)
+        else:
+            try:
+                raw = struct.unpack("<I", struct.pack("<f", value))[0]
+            except (OverflowError, struct.error) as error:
+                raise ApiError(400, "Parameter exceeds float32 range.") from error
+        if not self.operation_lock.acquire(blocking=False):
+            raise ApiError(409, "Another operation is pending.")
+        try:
+            with self.lock:
+                self.require_session(session)
+                if (not self.connected() or not self.state["feedback_fresh"]
+                        or self.state["phase"] != MotorState.DISABLED or self.state["status"] != 0
+                        or not self.state["ready"] or self.state["task_active"]):
+                    raise ApiError(409, "Parameter writes require ready, fresh disabled feedback and no task.")
+                generation, token = self.generation, self.driver_token
+            response = self.command_response(self.register_client, RegisterAccess.Request(
+                write=True, token=token, addresses=[body["address"]], raw_values=[raw]), generation)
+            return {"message": response.message, "operation_ids": list(response.operation_ids)}
+        finally:
+            self.operation_lock.release()
 
     def get_operation(self, operation_id):
         if not operation_id.isdecimal() or not 0 < int(operation_id) < 2**64:
             raise ApiError(400, "Operation ID must be a positive uint64.")
-        response = self.service_response(self.get_operation_client, GetOperation.Request(
+        response = self.command_response(self.get_operation_client, GetOperation.Request(
             operation_id=int(operation_id)))
         return plain_message(response)
 
@@ -508,9 +782,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.connection.settimeout(2)
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
+    def log_request(self, code="-", size="-"):
+        if code not in (200, 304, "200", "304"):
+            super().log_request(code, size)
+
     def log_message(self, format_string, *args):
-        if args and str(args[1]) not in ("200", "304"):
-            self.server.node.get_logger().warning(format_string % args)
+        message = format_string % args if args else format_string
+        self.server.node.get_logger().warning(message)
 
     def respond(self, status, content, content_type="application/json; charset=utf-8"):
         self.send_response(status)
@@ -548,8 +826,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", ""))
         except ValueError as error:
             raise ApiError(400, "A valid Content-Length is required.") from error
-        if not 0 < length <= 4096:
-            raise ApiError(413, "JSON request body must be in 1..4096 bytes.")
+        maximum = 32768 if urlsplit(self.path).path == "/api/task" else 4096
+        if not 0 < length <= maximum:
+            raise ApiError(413, f"JSON request body must be in 1..{maximum} bytes.")
 
         def reject_constant(value):
             raise ValueError(f"Non-finite JSON number: {value}")
@@ -572,7 +851,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         node = self.server.node
-        version = 0
+        with node.stream_condition:
+            version = max(0, node.stream_version - 1)
         try:
             while True:
                 with node.stream_condition:
@@ -580,14 +860,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         lambda: node.closing or node.stream_version > version, timeout=1)
                     if node.closing:
                         return
-                    sample = node.stream_sample if node.stream_version > version else None
+                    oldest = max(1, node.stream_version - len(node.stream_samples) + 1)
+                    missing = max(0, oldest - version - 1)
+                    first = max(version + 1, oldest)
+                    samples = [node.stream_samples[index % len(node.stream_samples)]
+                               for index in range(first, node.stream_version + 1)]
                     version = node.stream_version
-                if sample is None:
+                if not samples:
                     packet = b": keepalive\n\n"
                 else:
-                    # Each client takes only the latest sample; slow clients never accumulate a queue.
-                    packet = ("data: " + json.dumps(sample, allow_nan=False, separators=(",", ":"))
-                              + "\n\n").encode("utf-8")
+                    prefix = ""
+                    if missing:
+                        node.get_logger().warning(f"Slow feedback stream client lost {missing} buffered samples.")
+                        prefix = "event: gap\ndata: " + json.dumps({"missing": missing}) + "\n\n"
+                    packet = (prefix + "".join(
+                        "data: " + json.dumps(sample, allow_nan=False, separators=(",", ":")) + "\n\n"
+                        for sample in samples)).encode("utf-8")
                 self.wfile.write(packet)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, TimeoutError) as error:
@@ -629,11 +917,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             node = self.server.node
             path = urlsplit(self.path).path
             if path == "/api/target":
-                result = node.apply(self.session(), body)
+                generation = self.headers.get("X-Control-Generation")
+                sequence = self.headers.get("X-Target-Sequence")
+                if generation is not None or sequence is not None:
+                    if (generation is None or sequence is None
+                            or any(not value.isdecimal() or len(value) > 20
+                                   or int(value) >= 2**64 for value in (generation, sequence))
+                            or int(sequence) == 0):
+                        raise ApiError(400, "Target ordering requires uint64 generation and positive sequence.")
+                    result = node.apply(self.session(), body, int(generation), int(sequence))
+                else:
+                    result = node.apply(self.session(), body)
             elif path == "/api/operation":
                 result = node.operation(self.session(), body)
+            elif path == "/api/control-rate":
+                result = node.set_control_rate(self.session(), body)
             elif path == "/api/registers":
                 result = node.read_registers(body)
+            elif path == "/api/register-write":
+                result = node.write_register(self.session(), body)
+            elif path == "/api/task":
+                result = node.start_task(self.session(), body)
             else:
                 if body:
                     raise ApiError(400, "This operation requires an empty JSON object.")

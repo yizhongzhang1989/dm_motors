@@ -7,12 +7,12 @@ client and cannot transmit.
 
 ```bash
 ros2 launch can_bus_dashboard dashboard.launch.py \
-  bus_namespace:=/can/main host:=127.0.0.1 port:=8090
+  bus_namespace:=/can/main host:=127.0.0.1 port:=8080
 ```
 
 Executable: `dashboard.py`; launch arguments and ROS parameters:
 `bus_namespace` (absolute, default `/can/main`), `host` (default `127.0.0.1`),
-`port` (default `8090`). Backend/FD capability, port and bitrate are read from
+`port` (default `8080`). Backend/FD capability, port and bitrate are read from
 actual bus status; debugging remains disabled until that status is fresh.
 
 ## Monitoring and bounds
@@ -22,6 +22,10 @@ errors, authoritative RX/TX/rejection counters, queue depth, client count,
 maintenance owner name, client names/heartbeat acknowledgments/faults/receive
 readiness, quiet state and group faults. Capability tokens and
 token-bearing client diagnostic prefixes are never exposed over HTTP.
+
+Status also exposes `observer_dropped` and `observer_queue_depth`. Public RX/TX
+observation is asynchronous and bounded; a nonzero drop counter means the raw
+observer trace is incomplete, not that private motor feedback was downsampled.
 
 `rx` means acquired receive traffic, including error frames where the backend
 provides them. `tx_observed` means a successful driver write (or simulation

@@ -7,7 +7,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
-    defaults = {"bus_namespace": "/can/main", "host": "127.0.0.1", "port": "8090"}
+    defaults = {"bus_namespace": "/can/main", "host": "127.0.0.1", "port": "8080"}
     return LaunchDescription([
         *(DeclareLaunchArgument(name, default_value=value) for name, value in defaults.items()),
         Node(package="can_bus_dashboard", executable="dashboard.py", name="can_bus_dashboard",

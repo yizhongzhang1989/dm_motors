@@ -10,6 +10,7 @@
 
 namespace dm_motor
 {
+constexpr double max_kd = 1.0;
 struct Frame
 {
   uint16_t id{0};
@@ -30,8 +31,8 @@ struct Feedback
 };
 struct Limits
 {
-  // Zero p/v/t selects the motor's full mapping, not a fixed model-specific cap.
-  double p{0.0}, v{0.0}, t{0.0}, kp{500.0}, kd{5.0};
+  // Zero selects mapping limits; non-MIT float positions instead use float32 range.
+  double p{0.0}, v{0.0}, t{0.0}, kp{500.0}, kd{max_kd};
 };
 void validate_mapping(const Mapping & mapping);
 Limits resolve_limits(const Mapping & mapping, Limits limits);

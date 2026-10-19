@@ -28,12 +28,25 @@ class RecordingTransport : public Transport
 public:
   explicit RecordingTransport(const std::vector<MotorConfig> & c) : sim(c) {}
   bool maintenance_available() const override {return available;}
+  bool activity_available() const override {return motion_available;}
   bool maintenance_blocked() const override {return !available;}
   bool prepare_maintenance() override {return reserved;}
   void send(const Frame & f) override
   {
     if (broken) {throw std::runtime_error("injected transport disconnect");}
     sent.push_back(f);
+    if (f.id == 0x7ff && f.data[2] == 0x33 && f.data[3] == 80) {
+      if (drop_position_read) {return;}
+      if (position_raw_override) {
+        Frame reply = f;
+        reply.id = 0;
+        for (unsigned j = 0; j < 4; ++j) {
+          reply.data[4 + j] = (*position_raw_override >> (8 * j)) & 255;
+        }
+        injected.push_back(reply);
+        return;
+      }
+    }
     if (ignore_write && f.id == 0x7ff && f.data[2] == 0x55) {
       Frame echo = f; echo.id = 0; injected.push_back(echo); return;
     }
@@ -49,6 +62,9 @@ public:
   SimBusTransport sim;
   bool ignore_write{false}, broken{false};
   bool available{true}, reserved{true};
+  bool motion_available{true};
+  bool drop_position_read{false};
+  std::optional<uint32_t> position_raw_override;
   std::vector<Frame> sent, injected;
 };
 class RuntimeTest : public ::testing::Test
@@ -141,6 +157,33 @@ TEST(RuntimeProtocol, RejectsInvalidModeSpecificTargets)
   EXPECT_THROW(target_frame(1, t, {}), std::invalid_argument);
   t = {}; t.current_ratio = std::numeric_limits<double>::quiet_NaN();
   EXPECT_THROW(target_frame(1, t, {}), std::invalid_argument);
+  t = {}; t.kd = 1;
+  EXPECT_NO_THROW(target_frame(1, t, {}));
+  t.kd = std::nextafter(1.0, 2.0);
+  EXPECT_THROW(target_frame(1, t, {}), std::invalid_argument);
+}
+TEST(RuntimeProtocol, FloatPositionModesSupportMultiTurnTargetsAndKeepExplicitLimits)
+{
+  for (Mode mode : {Mode::PositionVelocity, Mode::PositionForce}) {
+    Target target;
+    target.mode = mode;
+    target.velocity_limit = 0.2;
+    target.current_ratio = mode == Mode::PositionForce ? 0.1 : 0;
+    for (double position : {-1885.0, 1885.0}) {
+      target.position = position;
+      const auto frame = target_frame(1, target, {});
+      uint32_t raw = 0;
+      for (unsigned j = 0; j < 4; ++j) {raw |= uint32_t(frame.data[j]) << (8 * j);}
+      EXPECT_EQ(raw, float_bits(static_cast<float>(position)));
+      EXPECT_THROW(target_frame(1, target, {}, {1, 0, 0, 500, 1}), std::invalid_argument);
+    }
+    target.position = std::nextafter(
+      double(std::numeric_limits<float>::max()), std::numeric_limits<double>::infinity());
+    EXPECT_THROW(target_frame(1, target, {}), std::invalid_argument);
+  }
+  Target mit;
+  mit.position = 25;
+  EXPECT_THROW(target_frame(1, mit, {}), std::invalid_argument);
 }
 TEST(RuntimeProtocol, LegacySerialCompatibilityPreservesAllFourModes)
 {
@@ -191,6 +234,23 @@ TEST_F(RuntimeTest, AsynchronousStartupConfirmsMappingsWatchdogAndDisabled)
   EXPECT_TRUE(std::none_of(transport->sent.begin(), transport->sent.end(),
     [](const Frame & f) {return f.id != 0x7ff && f.data[7] == 0xfc;}));
 }
+TEST_F(RuntimeTest, FeedbackObserverPreservesEveryFrameInOneReceiveBatch)
+{
+  ready();
+  const auto before = bus->snapshot("a", now).feedback_count;
+  std::vector<uint64_t> counts;
+  bus->set_feedback_callback([&](const std::string & name, const MotorSnapshot & sample, double received) {
+    if (name == "a") {
+      counts.push_back(sample.feedback_count);
+      EXPECT_LE(received, now);
+    }
+  });
+  for (unsigned i = 0; i < 10; ++i) {transport->sim.send(query_frame(1));}
+  step();
+  ASSERT_GE(counts.size(), 10u);
+  EXPECT_EQ(counts.size(), bus->snapshot("a", now).feedback_count - before);
+  for (size_t i = 0; i < counts.size(); ++i) {EXPECT_EQ(counts[i], before + i + 1);}
+}
 TEST_F(RuntimeTest, MultiMotorLatestTargetsAndIndependentStop)
 {
   ready(); enable("a"); enable("b");
@@ -204,6 +264,214 @@ TEST_F(RuntimeTest, MultiMotorLatestTargetsAndIndependentStop)
   bus->disable("a", now); step();
   EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Disabled);
   EXPECT_EQ(bus->snapshot("b", now).phase, Phase::Enabled);
+}
+TEST_F(RuntimeTest, ExplicitStartupModeConfigurationEnablesMultiTurnTargetsWithoutAutoEnable)
+{
+  auto desired = configuration();
+  for (auto & config : desired) {
+    config.mode = Mode::PositionVelocity;
+    config.configure_mode_on_startup = true;
+  }
+  auto remote = std::make_unique<RecordingTransport>(configuration());
+  transport = remote.get();
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  for (unsigned i = 0; i < 500 && !bus->ready(); ++i) {step();}
+  ASSERT_TRUE(bus->ready()) << bus->initialization_error();
+  for (const auto & config : desired) {
+    EXPECT_EQ(transport->sim.register_value(config.id, 10), 2u);
+    EXPECT_EQ(bus->snapshot(config.name, now).phase, Phase::Disabled);
+    EXPECT_EQ(bus->snapshot(config.name, now).feedback.status, 0);
+  }
+  EXPECT_TRUE(std::none_of(transport->sent.begin(), transport->sent.end(), [](const Frame & frame) {
+    return (frame.id != 0x7ff && frame.data[7] == 0xfc) ||
+      (frame.id == 0x7ff && frame.data[2] == 0xaa);
+  }));
+  enable("a");
+  for (const double position : {8 * std::acos(-1.0), -8 * std::acos(-1.0)}) {
+    Target target; target.mode = Mode::PositionVelocity;
+    target.position = position; target.velocity_limit = 10;
+    for (unsigned i = 0; i < 1200; ++i) {
+      bus->command("a", target, now); step();
+    }
+    EXPECT_NEAR(bus->snapshot("a", now).absolute_position, position, 0.02);
+    EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Enabled);
+  }
+}
+
+TEST_F(RuntimeTest, StartupModeWriteRequiresIndependentReadback)
+{
+  auto desired = configuration();
+  desired[0].mode = Mode::PositionVelocity;
+  desired[0].configure_mode_on_startup = true;
+  auto remote = std::make_unique<RecordingTransport>(configuration());
+  transport = remote.get(); transport->ignore_write = true;
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  step(500);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_FALSE(bus->initialization_error().empty());
+  EXPECT_EQ(transport->sim.register_value(1, 10), 1u);
+  EXPECT_TRUE(std::none_of(transport->sent.begin(), transport->sent.end(), [](const Frame & frame) {
+    return frame.id != 0x7ff && frame.data[7] == 0xfc;
+  }));
+}
+
+TEST_F(RuntimeTest, StartupModeConfigurationNeverWritesWhileMotorIsEnabled)
+{
+  auto desired = configuration();
+  desired[0].mode = Mode::PositionVelocity;
+  desired[0].configure_mode_on_startup = true;
+  auto remote = std::make_unique<RecordingTransport>(configuration());
+  transport = remote.get();
+  transport->sim.send(special_frame(1, 0xfc));
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  step(500);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_TRUE(std::none_of(transport->sent.begin(), transport->sent.end(), [](const Frame & frame) {
+    return frame.id == 0x7ff && frame.data[2] == 0x55 && frame.data[3] == 10;
+  }));
+}
+TEST_F(RuntimeTest, StartupAnchorsEachMotorOnceAtMultiTurnPosition)
+{
+  transport->sim.set_position(1, 1884.98);
+  transport->sim.set_position(2, -50.0);
+  ready();
+  for (const auto & config : bus->configs()) {
+    const auto state = bus->snapshot(config.name, now);
+    EXPECT_TRUE(state.absolute_position_valid);
+    EXPECT_NEAR(state.absolute_position, config.id == 1 ? 1884.98 : -50.0, 0.001);
+    EXPECT_EQ(state.position_wraps, 0);
+    EXPECT_LE(std::abs(state.feedback.p), state.mapping.p);
+  }
+  step(50);
+  for (uint8_t id : {1, 2}) {
+    EXPECT_EQ(std::count_if(transport->sent.begin(), transport->sent.end(),
+      [id](const Frame & f) {
+        return f.id == 0x7ff && f.data[0] == id && f.data[2] == 0x33 && f.data[3] == 80;
+      }), 1);
+  }
+}
+TEST_F(RuntimeTest, StartupPositionAnchorWaitsForBusMaintenanceToFinish)
+{
+  transport->motion_available = false;
+  step(150);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_TRUE(bus->initialization_error().empty());
+  EXPECT_FALSE(bus->snapshot("a", now).absolute_position_valid);
+  const auto position_reads = [&]() {
+      return std::count_if(transport->sent.begin(), transport->sent.end(), [](const Frame & f) {
+        return f.id == 0x7ff && f.data[2] == 0x33 && f.data[3] == 80;
+      });
+    };
+  EXPECT_EQ(position_reads(), 0);
+  transport->motion_available = true;
+  step(10);
+  EXPECT_EQ(position_reads(), 0);
+  transport->motion_available = false;
+  step(10);
+  transport->motion_available = true;
+  step(10);
+  EXPECT_EQ(position_reads(), 0);
+  ready();
+  EXPECT_TRUE(bus->snapshot("a", now).absolute_position_valid);
+  EXPECT_TRUE(bus->snapshot("b", now).absolute_position_valid);
+  EXPECT_EQ(position_reads(), 2);
+}
+TEST_F(RuntimeTest, SoftwarePositionTracksThreeHundredTurnsAndReverseWithoutApiCorrection)
+{
+  transport->sim.set_position(1, 0.02);
+  ready();
+  const double start = bus->snapshot("a", now).absolute_position;
+  for (unsigned direction : {0, 1}) {
+    for (unsigned j = 1; j <= 3000; ++j) {
+      const double turns = direction == 0 ? j / 10.0 : 300 - j / 10.0;
+      transport->sim.set_position(1, 0.02 + turns * 2 * std::acos(-1.0));
+      step(2);
+      const auto state = bus->snapshot("a", now);
+      ASSERT_TRUE(state.absolute_position_valid) << state.error;
+      ASSERT_NEAR(state.absolute_position, 0.02 + turns * 2 * std::acos(-1.0), 0.001);
+    }
+    EXPECT_EQ(bus->snapshot("a", now).position_wraps, direction == 0 ? 75 : 0);
+  }
+  EXPECT_NEAR(bus->snapshot("a", now).absolute_position, start, 0.001);
+  EXPECT_EQ(std::count_if(transport->sent.begin(), transport->sent.end(), [](const Frame & f) {
+    return f.id == 0x7ff && f.data[0] == 1 && f.data[2] == 0x33 && f.data[3] == 80;
+  }), 1);
+}
+TEST_F(RuntimeTest, MissingOrNonfinitePositionAnchorPreventsReadiness)
+{
+  transport->drop_position_read = true;
+  step(300);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_FALSE(bus->snapshot("a", now).absolute_position_valid);
+  EXPECT_NE(bus->initialization_error().find("register=80"), std::string::npos);
+}
+TEST_F(RuntimeTest, NonfinitePositionAnchorIsExplicitStartupFailure)
+{
+  transport->position_raw_override = float_bits(std::numeric_limits<float>::quiet_NaN());
+  step(200);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_NE(bus->initialization_error().find("p_m position is not finite"), std::string::npos);
+}
+TEST_F(RuntimeTest, InconsistentPositionAnchorIsExplicitStartupFailure)
+{
+  transport->position_raw_override = float_bits(5);
+  step(200);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_NE(bus->initialization_error().find("differs from compact"), std::string::npos);
+}
+TEST_F(RuntimeTest, LongFeedbackGapInvalidatesAbsolutePositionAndCannotResetIt)
+{
+  ready();
+  transport->sim.receive();
+  transport->sim.drop_replies(true);
+  step(100);
+  EXPECT_FALSE(bus->snapshot("a", now).absolute_position_valid);
+  transport->sim.drop_replies(false);
+  step(3);
+  const auto state = bus->snapshot("a", now);
+  EXPECT_EQ(state.phase, Phase::Fault);
+  EXPECT_FALSE(state.absolute_position_valid);
+  EXPECT_NE(state.error.find("absolute position ambiguous"), std::string::npos);
+  EXPECT_THROW(bus->reset("a", now), std::runtime_error);
+  EXPECT_THROW(bus->enable("a", now), std::runtime_error);
+}
+TEST_F(RuntimeTest, ConfirmedDeviceZeroReanchorsSoftwareWithoutReadingRegisterAgain)
+{
+  transport->sim.set_position(1, 50);
+  ready();
+  EXPECT_NEAR(bus->snapshot("a", now).absolute_position, 50, 0.001);
+  EXPECT_EQ(await(bus->set_device_zero("a", now)).state, OperationState::Confirmed);
+  step(3);
+  const auto state = bus->snapshot("a", now);
+  EXPECT_TRUE(state.absolute_position_valid);
+  EXPECT_NEAR(state.absolute_position, 0, 0.001);
+  EXPECT_EQ(state.position_wraps, 0);
+}
+TEST_F(RuntimeTest, PositionModeEnableUsesFullContinuousNeutralPosition)
+{
+  auto config = configuration();
+  config[0].mode = Mode::PositionVelocity;
+  auto sim = std::make_unique<RecordingTransport>(config);
+  auto * raw = sim.get();
+  raw->sim.set_position(1, 50);
+  Bus local(std::move(sim), config, true);
+  double time = 0;
+  for (unsigned j = 0; j < 200; ++j) {local.tick(time += 0.005);}
+  ASSERT_TRUE(local.ready()) << local.initialization_error();
+  raw->sent.clear();
+  EXPECT_NO_THROW(local.enable("a", time));
+  ASSERT_EQ(raw->sent.size(), 2u);
+  EXPECT_EQ(raw->sent[0].id, 0x101);
+  EXPECT_TRUE(std::equal(raw->sent[0].data.begin(), raw->sent[0].data.begin() + 4,
+    (std::array<uint8_t, 4>{0, 0, 0x48, 0x42}).begin()));
+  local.tick(time += 0.005);
+  EXPECT_EQ(local.snapshot("a", time).phase, Phase::Enabled);
+  Target target;
+  target.mode = Mode::PositionVelocity; target.position = -1885; target.velocity_limit = 0.2;
+  EXPECT_NO_THROW(local.command("a", target, time));
+  local.tick(time += 0.005);
+  EXPECT_EQ(local.snapshot("a", time).phase, Phase::Enabled);
+  EXPECT_NEAR(local.snapshot("a", time).absolute_position, 50, 0.001);
 }
 TEST_F(RuntimeTest, IndependentReadbackNotWriteEchoConfirms)
 {

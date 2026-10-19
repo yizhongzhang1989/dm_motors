@@ -131,9 +131,9 @@ TEST(Protocol, DefaultRangesFollowActualMappingAndAllowFullEndpoints)
   EXPECT_EQ(limits.v, 50);
   EXPECT_EQ(limits.t, 10);
   EXPECT_EQ(limits.kp, 500);
-  EXPECT_EQ(limits.kd, 5);
-  const Command commands[] = {{12.5, 50, 500, 5, -10}, {-12.5, -50, 0, 0, 10},
-    {12.5, 50, 500, 0, 10}, {2, 4, 30, 0, 2}, {0, 0, 500, 5, 0}};
+  EXPECT_EQ(limits.kd, 1);
+  const Command commands[] = {{12.5, 50, 500, 1, -10}, {-12.5, -50, 0, 0, 10},
+    {12.5, 50, 500, 0, 10}, {2, 4, 30, 0, 2}, {0, 0, 500, 1, 0}};
   for (const auto & command : commands) {
     ASSERT_NO_THROW(validate_command(command, mapping, {}));
     const auto decoded = decode_mit(mit_frame(7, command, mapping), mapping);
@@ -146,18 +146,33 @@ TEST(Protocol, DefaultRangesFollowActualMappingAndAllowFullEndpoints)
 }
 TEST(Protocol, ExplicitLowerLimitsRemainAvailable)
 {
-  const Limits limits{1, 1, 0.5, 20, 2};
-  EXPECT_NO_THROW(validate_command({1, 1, 20, 2, 0.5}, {}, limits));
+  const Limits limits{1, 1, 0.5, 20, 0.5};
+  EXPECT_NO_THROW(validate_command({1, 1, 20, 0.5, 0.5}, {}, limits));
   EXPECT_THROW(validate_command({1.01, 0, 0, 0, 0}, {}, limits), std::invalid_argument);
   EXPECT_THROW(validate_command({0, 1.01, 0, 0, 0}, {}, limits), std::invalid_argument);
   EXPECT_THROW(validate_command({0, 0, 0, 0, 0.51}, {}, limits), std::invalid_argument);
   EXPECT_THROW(validate_command({0, 0, 20.01, 0, 0}, {}, limits), std::invalid_argument);
-  EXPECT_THROW(validate_command({0, 0, 0, 2.01, 0}, {}, limits), std::invalid_argument);
-  EXPECT_THROW(resolve_limits({}, {-1, 0, 0, 500, 5}), std::invalid_argument);
-  EXPECT_THROW(resolve_limits({}, {0, 31, 0, 500, 5}), std::invalid_argument);
-  EXPECT_THROW(resolve_limits({}, {0, 0, 0, 501, 5}), std::invalid_argument);
+  EXPECT_THROW(validate_command({0, 0, 0, 0.51, 0}, {}, limits), std::invalid_argument);
+  EXPECT_THROW(resolve_limits({}, {-1, 0, 0, 500, 1}), std::invalid_argument);
+  EXPECT_THROW(resolve_limits({}, {0, 31, 0, 500, 1}), std::invalid_argument);
+  EXPECT_THROW(resolve_limits({}, {0, 0, 0, 501, 1}), std::invalid_argument);
 }
-TEST(Protocol, MotionTargetsCannotBecomeSpecialCommands)
+TEST(Protocol, DampingCapPreservesWireScale)
+{
+  const Command command{0, 0, 0, 1, 0};
+  const auto frame = mit_frame(7, command, {});
+  EXPECT_EQ((frame.data[5] << 4) | (frame.data[6] >> 4), 819);
+  EXPECT_DOUBLE_EQ(decode_mit(frame, {}).kd, 1);
+  auto invalid = command;
+  invalid.kd = std::nextafter(1.0, 2.0);
+  EXPECT_THROW(mit_frame(7, invalid, {}), std::invalid_argument);
+  EXPECT_THROW(validate_command(invalid, {}, {}), std::invalid_argument);
+  EXPECT_THROW(resolve_limits({}, {0, 0, 0, 500, invalid.kd}), std::invalid_argument);
+  Frame legacy;
+  legacy.data.fill(0xff);
+  EXPECT_DOUBLE_EQ(decode_mit(legacy, {}).kd, 5);
+}
+TEST(Protocol, UnsafeDampingAndSpecialCommandPrefixesAreRejected)
 {
   const Mapping mapping{12.5, 50, 10};
   for (unsigned code = 4091; code <= 4095; ++code) {

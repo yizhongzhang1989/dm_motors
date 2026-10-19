@@ -199,7 +199,16 @@ std::vector<Frame> Router::drain(double now, bool transmit_ready)
   std::vector<Frame> result;
   if (transmit_ready) {
     result.assign(emergency_.begin(), emergency_.end()); emergency_.clear();
+    for (const auto & frame : result) {
+      for (auto & item : clients) {
+        auto & c = item.second;
+        if (c.activity_requires_stop && std::any_of(c.stops.begin(), c.stops.end(),
+          [&](const auto & registered) {return same(registered, frame);}))
+        {c.stop_dispatched_steady = static_cast<uint64_t>(now * 1e9);}
+      }
+    }
   }
+  size_t priority_end = result.size();
   for (auto & item : clients) {
     auto & c = item.second;
     for (auto it = c.pending.begin(); it != c.pending.end();) {
@@ -208,19 +217,22 @@ std::vector<Frame> Router::drain(double now, bool transmit_ready)
     }
     if (c.pending.empty() || c.revoked || !transmit_ready) {continue;}
     auto stop = std::find_if(c.pending.begin(), c.pending.end(), [](const auto & p) {return p.priority == 1;});
-    if (stop != c.pending.end()) {result.push_back(stop->frame); c.pending.erase(stop); continue;}
+    if (stop != c.pending.end()) {
+      if (result.capacity() == 0) {result.reserve(clients.size());}
+      result.insert(result.begin() + priority_end, stop->frame); ++priority_end;
+      c.pending.erase(stop);
+      if (c.activity_requires_stop) {c.stop_dispatched_steady = static_cast<uint64_t>(now * 1e9);}
+      continue;
+    }
     if (!c.receive_ready) {continue;}
     if ((!maintenance_owner.empty() && maintenance_owner != c.token) || now < c.next_tx) {continue;}
-    result.push_back(c.pending.front().frame); c.pending.pop_front();
+    const auto frame = c.pending.front().frame;
+    if (result.capacity() == 0) {result.reserve(clients.size());}
+    result.push_back(frame); c.pending.pop_front();
+    if (c.activity_requires_stop && std::any_of(c.stops.begin(), c.stops.end(),
+      [&](const auto & registered) {return same(registered, frame);}))
+    {c.stop_dispatched_steady = static_cast<uint64_t>(now * 1e9);}
     c.next_tx = now + 1.0 / c.max_tx_hz;
-  }
-  for (const auto & frame : result) {
-    for (auto & item : clients) {
-      auto & c = item.second;
-      if (c.activity_requires_stop && std::any_of(c.stops.begin(), c.stops.end(),
-        [&](const auto & registered) {return same(registered, frame);}))
-      {c.stop_dispatched_steady = static_cast<uint64_t>(now * 1e9);}
-    }
   }
   return result;
 }

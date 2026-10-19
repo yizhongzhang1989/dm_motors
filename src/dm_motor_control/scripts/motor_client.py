@@ -9,31 +9,25 @@ import sys
 import time
 
 import rclpy
-from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 
-from dm_motor_interfaces.action import RunTask
 from dm_motor_interfaces.msg import MotorState, MotorTarget
-from dm_motor_interfaces.srv import (
+from dm_motor_control.topic_client import (
     ControlLease, GetCapabilities, GetOperation, MotorOperation, RegisterAccess,
+    RunTask, TopicTaskClient, motor_topics,
 )
 
 
 class MotorClient(Node):
     def __init__(self, namespace):
-        super().__init__("motor_cli", namespace=namespace)
+        super().__init__("motor_cli", namespace=namespace, start_parameter_services=False)
         self.state = None
         self.subscription = self.create_subscription(MotorState, "state", self.receive, 1)
-        self.service_clients = {
-            name: self.create_client(kind, name)
-            for name, kind in (
-                ("get_capabilities", GetCapabilities), ("control_lease", ControlLease),
-                ("operation", MotorOperation), ("registers", RegisterAccess),
-                ("get_operation", GetOperation),
-            )
-        }
-        self.action = ActionClient(self, RunTask, "run_task")
+        self.topics = motor_topics(self)
+        self.command_clients = {name: self.topics.endpoint(name) for name in (
+            "get_capabilities", "control_lease", "operation", "registers", "get_operation")}
+        self.tasks = TopicTaskClient(self)
         self.token = ""
         self.renew_at = 0.0
         self.renew_future = None
@@ -48,7 +42,7 @@ class MotorClient(Node):
             if not response.success:
                 raise RuntimeError(f"Control lease lost: {response.message}")
         if self.token and self.renew_future is None and time.monotonic() >= self.renew_at:
-            self.renew_future = self.service_clients["control_lease"].call_async(ControlLease.Request(
+            self.renew_future = self.command_clients["control_lease"].call_async(ControlLease.Request(
                 operation=ControlLease.Request.RENEW, token=self.token, duration=1.0))
             self.renew_at = time.monotonic() + 0.2
 
@@ -62,9 +56,9 @@ class MotorClient(Node):
         raise TimeoutError("Driver response/confirmation timeout; result unknown")
 
     def call(self, name, request):
-        client = self.service_clients[name]
-        if not client.wait_for_service(timeout_sec=3.0):
-            raise RuntimeError(f"Service unavailable: {name}")
+        client = self.command_clients[name]
+        if not client.wait_for_ready(timeout_sec=3.0):
+            raise RuntimeError(f"Topic endpoint unavailable: {name}")
         future = client.call_async(request)
         self.wait(future.done)
         response = future.result()
@@ -190,9 +184,9 @@ class MotorClient(Node):
             amplitude=args.amplitude if args.kind == "sine" else 0.0,
             frequency=args.frequency if args.kind == "sine" else 0.0,
             times=args.times, positions=args.positions)
-        if not self.action.wait_for_server(timeout_sec=3.0):
-            raise RuntimeError("Task action server unavailable")
-        future = self.action.send_goal_async(goal)
+        if not self.tasks.wait_for_ready(timeout_sec=3.0):
+            raise RuntimeError("Task topic endpoints unavailable")
+        future = self.tasks.send_goal_async(goal)
         self.wait(future.done)
         handle = future.result()
         if not handle.accepted:
@@ -234,7 +228,7 @@ def parser():
     run.add_argument("--velocity", type=float, default=0.0)
     run.add_argument("--torque", type=float, default=0.0)
     run.add_argument("--kp", type=float, default=20.0)
-    run.add_argument("--kd", type=float, default=2.0)
+    run.add_argument("--kd", type=float, default=1.0)
     run.add_argument("--current-ratio", type=float, default=0.1)
     run.add_argument("--duration", type=float, default=2.0)
     run.add_argument("--max-velocity", type=float, default=1.0)
@@ -266,6 +260,8 @@ def main():
                 output = {
                     "name": caps.name, "profile": caps.profile, "backend": caps.backend,
                     "modes": list(caps.modes), "evidence": caps.evidence,
+                    "configuration": {name: getattr(caps.configuration, name)
+                                      for name in caps.configuration.get_fields_and_field_types()},
                     "simulated": caps.simulated, "registers": [
                         {"name": item.name, "address": item.address, "integer": item.integer,
                          "writable": item.writable, "raw_write_allowed": item.raw_write_allowed,
@@ -273,9 +269,12 @@ def main():
             elif args.command == "state":
                 state = client.state
                 output = {name: getattr(state, name) for name in (
-                    "name", "ready", "mode", "phase", "status", "position", "velocity",
+                    "name", "ready", "mode", "phase", "status", "position", "native_position",
+                    "absolute_position", "absolute_position_valid", "position_wraps", "velocity",
                     "torque", "mos_temperature", "rotor_temperature", "feedback_age",
                     "feedback_rate", "control_owner", "task_active", "error")}
+                output.update({name: getattr(state, name) for name in (
+                    "accepted_target_sequence", "applied_target_sequence", "target_accept_latency_ms")})
                 output.update({name: getattr(state, name) for name in (
                     "status_text", "host_fault", "device_fault", "host_protection_enabled")})
             elif args.command in ("read", "export"):

@@ -158,6 +158,11 @@ uint16_t control_id(uint8_t id, Mode mode)
   }
   return id + (unsigned(mode) - 1) * 0x100;
 }
+double position_command_limit(Mode mode, const Mapping & mapping, const Limits & limits)
+{
+  const auto resolved = resolve_limits(mapping, limits);
+  return mode == Mode::Mit || limits.p != 0 ? resolved.p : std::numeric_limits<float>::max();
+}
 Frame target_frame(uint8_t id, const Target & t, const Mapping & mapping, const Limits & limits)
 {
   const auto l = resolve_limits(mapping, limits);
@@ -187,7 +192,8 @@ Frame target_frame(uint8_t id, const Target & t, const Mapping & mapping, const 
     f.length = 4;
     put_raw(f, 0, bits(static_cast<float>(t.velocity)));
   } else {
-    bounded(t.position, -l.p, l.p, "position");
+    const double position_limit = position_command_limit(t.mode, mapping, limits);
+    bounded(t.position, -position_limit, position_limit, "position");
     put_raw(f, 0, bits(static_cast<float>(t.position)));
     if (t.mode == Mode::PositionVelocity) {
       if (t.velocity != 0 || t.current_ratio != 0) {
@@ -217,6 +223,9 @@ struct Bus::Impl
     double last_feedback{-1}, last_command{-1}, transition{0}, last_stop{-1};
     unsigned startup{0};
     bool startup_status_requested{false};
+    bool anchor_pending{false};
+    double anchor_time{-1}, tracking_time{-1};
+    double anchor_idle_since{-1};
   };
   enum class Kind {Read, Write, ModeWrite, Save, Clear, Zero, StartupRead, StartupWatchdog};
   struct Transaction
@@ -235,6 +244,7 @@ struct Bus::Impl
   std::unique_ptr<Transport> transport;
   std::vector<MotorConfig> configs;
   std::vector<Motor> motors;
+  std::function<void(const std::string &, const MotorSnapshot &, double)> feedback_callback;
   std::deque<Transaction> queue;
   std::map<uint64_t, RegisterOperation> history;
   uint64_t next{1};
@@ -286,6 +296,8 @@ struct Bus::Impl
     failed = true;
     if (!initialized) {init_error = reason;}
     for (size_t i = 0; i < motors.size(); ++i) {
+      motors[i].state.absolute_position_valid = false;
+      motors[i].anchor_pending = false;
       fault(i, reason);
       // A failed mode write may have changed the device despite a lost response.
       for (unsigned mode = 1; mode <= 4; ++mode) {
@@ -358,8 +370,11 @@ struct Bus::Impl
         io_failure("startup MST_ID mismatch"); return;
       }
       if (tx.rid == 10 && value != unsigned(c.mode)) {
-        io_failure("startup CTRL_MODE mismatch; configure desired mode while disabled before retry");
-        return;
+        if (!c.configure_mode_on_startup || value < 1 || value > 4) {
+          io_failure("startup CTRL_MODE mismatch; configure desired mode while disabled before retry");
+          return;
+        }
+        m.state.mode = Mode(value);
       }
       if (tx.rid == 21) {m.state.mapping.p = number(value);}
       if (tx.rid == 22) {m.state.mapping.v = number(value);}
@@ -370,6 +385,16 @@ struct Bus::Impl
           m.state.limits = resolve_limits(m.state.mapping, c.limits);
           c.mapping = m.state.mapping;
         } catch (const std::exception & e) {io_failure(e.what()); return;}
+      }
+      if (tx.rid == 80) {
+        const double position = number(value);
+        if (!std::isfinite(position)) {
+          io_failure("startup p_m position is not finite"); return;
+        }
+        m.state.absolute_position = position;
+        m.anchor_pending = true;
+        m.anchor_time = now;
+        m.transition = now;
       }
       ++m.startup;
     } else if (tx.kind == Kind::StartupWatchdog) {
@@ -402,8 +427,28 @@ struct Bus::Impl
         m.startup = 6;
       }
     } else if (m.startup == 6) {
-      const auto raw = static_cast<uint32_t>(std::llround(configs[startup_motor].watchdog / 50e-6));
-      queue.push_back({0, startup_motor, Kind::StartupWatchdog, 9, raw});
+      if (m.state.mode != configs[startup_motor].mode) {
+        queue.push_back({0, startup_motor, Kind::ModeWrite, 10, unsigned(configs[startup_motor].mode)});
+      } else {
+        const auto raw = static_cast<uint32_t>(std::llround(configs[startup_motor].watchdog / 50e-6));
+        queue.push_back({0, startup_motor, Kind::StartupWatchdog, 9, raw});
+      }
+    } else if (m.startup == 7) {
+      // Finish bus-wide commissioning before anchoring: another node's startup
+      // parameter burst suppresses our feedback and can make a new anchor ambiguous.
+      if (!transport->activity_available() || !fresh(startup_motor, now) ||
+        m.state.feedback.status != 0)
+      {
+        m.anchor_idle_since = -1;
+        return;
+      }
+      if (m.anchor_idle_since < 0) {m.anchor_idle_since = now;}
+      if (now - m.anchor_idle_since < configs[startup_motor].feedback_timeout) {return;}
+      queue.push_back({0, startup_motor, Kind::StartupRead, 80});
+    } else if (!m.state.absolute_position_valid) {
+      if (now - m.transition > 0.5) {io_failure("startup absolute position anchor timeout");}
+    } else if (!transport->activity_available()) {
+      return;
     } else {
       ++startup_motor;
     }
@@ -436,7 +481,12 @@ struct Bus::Impl
         return;
       }
       // Revalidate at dispatch, not only when the service request was queued.
-      if (tx.op && !maintenance(now, tx.kind == Kind::Clear, tx.motor)) {
+      const bool startup_mode = !tx.op && tx.kind == Kind::ModeWrite;
+      const bool startup_disabled = m.state.phase == Phase::Disabled &&
+        m.state.feedback.status == 0 && fresh(tx.motor, now);
+      if ((tx.op && !maintenance(now, tx.kind == Kind::Clear, tx.motor)) ||
+        (startup_mode && !startup_disabled))
+      {
         const bool quiet_phase = m.state.phase == Phase::Disabled ||
           (tx.kind == Kind::Clear && m.state.phase == Phase::Fault);
         const bool quiet_status = m.state.feedback.status == 0 ||
@@ -522,6 +572,47 @@ struct Bus::Impl
       auto fb = decode_feedback(f, configs[i].id, configs[i].master, motors[i].state.mapping);
       if (!fb) {continue;}
       auto & m = motors[i];
+      const double received = f.received_steady ? f.received_steady * 1e-9 : now;
+      const bool zero_confirmation = !queue.empty() && queue.front().motor == i &&
+        queue.front().kind == Kind::Zero && queue.front().stage == 2 &&
+        m.state.feedback_count >= queue.front().feedback_before &&
+        fb->status == 0 && std::abs(fb->p) <= m.state.mapping.p * 2 / 65535 + 1e-6;
+      if (zero_confirmation) {
+        m.state.absolute_position = 0;
+        m.state.absolute_position_valid = true;
+        m.state.position_wraps = 0;
+        m.anchor_pending = false;
+        m.tracking_time = received;
+      } else if (m.anchor_pending && received > m.anchor_time) {
+        const double near_zero_speed = std::max(0.1, m.state.mapping.v * 2 / 4095);
+        if (fb->status != 0 || std::abs(fb->v) > near_zero_speed) {
+          io_failure("startup absolute position requires stationary disabled feedback"); return;
+        }
+        const double period = 2 * m.state.mapping.p * 65536 / 65535;
+        if (std::abs(std::remainder(m.state.absolute_position - fb->p, period)) >
+          0.01 + near_zero_speed * (received - m.anchor_time))
+        {
+          io_failure("startup p_m differs from compact position anchor"); return;
+        }
+        m.state.absolute_position_valid = true;
+        m.state.position_wraps = 0;
+        m.anchor_pending = false;
+        m.tracking_time = received;
+      } else if (m.state.absolute_position_valid) {
+        // One full 16-bit rollover includes 65536 steps, not 65535.
+        const double period = 2 * m.state.mapping.p * 65536 / 65535;
+        const double elapsed = received - m.tracking_time;
+        if (elapsed < 0 || elapsed * m.state.mapping.v >= period / 2) {
+          m.state.absolute_position_valid = false;
+          fault(i, "absolute position ambiguous after feedback gap; restart node to re-anchor");
+        } else {
+          double delta = fb->p - m.state.feedback.p;
+          if (delta > period / 2) {delta -= period; --m.state.position_wraps;}
+          else if (delta < -period / 2) {delta += period; ++m.state.position_wraps;}
+          m.state.absolute_position += delta;
+          m.tracking_time = received;
+        }
+      }
       m.state.feedback = *fb; m.last_feedback = now; ++m.state.feedback_count;
       if (fb->status > 1) {
         if (!m.state.device_fault) {m.last_stop = -1;}
@@ -536,6 +627,7 @@ struct Bus::Impl
       else if (m.state.phase == Phase::Stopping && fb->status == 0) {m.state.phase = Phase::Disabled;}
       else if (m.state.phase == Phase::Disabled && fb->status == 1) {fault(i, "unexpected external enable");}
       else if (m.state.phase == Phase::Enabled && fb->status == 0) {fault(i, "motor unexpectedly disabled");}
+      if (feedback_callback) {feedback_callback(configs[i].name, m.state, received);}
       if (!queue.empty()) {
         const auto tx = queue.front();
         if (tx.motor == i && tx.kind == Kind::ModeWrite && tx.stage == 3 &&
@@ -639,6 +731,13 @@ void Bus::tick(double now)
     for (size_t i = 0; i < b.motors.size(); ++i) {
       auto & m = b.motors[i];
       const auto & c = b.configs[i];
+      if (m.state.absolute_position_valid &&
+        (now - m.tracking_time) * m.state.mapping.v >=
+        m.state.mapping.p * 65536 / 65535)
+      {
+        m.state.absolute_position_valid = false;
+        b.fault(i, "absolute position ambiguous after feedback gap; restart node to re-anchor");
+      }
       if (m.state.phase == Phase::Enabled || m.state.phase == Phase::Enabling) {
         if (!b.fresh(i, now)) {b.fault(i, "feedback timeout");}
         else if (now - m.last_command > c.command_timeout) {b.fault(i, "command publisher timeout");}
@@ -669,10 +768,11 @@ void Bus::tick(double now)
     for (size_t i = 0; i < b.motors.size(); ++i) {
       auto & m = b.motors[i];
       if (m.state.phase == Phase::Enabled) {
-        b.transport->send(target_frame(b.configs[i].id, m.target, m.state.mapping, m.state.limits));
+        b.transport->send(target_frame(b.configs[i].id, m.target, m.state.mapping, b.configs[i].limits));
       } else {
         // During register transactions, do not provoke ambiguous normal feedback.
         const bool parameter_active = !b.queue.empty() &&
+          (!b.initialized || b.queue.front().stage != 0) &&
           b.queue.front().kind != Impl::Kind::Clear && b.queue.front().kind != Impl::Kind::Zero;
         if (!parameter_active && now >= b.quiet_until) {
           b.transport->send(query_frame(b.configs[i].id));
@@ -687,23 +787,31 @@ MotorSnapshot Bus::snapshot(const std::string & name, double now) const
   auto result = impl_->motors[i].state;
   result.feedback_age = impl_->motors[i].last_feedback < 0 ? -1 :
     now - impl_->motors[i].last_feedback;
+  if (result.absolute_position_valid &&
+    (now - impl_->motors[i].tracking_time) * result.mapping.v >=
+    result.mapping.p * 65536 / 65535)
+  {
+    result.absolute_position_valid = false;
+  }
   return result;
 }
 void Bus::enable(const std::string & name, double now)
 {
   auto & b = *impl_; const auto i = b.index(name); auto & m = b.motors[i];
   if (!b.initialized || b.failed || !b.queue.empty() || !b.transport->activity_available() ||
-    m.state.phase != Phase::Disabled || !b.fresh(i, now) || m.state.feedback.status != 0)
+    m.state.phase != Phase::Disabled || !b.fresh(i, now) || m.state.feedback.status != 0 ||
+    !snapshot(name, now).absolute_position_valid)
   {
     throw std::runtime_error("enable requires ready bus, no maintenance, fresh disabled feedback and no latched fault");
   }
   m.target = {}; m.target.mode = m.state.mode;
   if (m.state.mode == Mode::PositionVelocity || m.state.mode == Mode::PositionForce) {
-    m.target.position = m.state.feedback.p;
+    m.target.position = m.state.absolute_position;
   }
+  target_frame(b.configs[i].id, m.target, m.state.mapping, b.configs[i].limits);
   m.last_command = now; m.transition = now; m.state.phase = Phase::Enabling;
   try {
-    b.transport->send(target_frame(b.configs[i].id, m.target, m.state.mapping, m.state.limits));
+    b.transport->send(target_frame(b.configs[i].id, m.target, m.state.mapping, b.configs[i].limits));
     b.transport->send(special_frame(control_id(b.configs[i].id, m.state.mode), 0xfc));
   } catch (const std::exception & e) {b.io_failure(e.what()); throw;}
 }
@@ -727,9 +835,9 @@ void Bus::reset(const std::string & name, double now)
 {
   auto & b = *impl_; const auto i = b.index(name); auto & m = b.motors[i];
   if (!b.initialized || b.failed || !b.queue.empty() || m.state.phase != Phase::Fault ||
-    !b.fresh(i, now) || m.state.feedback.status != 0)
+    !b.fresh(i, now) || m.state.feedback.status != 0 || !snapshot(name, now).absolute_position_valid)
   {
-    throw std::runtime_error("reset requires healthy initialized bus and fresh disabled feedback");
+    throw std::runtime_error("reset requires initialized bus, valid absolute position and fresh disabled feedback");
   }
   m.state.phase = Phase::Disabled; m.state.error.clear(); m.target = {};
   m.state.host_fault = false; m.state.device_fault = false;
@@ -738,16 +846,22 @@ void Bus::fail(const std::string & name, const std::string & reason)
 {
   impl_->fault(impl_->index(name), reason);
 }
+void Bus::set_feedback_callback(
+  std::function<void(const std::string &, const MotorSnapshot &, double)> callback)
+{
+  impl_->feedback_callback = std::move(callback);
+}
 void Bus::command(const std::string & name, const Target & target, double now)
 {
   auto & b = *impl_; const auto i = b.index(name); auto & m = b.motors[i];
   if (m.state.phase != Phase::Enabled || target.mode != m.state.mode) {
     throw std::runtime_error("target requires confirmed enabled motor and matching mode");
   }
-  if (!std::isfinite(now) || now < b.last_tick || !b.fresh(i, now)) {
+  if (!std::isfinite(now) || now < b.last_tick || !b.fresh(i, now) ||
+    !snapshot(name, now).absolute_position_valid) {
     throw std::runtime_error("target requires monotonic time and fresh feedback");
   }
-  target_frame(b.configs[i].id, target, m.state.mapping, m.state.limits);
+  target_frame(b.configs[i].id, target, m.state.mapping, b.configs[i].limits);
   m.target = target; m.last_command = now;
 }
 uint64_t Bus::read_register(const std::string & name, uint8_t rid, double now)
@@ -823,8 +937,15 @@ struct SimBusTransport::Impl
   bool drop{false};
   void feedback(Motor & m)
   {
-    if (!drop) {pending.push_back(feedback_frame(m.config.id, m.config.master,
-      m.feedback, m.config.mapping));}
+    if (!drop) {
+      auto wire = m.feedback;
+      const double pmax = m.config.mapping.p;
+      const double period = 2 * pmax * 65536 / 65535;
+      double wrapped = std::fmod(wire.p + pmax, period);
+      if (wrapped < 0) {wrapped += period;}
+      wire.p = std::clamp(wrapped - pmax, -pmax, pmax);
+      pending.push_back(feedback_frame(m.config.id, m.config.master, wire, m.config.mapping));
+    }
   }
 };
 SimBusTransport::SimBusTransport(const std::vector<MotorConfig> & configs)
@@ -911,8 +1032,7 @@ void SimBusTransport::send(const Frame & f)
         m.feedback.v = std::clamp((position - m.feedback.p) / dt, -speed, speed);
         m.feedback.t = 0;
       }
-      m.feedback.p = std::clamp(m.feedback.p + m.feedback.v * dt,
-        -m.config.mapping.p, m.config.mapping.p);
+      m.feedback.p += m.feedback.v * dt;
     }
     sim.feedback(m);
   }
@@ -928,6 +1048,14 @@ void SimBusTransport::inject_fault(uint8_t id, uint8_t status)
 }
 void SimBusTransport::drop_replies(bool drop) {impl_->drop = drop;}
 void SimBusTransport::inject_frame(const Frame & frame) {impl_->pending.push_back(frame);}
+void SimBusTransport::set_position(uint8_t id, double position)
+{
+  auto & m = impl_->motors.at(id);
+  if (!std::isfinite(position) || m.feedback.status != 0) {
+    throw std::invalid_argument("simulated position requires finite value and disabled motor");
+  }
+  m.feedback.p = position;
+}
 void SimBusTransport::power_cycle(uint8_t id)
 {
   auto & m = impl_->motors.at(id);

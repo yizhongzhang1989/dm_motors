@@ -139,7 +139,7 @@ class Dashboard(Node):
         super().__init__("can_bus_dashboard", **kwargs)
         self.bus = self.declare_parameter("bus_namespace", "/can/main").value.rstrip("/")
         self.host = self.declare_parameter("host", "127.0.0.1").value
-        self.port = self.declare_parameter("port", 8090).value
+        self.port = self.declare_parameter("port", 8080).value
         if not self.bus.startswith("/") or "//" in self.bus:
             raise ValueError("bus_namespace must be an absolute ROS namespace")
         if not self.host or type(self.port) is not int or not 1 <= self.port <= 65535:
@@ -193,7 +193,7 @@ class Dashboard(Node):
             self.status = {key: getattr(msg, key) for key in
                 ("epoch", "ready", "endpoint_ready", "backend", "error", "rx_count",
                  "tx_count", "rejected", "queue_depth", "clients", "all_quiet",
-                 "port", "can_bitrate", "can_fd")}
+                 "port", "can_bitrate", "can_fd", "observer_dropped", "observer_queue_depth")}
             public_names = dict(zip(msg.client_tokens, msg.client_names, strict=True))
             self.status.update(maintenance=bool(msg.maintenance_owner),
                 maintenance_owner=public_names.get(msg.maintenance_owner, ""),

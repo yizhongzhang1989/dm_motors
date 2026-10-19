@@ -1,0 +1,17 @@
+float64 control_rate
+float64 state_rate
+float64 command_timeout
+float64 feedback_timeout
+float64 watchdog_timeout
+float64 max_task_duration
+bool host_protection_enabled
+bool configure_mode_on_startup
+float64 position_min
+float64 position_max
+float64 estimated_torque_limit
+float64 measured_torque_limit
+float64 measured_velocity_limit
+float64 mos_temperature_stop
+float64 rotor_temperature_stop
+int32 protection_samples
+string fault_group

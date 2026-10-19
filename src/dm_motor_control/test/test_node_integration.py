@@ -1,6 +1,7 @@
 """Isolated shared-bus simulation tests; never opens a physical motor adapter."""
 
 import os
+import math
 from pathlib import Path
 import signal
 import struct
@@ -13,16 +14,14 @@ import yaml
 
 from ament_index_python.packages import get_package_prefix
 import rclpy
-from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from rcl_interfaces.srv import GetParameters
 from std_srvs.srv import SetBool
 
-from dm_motor_interfaces.action import RunTask
-from dm_motor_interfaces.msg import MotorSetpoint, MotorState, MotorTarget
-from dm_motor_interfaces.srv import (
+from dm_motor_interfaces.msg import MotorSetpoint, MotorState, MotorTarget, MotorFeedback, MotorRequest, MotorReply
+from dm_motor_control.topic_client import (
     ControlLease, GetCapabilities, GetOperation, MotorOperation, RegisterAccess,
+    SetTarget, RunTask, TopicTaskClient, create_motor_client,
 )
 
 
@@ -46,14 +45,15 @@ class SharedBusIntegration(unittest.TestCase):
                 MotorSetpoint, f"{name}/setpoint",
                 QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
             cls.clients[name] = {
-                key: cls.node.create_client(service, f"{name}/{key}")
+                key: create_motor_client(cls.node, service, f"{name}/{key}")
                 for key, service in (
                     ("control_lease", ControlLease), ("operation", MotorOperation),
                     ("registers", RegisterAccess), ("get_operation", GetOperation),
                     ("get_capabilities", GetCapabilities),
+                    ("set_target", SetTarget),
                 )
             }
-            cls.actions[name] = ActionClient(cls.node, RunTask, f"{name}/run_task")
+            cls.actions[name] = TopicTaskClient(cls.node, RunTask, f"{name}/run_task")
         cls.config = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
         yaml.safe_dump({"/**": {"ros__parameters": {
             "motor_names": ["left", "right"], "bus_names": ["main"],
@@ -204,6 +204,26 @@ class SharedBusIntegration(unittest.TestCase):
         self.call("left", "registers", RegisterAccess.Request(
             write=True, token=self.tokens["left"], addresses=[0x3C], raw_values=[0]), success=False)
 
+    def test_one_event_target_holds_until_control_lease_expires(self):
+        self.call("left", "control_lease", ControlLease.Request(
+            operation=ControlLease.Request.RENEW, token=self.tokens["left"], duration=0.8))
+        self.enable("left")
+        request = SetTarget.Request(
+            token=self.tokens["left"], sequence=1, valid_for=0.1,
+            target=MotorTarget(mode=1, position=self.states["left"].position + 0.02, kp=1.0, kd=0.2))
+        request.header.stamp = self.node.get_clock().now().to_msg()
+        self.call("left", "set_target", request)
+        started = time.monotonic()
+        self.wait(lambda: time.monotonic() - started > 0.35)
+        self.assertEqual(self.states["left"].phase, MotorState.ENABLED)
+        self.assertTrue(self.states["left"].target_active)
+        self.assertEqual(self.states["left"].active_target.kp, 1.0)
+        self.call("left", "set_target", request, success=False)
+        self.assertEqual(self.states["left"].phase, MotorState.ENABLED)
+        self.wait(lambda: self.states["left"].status == 0 and
+                  self.states["left"].phase in (MotorState.DISABLED, MotorState.FAULT), timeout=2)
+        self.assertFalse(self.states["left"].target_active)
+
     def test_lease_exclusion_and_unauthorized_target(self):
         self.call("left", "control_lease", ControlLease.Request(
             operation=ControlLease.Request.ACQUIRE, owner="second", duration=1.0), success=False)
@@ -256,7 +276,7 @@ class SharedBusIntegration(unittest.TestCase):
     def test_independent_measured_torque_protection_still_stops(self):
         self.enable("right")
         target = MotorTarget(
-            mode=1, position=self.states["right"].position + 0.1, kp=20.0, kd=2.0)
+            mode=1, position=self.states["right"].position + 0.1, kp=20.0, kd=1.0)
         self.wait(lambda: self.states["right"].phase == MotorState.FAULT,
                   action=lambda: self.publish("right", target))
         self.assertIn("measured feedback protection", self.states["right"].error)
@@ -389,7 +409,7 @@ class SharedBusIntegration(unittest.TestCase):
             position = self.states["right"].position
             goal = RunTask.Goal(
                 token=self.tokens["right"], kind=kind,
-                target=MotorTarget(mode=1, position=position + 0.03, kp=20.0, kd=2.0),
+                target=MotorTarget(mode=1, position=position + 0.03, kp=20.0, kd=1.0),
                 duration=0.9, max_velocity=1.0, max_acceleration=2.0,
                 tolerance=0.03, settling_time=0.1)
             if kind == RunTask.Goal.TRAJECTORY:
@@ -448,7 +468,7 @@ class SharedBusIntegration(unittest.TestCase):
         self.assertTrue(client.wait_for_server(timeout_sec=2))
         for kind in (RunTask.Goal.HOLD, RunTask.Goal.SINE, RunTask.Goal.RAMP, RunTask.Goal.VELOCITY):
             self.enable("left")
-            target = MotorTarget(mode=1, position=self.states["left"].position, kp=20.0, kd=2.0)
+            target = MotorTarget(mode=1, position=self.states["left"].position, kp=20.0, kd=1.0)
             goal = RunTask.Goal(
                 token=self.tokens["left"], kind=kind, target=target,
                 duration=0.4, max_velocity=1.0, max_acceleration=2.0,
@@ -477,6 +497,7 @@ class SharedBusIntegration(unittest.TestCase):
     def test_software_zero_preserves_mechanical_bounds(self):
         old = self.states["right"]
         native = old.native_position
+        absolute = old.absolute_position
         lower = old.position_min
         upper = old.position_max
         position = old.position
@@ -486,9 +507,14 @@ class SharedBusIntegration(unittest.TestCase):
                   abs(self.states["right"].position) < 0.001)
         state = self.states["right"]
         self.assertAlmostEqual(state.native_position, native, delta=0.001)
+        self.assertTrue(state.absolute_position_valid)
+        self.assertAlmostEqual(state.absolute_position, absolute, delta=0.001)
+        self.assertAlmostEqual(
+            state.position, state.direction * state.absolute_position + state.software_offset,
+            delta=0.000001)
         self.assertAlmostEqual(state.position_min, lower - position, delta=0.001)
         self.assertAlmostEqual(state.position_max, upper - position, delta=0.001)
-        self.assertAlmostEqual(state.software_offset, state.native_position, delta=0.001)
+        self.assertAlmostEqual(state.software_offset, state.absolute_position, delta=0.001)
 
     def test_invalid_configuration_is_rejected_without_hardware(self):
         executable = Path(get_package_prefix("dm_motor_control")) / "lib/dm_motor_control/motor_node"
@@ -559,12 +585,13 @@ class SharedBusIntegration(unittest.TestCase):
         process = subprocess.Popen(
             ["ros2", "launch", "dm_motor_control", "motor.launch.py",
              f"namespace:={namespace}", "backend:=sim",
+             "mode:=2",
              "estimated_torque_limit:=0.3", "measured_torque_limit:=0.5",
              "measured_velocity_limit:=0.5", "mos_temperature_stop:=60.0",
              "rotor_temperature_stop:=60.0", "position_min:=-0.2", "position_max:=0.2",
              "protection_samples:=4", "fault_group:=launch_test", "max_task_duration:=10.0"],
             stdout=log, stderr=subprocess.STDOUT)
-        client = self.node.create_client(GetParameters, f"{namespace}/motor_controller/get_parameters")
+        client = create_motor_client(self.node, GetCapabilities, f"{namespace}/get_capabilities")
         try:
             if not client.wait_for_service(timeout_sec=8):
                 log.seek(0)
@@ -577,13 +604,16 @@ class SharedBusIntegration(unittest.TestCase):
             names = ["estimated_torque_limit", "measured_torque_limit", "measured_velocity_limit",
                      "mos_temperature_stop", "rotor_temperature_stop", "position_min",
                      "position_max", "protection_samples", "fault_group", "max_task_duration"]
-            future = client.call_async(GetParameters.Request(names=names))
+            future = client.call_async(GetCapabilities.Request())
             self.wait(future.done)
-            values = future.result().values
-            self.assertEqual([v.double_value for v in values[:7]], [0.3, 0.5, 0.5, 60.0, 60.0, -0.2, 0.2])
-            self.assertEqual(values[7].integer_value, 4)
-            self.assertEqual(values[8].string_value, "launch_test")
-            self.assertEqual(values[9].double_value, 10.0)
+            config = future.result().configuration
+            self.assertEqual([getattr(config, name) for name in names],
+                             [0.3, 0.5, 0.5, 60.0, 60.0, -0.2, 0.2, 4, "launch_test", 10.0])
+            self.assertFalse(any(name.startswith(namespace + "/motor_controller/")
+                                 for name, _ in self.node.get_service_names_and_types()))
+            self.assertEqual(states[-1].mode, MotorTarget.POSITION_VELOCITY)
+            self.assertGreater(states[-1].position_limit, 1e30)
+            self.assertEqual((states[-1].position_min, states[-1].position_max), (-0.2, 0.2))
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGINT)
@@ -593,8 +623,100 @@ class SharedBusIntegration(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=3)
             log.close()
-            self.node.destroy_client(client)
             self.node.destroy_subscription(subscription)
+
+    def test_topic_only_graph_and_500hz_latest_target_latency(self):
+        for name in ("left", "right"):
+            prefix = f"{self.namespace}/{name}/"
+            self.assertFalse(any(service.startswith(prefix)
+                                 for service, _ in self.node.get_service_names_and_types()))
+            topics = dict(self.node.get_topic_names_and_types())
+            self.assertIn("dm_motor_interfaces/msg/MotorRequest", topics[prefix + "control"])
+            self.assertIn("dm_motor_interfaces/msg/MotorTaskEvent", topics[prefix + "task_events"])
+        self.call("left", "control_lease", ControlLease.Request(
+            operation=ControlLease.Request.RENEW, token=self.tokens["left"], duration=5.0))
+        rate = create_motor_client(self.node, None, "left/control_rate")
+        future = rate.call_async(MotorRequest(token=self.tokens["left"], value=500.0))
+        self.wait(future.done)
+        self.assertTrue(future.result().success, future.result().message)
+        self.enable("left")
+        ages = {}
+
+        def receive(message):
+            if message.applied_target_sequence:
+                ages.setdefault(message.applied_target_sequence, message.target_accept_latency_ms)
+
+        subscription = self.node.create_subscription(
+            MotorFeedback, "left/feedback", receive,
+            QoSProfile(depth=4096, reliability=ReliabilityPolicy.RELIABLE))
+        try:
+            target = MotorTarget(mode=1, position=self.states["left"].position)
+            deadline = time.monotonic() + 1.2
+            next_target = time.monotonic()
+            next_query = next_target
+            queries = []
+            while time.monotonic() < deadline:
+                if time.monotonic() >= next_target:
+                    self.publish("left", target, valid_for=0.2)
+                    next_target += 0.002
+                if time.monotonic() >= next_query:
+                    queries.append(self.clients["left"]["get_capabilities"].call_async(GetCapabilities.Request()))
+                    next_query += 0.02
+                rclpy.spin_once(self.node, timeout_sec=0.0002)
+            self.wait(lambda: self.sequence in ages)
+            self.wait(lambda: all(query.done() for query in queries))
+            self.assertGreaterEqual(len(queries), 50)
+            self.assertTrue(all(query.result().success for query in queries))
+            values = sorted(ages.values())
+            self.assertGreater(len(values), 300)
+            self.assertGreaterEqual(values[0], 0)
+            p99 = values[math.ceil(len(values) * 0.99) - 1]
+            self.assertLess(p99, 20.0, f"Topic target control-cycle P99 {p99} ms")
+            print(f"500 Hz topic targets: {self.sequence} sent, {len(values)} distinct applied tags observed, "
+                  f"{len(queries)} concurrent capability queries; acceptance latency "
+                  f"P50={values[len(values)//2]:.3f} ms P99={p99:.3f} ms")
+        finally:
+            self.node.destroy_subscription(subscription)
+            self.operate("left", "", MotorOperation.Request.DISABLE)
+            future = rate.call_async(MotorRequest(token=self.tokens["left"], value=200.0))
+            self.wait(future.done)
+
+    def test_expired_topic_control_cannot_enable_and_duplicate_is_idempotent(self):
+        replies = []
+        subscription = self.node.create_subscription(
+            MotorReply, "left/control_result",
+            lambda msg: replies.append(msg) if msg.client_id == "topic_contract" else None, 10)
+        publisher = self.node.create_publisher(
+            MotorRequest, "left/control", QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
+        try:
+            self.wait(lambda: publisher.get_subscription_count() > 0)
+            request = MotorRequest(client_id="topic_contract", request_id=1,
+                                   valid_for=0.1, kind=MotorRequest.OPERATION,
+                                   token=self.tokens["left"], operation=MotorRequest.ENABLE)
+            request.header.stamp = self.node.get_clock().now().to_msg()
+            request.header.stamp.sec -= 1
+            publisher.publish(request)
+            self.wait(lambda: replies)
+            self.assertFalse(replies[-1].success)
+            self.assertEqual(self.states["left"].phase, MotorState.DISABLED)
+            request.request_id = 2
+            request.valid_for = 0.5
+            request.header.stamp = self.node.get_clock().now().to_msg()
+            publisher.publish(request)
+            self.wait(lambda: len(replies) >= 2)
+            self.assertTrue(replies[-1].success)
+            publisher.publish(request)
+            self.wait(lambda: len(replies) >= 3)
+            self.assertTrue(replies[-1].success)
+            self.wait(lambda: self.states["left"].phase == MotorState.ENABLED)
+            request.value = 1.0
+            publisher.publish(request)
+            self.wait(lambda: len(replies) >= 4)
+            self.assertFalse(replies[-1].success)
+            self.assertIn("different payload", replies[-1].message)
+        finally:
+            self.node.destroy_subscription(subscription)
+            self.node.destroy_publisher(publisher)
 
 
 if __name__ == "__main__":

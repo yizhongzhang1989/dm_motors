@@ -14,7 +14,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from dm_motor_interfaces.msg import MotorSetpoint, MotorState, MotorTarget
-from dm_motor_interfaces.srv import ControlLease, MotorOperation, RegisterAccess, GetOperation
+from dm_motor_control.topic_client import (
+    ControlLease, MotorOperation, RegisterAccess, GetOperation, SetTarget, create_motor_client,
+)
 from builtin_interfaces.msg import Duration
 from can_bus.msg import Frame, FrameFilter, Heartbeat, TxFrame, Status
 from can_bus.srv import RegisterClient
@@ -45,8 +47,8 @@ class SplitProcesses(unittest.TestCase):
             self.publishers[name] = self.node.create_publisher(
                 MotorSetpoint, f"{name}/setpoint",
                 QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
-            self.leases[name] = self.node.create_client(ControlLease, f"{name}/control_lease")
-            self.operations[name] = self.node.create_client(MotorOperation, f"{name}/operation")
+            self.leases[name] = create_motor_client(self.node, ControlLease, f"{name}/control_lease")
+            self.operations[name] = create_motor_client(self.node, MotorOperation, f"{name}/operation")
         self.start("can", [str(self.can), "--ros-args", "-r", f"__ns:={self.bus_namespace}",
                            "-p", "backend:=sim", "-p", "can_fd:=true"])
         self.start("sim", [
@@ -72,6 +74,8 @@ class SplitProcesses(unittest.TestCase):
             "-p", f"can_bus_namespace:={self.bus_namespace}"]
         if "fault_group" in self._testMethodName:
             command += ["-p", "fault_group:=paired"]
+        if self._testMethodName == "test_startup_multiturn_mode_and_following_across_both_boundaries":
+            command += ["-p", "mode:=2", "-p", "configure_mode_on_startup:=true"]
         self.start(name, command)
 
     def wait(self, predicate, timeout=5, action=None):
@@ -154,6 +158,29 @@ class SplitProcesses(unittest.TestCase):
         self.assertEqual(self.states["one"].status, 0, "CAN client expiry must send registered STOP frames")
         self.assertEqual(self.states["one"].phase, MotorState.DISABLED)
         self.assertFalse(self.states["one"].control_owner, "Restart must not restore old controller ownership")
+
+    def test_startup_multiturn_mode_and_following_across_both_boundaries(self):
+        for state in self.states.values():
+            self.assertEqual(state.mode, 2)
+            self.assertEqual(state.phase, MotorState.DISABLED)
+            self.assertEqual(state.status, 0)
+            self.assertGreater(state.position_limit, 1e30)
+        self.enable("one")
+        client = create_motor_client(self.node, SetTarget, "one/set_target")
+        for sequence, position in enumerate((25.132741228718345, -25.132741228718345), 1):
+            self.call(self.leases["one"], ControlLease.Request(
+                operation=ControlLease.Request.RENEW, token=self.tokens["one"], duration=5.0))
+            request = SetTarget.Request(
+                token=self.tokens["one"], sequence=sequence, valid_for=0.1,
+                target=MotorTarget(mode=2, position=position, velocity_limit=20.0))
+            request.header.stamp = self.node.get_clock().now().to_msg()
+            self.call(client, request)
+            self.wait(lambda: abs(self.states["one"].position - position) < 0.03, timeout=4)
+            self.assertEqual(self.states["one"].phase, MotorState.ENABLED)
+            self.assertTrue(self.states["one"].absolute_position_valid)
+            self.assertEqual(self.states["two"].phase, MotorState.DISABLED)
+        self.call(self.operations["one"], MotorOperation.Request(operation=MotorOperation.Request.DISABLE))
+        self.wait(lambda: self.states["one"].phase == MotorState.DISABLED)
 
     def test_can_process_death_latches_motors_and_restart_does_not_resume(self):
         self.enable("one")

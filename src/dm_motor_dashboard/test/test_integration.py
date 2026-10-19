@@ -23,7 +23,7 @@ from rclpy.parameter import Parameter
 from rclpy.time import Time
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from dm_motor_interfaces.msg import MotorCommand, MotorSetpoint, MotorState
-from dm_motor_interfaces.srv import ControlLease
+from dm_motor_control.topic_client import ControlLease, create_motor_client
 from std_srvs.srv import SetBool, Trigger
 
 
@@ -45,14 +45,17 @@ class RosIntegration(unittest.TestCase):
         cls.subscription = cls.node.create_subscription(MotorState, "state", receive, 1)
         cls.publisher = cls.node.create_publisher(
             MotorCommand, "command", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
-        cls.enable_client = cls.node.create_client(SetBool, "enable")
-        cls.reset_client = cls.node.create_client(Trigger, "reset")
-        cls.lease_client = cls.node.create_client(ControlLease, "control_lease")
+        cls.setpoint_publisher = cls.node.create_publisher(
+            MotorSetpoint, "setpoint", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+        cls.enable_client = create_motor_client(cls.node, SetBool, "enable")
+        cls.reset_client = create_motor_client(cls.node, Trigger, "reset")
+        cls.lease_client = create_motor_client(cls.node, ControlLease, "control_lease")
         cls.log = tempfile.TemporaryFile(mode="w+", dir=Path(__file__).parent)
         cls.process = subprocess.Popen([
             "ros2", "launch", "dm_motor_control", "motor.launch.py",
             f"namespace:={cls.namespace}", "motor_id:=7", "master_id:=42", "backend:=sim",
             "legacy_control:=true",
+            "state_rate:=200",
         ], stdout=cls.log, stderr=subprocess.STDOUT)
         cls.addClassCleanup(cls.cleanup)
         cls.wait(lambda: cls.state is not None and cls.state.ready and cls.state.feedback_fresh
@@ -189,7 +192,8 @@ class RosIntegration(unittest.TestCase):
         base = f"http://127.0.0.1:{server.server_port}"
         self.wait(lambda: web_node.connected() and web_node.capabilities is not None
                   and web_node.capabilities["ready"] and web_node.lease_client.service_is_ready()
-                  and web_node.operation_client.service_is_ready())
+                  and web_node.operation_client.service_is_ready()
+                  and web_node.target_client.service_is_ready() and web_node.rate_client.service_is_ready())
         try:
             yield web_node, base
         finally:
@@ -269,10 +273,10 @@ class RosIntegration(unittest.TestCase):
             code, body = self.http(base, "heartbeat", {}, session)
             self.assertEqual(code, 409)
 
-    def test_07_protocol_ranges_without_conservative_caps(self):
+    def test_07_mapping_ranges_with_damping_cap(self):
         self.assertEqual(
             (self.state.position_limit, self.state.velocity_limit, self.state.torque_limit,
-             self.state.kp_limit, self.state.kd_limit), (12.5, 30, 10, 500, 5))
+             self.state.kp_limit, self.state.kd_limit), (12.5, 30, 10, 500, 1))
         self.enable()
         previous_count = self.state.feedback_count
         self.wait(lambda: self.state.feedback_count > previous_count + 20,
@@ -287,11 +291,11 @@ class RosIntegration(unittest.TestCase):
         self.wait(lambda: self.state.phase == MotorState.FAULT and self.state.status == 0)
         self.assertIn("torque outside configured range", self.state.error)
 
-    def test_09_special_command_collision_latches_stop(self):
+    def test_09_damping_overflow_latches_stop(self):
         self.enable()
-        self.publish(10, position=12.5, velocity=30, kp=500, kd=5)
+        self.publish(0, kd=1.01)
         self.wait(lambda: self.state.phase == MotorState.FAULT and self.state.status == 0)
-        self.assertIn("special-command prefix", self.state.error)
+        self.assertIn("kd outside configured range", self.state.error)
 
     def test_10_web_open_access_single_owner_and_input_validation(self):
         with self.web_dashboard() as (web, base):
@@ -344,7 +348,7 @@ class RosIntegration(unittest.TestCase):
                 msg.valid_for = 0.1
                 msg.target.mode = 1
                 msg.target.torque = float("nan")
-                web.publisher.publish(msg)
+                self.setpoint_publisher.publish(msg)
             self.wait(lambda: web.state["phase"] == MotorState.FAULT and web.state["status"] == 0,
                       action=lambda: self.http(base, "heartbeat", {}, session))
             code, body = self.http(base, "reset", {}, session)
@@ -483,7 +487,12 @@ class RosIntegration(unittest.TestCase):
             self.assertLess(p99, 0.05)
             for _, sample in packets:
                 self.assertEqual(set(sample), {"sequence", "time", "feedback_count",
-                                               "position", "velocity", "torque"})
+                                               "position", "velocity", "torque", "native_position",
+                                               "absolute_position", "absolute_position_valid",
+                                               "position_wraps", "mos_temperature", "rotor_temperature",
+                                               "source_skipped_samples",
+                                               "applied_target_sequence", "target_accept_latency_ms",
+                                               "target_position", "target_velocity", "target_torque"})
                 self.assertTrue(all(math.isfinite(sample[field]) for field in
                                     ("time", "position", "velocity", "torque")))
             self.assertTrue(all(a[1]["sequence"] < b[1]["sequence"]
@@ -492,6 +501,243 @@ class RosIntegration(unittest.TestCase):
                                 for a, b in zip(packets, packets[1:])))
             self.assertIsNone(web.owner)
             self.assertFalse(web.armed)
+
+    def test_16_web_tasks_complete_cancel_and_do_not_restore_target_stream(self):
+        with self.web_dashboard() as (web, base):
+            self.wait(lambda: web.task_client.server_is_ready())
+            code, response = self.http(base, "session", {})
+            self.assertEqual(code, 200, response)
+            session = response["session"]
+            heartbeat = lambda: self.http(base, "heartbeat", {}, session)
+            target = dict(position=0, velocity=0, kp=0, kd=0, torque=0.02)
+            task = dict(kind="torque", target=target, duration=0.8, max_velocity=1,
+                        max_acceleration=2, tolerance=0.03, settling_time=0.05,
+                        ramp_time=0.1, amplitude=0, frequency=0, times=[], positions=[])
+            for cancel in (False, True):
+                self.wait(lambda: web.state["phase"] == MotorState.DISABLED
+                          and web.state["activity_available"], action=heartbeat)
+                self.assertEqual(self.http(base, "enable", {}, session)[0], 200)
+                self.wait(lambda: web.state["phase"] == MotorState.ENABLED, action=heartbeat)
+                code, response = self.http(base, "task", task, session)
+                self.assertEqual(code, 200, response)
+                self.wait(lambda: web.task["state"] == "running", action=heartbeat)
+                self.assertEqual(self.http(base, "target", target, session)[0], 409)
+                if cancel:
+                    self.assertEqual(self.http(base, "stop", {})[0], 200)
+                    self.wait(lambda: web.task["state"] == "stopped", action=heartbeat)
+                else:
+                    self.wait(lambda: web.task["state"] == "succeeded", timeout=3, action=heartbeat)
+                    self.assertTrue(web.task["result"]["success"])
+                self.wait(lambda: web.state["phase"] == MotorState.DISABLED
+                          and not web.state["task_active"], action=heartbeat)
+                self.assertFalse(web.armed)
+                self.assertEqual(web.target["torque"], 0)
+
+    def test_17_web_parameter_write_checks_permissions_and_independent_readback(self):
+        with self.web_dashboard() as (web, base):
+            code, response = self.http(base, "session", {})
+            self.assertEqual(code, 200, response)
+            session = response["session"]
+            self.assertEqual(self.http(base, "register-write", {"address": 25, "value": 3})[0], 409)
+            self.assertEqual(self.http(base, "register-write", {"address": 21, "value": 50}, session)[0], 400)
+            code, response = self.http(base, "register-write", {"address": 25, "value": 3}, session)
+            self.assertEqual(code, 200, response)
+            operation_id = response["operation_ids"][0]
+            result = {}
+            def check():
+                nonlocal result
+                self.http(base, "heartbeat", {}, session)
+                code, result = self.http(base, f"operations/{operation_id}")
+                self.assertEqual(code, 200, result)
+            self.wait(lambda: result.get("state") == 1, action=check)
+            self.assertEqual(result["address"], 25)
+            self.assertEqual(result["raw_value"], 1077936128)
+            self.assertEqual(web.state["phase"], MotorState.DISABLED)
+
+    def test_18_all_remaining_task_kinds_reach_driver_and_finish_disabled(self):
+        with self.web_dashboard() as (web, base):
+            self.wait(lambda: web.task_client.server_is_ready())
+            code, response = self.http(base, "session", {})
+            self.assertEqual(code, 200, response)
+            session = response["session"]
+            heartbeat = lambda: self.http(base, "heartbeat", {}, session)
+            for kind in ("move", "hold", "velocity", "sine", "ramp", "trajectory"):
+                self.wait(lambda: web.state["phase"] == MotorState.DISABLED
+                          and web.state["activity_available"], action=heartbeat)
+                self.assertEqual(self.http(base, "enable", {}, session)[0], 200)
+                self.wait(lambda: web.state["phase"] == MotorState.ENABLED, action=heartbeat)
+                position = web.state["position"]
+                target = dict(position=position, velocity=0, kp=2, kd=0.3, torque=0)
+                if kind in ("move", "ramp"):
+                    target["position"] += 0.005
+                if kind == "velocity":
+                    target.update(kp=0, kd=0.3, velocity=0.05)
+                task = dict(kind=kind, target=target, duration=0.7, max_velocity=0.1,
+                            max_acceleration=1, tolerance=0.03, settling_time=0.1,
+                            ramp_time=0.1 if kind == "velocity" else 0,
+                            amplitude=0.005 if kind == "sine" else 0,
+                            frequency=0.2 if kind == "sine" else 0,
+                            times=[0.0, 0.4] if kind == "trajectory" else [],
+                            positions=[position, position + 0.005] if kind == "trajectory" else [])
+                code, response = self.http(base, "task", task, session)
+                self.assertEqual(code, 200, response)
+                self.wait(lambda: web.task["state"] in (
+                    "succeeded", "failed", "rejected", "unknown", "stopped"), timeout=3, action=heartbeat)
+                self.assertEqual(web.task["state"], "succeeded", f"{kind}: {web.task}")
+                self.wait(lambda: web.state["phase"] == MotorState.DISABLED, action=heartbeat)
+                self.assertFalse(web.armed)
+
+    def test_19_target_ordering_rejects_delayed_scroll_after_stop_and_enable(self):
+        with self.web_dashboard() as (web, base):
+            code, response = self.http(base, "session", {})
+            self.assertEqual(code, 200, response)
+            session = response["session"]
+            heartbeat = lambda: self.http(base, "heartbeat", {}, session)
+            self.assertEqual(self.http(base, "enable", {}, session)[0], 200)
+            self.wait(lambda: web.state["phase"] == MotorState.ENABLED, action=heartbeat)
+            generation = self.http(base, "state", session=session)[1]["control_generation"]
+            target = dict(position=0.01, velocity=0, kp=0, kd=0, torque=0)
+            headers = {"X-Control-Generation": str(generation), "X-Target-Sequence": "2"}
+            code, result = self.http(base, "target", target, session, extra_headers=headers)
+            self.assertEqual(code, 200, result)
+            self.assertEqual(result["target_sequence"], 2)
+            headers["X-Target-Sequence"] = "1"
+            self.assertEqual(self.http(base, "target", {**target, "position": 1},
+                                       session, extra_headers=headers)[0], 409)
+            self.assertEqual(web.target["position"], 0.01)
+            self.assertEqual(self.http(base, "stop", {})[0], 200)
+            self.wait(lambda: web.state["phase"] == MotorState.DISABLED
+                      and web.state["activity_available"], action=heartbeat)
+            self.assertEqual(self.http(base, "enable", {}, session)[0], 200)
+            self.wait(lambda: web.state["phase"] == MotorState.ENABLED, action=heartbeat)
+            headers["X-Target-Sequence"] = "3"
+            self.assertEqual(self.http(base, "target", target, session, extra_headers=headers)[0], 409)
+            self.assertEqual(web.target["position"], 0)
+            new_generation = self.http(base, "state", session=session)[1]["control_generation"]
+            headers.update({"X-Control-Generation": str(new_generation), "X-Target-Sequence": "4"})
+            self.assertEqual(self.http(base, "target", target, session, extra_headers=headers)[0], 200)
+
+    def test_20_float_position_mode_accepts_multi_turn_targets_but_mit_does_not(self):
+        with self.web_dashboard() as (web, base):
+            code, response = self.http(base, "session", {})
+            self.assertEqual(code, 200, response)
+            session = response["session"]
+            heartbeat = lambda: self.http(base, "heartbeat", {}, session)
+
+            def switch(mode):
+                self.wait(lambda: web.state["phase"] == MotorState.DISABLED
+                          and web.state["maintenance_available"], action=heartbeat)
+                code, operation = self.http(base, "operation", {"operation": "mode", "mode": mode}, session)
+                self.assertEqual(code, 200, operation)
+                result = {}
+                def poll():
+                    nonlocal result
+                    heartbeat()
+                    code, result = self.http(base, f"operations/{operation['operation_id']}")
+                    self.assertEqual(code, 200, result)
+                self.wait(lambda: result.get("state") in (1, 2, 3), action=poll)
+                self.assertEqual(result["state"], 1, result)
+                self.wait(lambda: web.state["mode"] == mode and web.state["activity_available"], action=heartbeat)
+
+            for mode in (2, 4, 2, 4):
+                switch(mode)
+                self.assertGreater(web.state["position_limit"], 1e30)
+                self.assertEqual(web.state["pmax"], 12.5)
+                self.assertEqual(self.http(base, "enable", {}, session)[0], 200)
+                self.wait(lambda: web.state["phase"] == MotorState.ENABLED, action=heartbeat)
+                for position in (50.0, -50.0):
+                    target = dict(position=position, velocity_limit=0.2)
+                    if mode == 4:
+                        target["current_ratio"] = 0.1
+                    code, result = self.http(base, "target", target, session)
+                    self.assertEqual(code, 200, result)
+                    self.wait(lambda: abs(web.state["active_target"]["position"] - position) < 1e-6
+                              and web.state["target_active"], action=heartbeat)
+                    self.assertEqual(web.state["phase"], MotorState.ENABLED)
+                self.assertEqual(self.http(base, "stop", {})[0], 200)
+            switch(1)
+            self.assertEqual(web.state["position_limit"], 12.5)
+            self.assertEqual(self.http(base, "enable", {}, session)[0], 200)
+            self.wait(lambda: web.state["phase"] == MotorState.ENABLED, action=heartbeat)
+            code, result = self.http(base, "target",
+                                     dict(position=50, velocity=0, kp=0, kd=0, torque=0), session)
+            self.assertEqual(code, 400, result)
+
+
+    def test_21_event_targets_hold_without_resend_and_rate_changes_live(self):
+        with self.web_dashboard() as (web, base):
+            code, result = self.http(base, "session", {})
+            self.assertEqual(code, 200, result)
+            session = result["session"]
+            heartbeat = lambda: self.http(base, "heartbeat", {}, session)
+            for rate in (19, 1001):
+                self.assertEqual(self.http(base, "control-rate", {"control_rate": rate}, session)[0], 400)
+            code, result = self.http(base, "control-rate", {"control_rate": 100}, session)
+            self.assertEqual(code, 200, result)
+            self.wait(lambda: web.state["control_rate"] == 100
+                      and abs(web.state["actual_control_rate"] - 100) < 10, action=heartbeat)
+            self.assertEqual(self.http(base, "enable", {}, session)[0], 200)
+            self.wait(lambda: web.state["phase"] == MotorState.ENABLED, action=heartbeat)
+            neutral_sequence = web.sequence
+            start = time.monotonic()
+            self.wait(lambda: time.monotonic() - start > 0.35, action=heartbeat)
+            self.assertEqual(web.sequence, neutral_sequence, "Holding neutral does not resend targets")
+            self.assertEqual(web.state["phase"], MotorState.ENABLED)
+            target = dict(position=web.state["position"] + 0.02, velocity=0, kp=1, kd=0.2, torque=0)
+            before = web.state["control_cycle_count"]
+            code, result = self.http(base, "target", target, session)
+            self.assertEqual(code, 200, result)
+            self.assertEqual(web.sequence, neutral_sequence + 1)
+            self.wait(lambda: web.state["active_target"]["position"] == target["position"]
+                      and web.state["active_target"]["kp"] == 1, action=heartbeat)
+            self.assertLessEqual(web.state["control_cycle_count"] - before, 5)
+            start = time.monotonic()
+            self.wait(lambda: time.monotonic() - start > 0.35, action=heartbeat)
+            self.assertEqual(web.sequence, neutral_sequence + 1)
+            self.assertEqual(web.state["phase"], MotorState.ENABLED)
+            for rate in (400, 200):
+                code, result = self.http(base, "control-rate", {"control_rate": rate}, session)
+                self.assertEqual(code, 200, result)
+                self.wait(lambda: web.state["control_rate"] == rate
+                          and abs(web.state["actual_control_rate"] - rate) < rate * 0.1
+                          and abs(web.state["feedback_rate"] - rate) < rate * 0.1, action=heartbeat)
+                print(f"Requested {rate} Hz; actual loop {web.state['actual_control_rate']:.2f} Hz; "
+                      f"CAN feedback {web.state['feedback_rate']:.2f} Hz")
+            self.assertEqual(web.state["active_target"]["kp"], 1)
+            self.assertEqual(web.state["phase"], MotorState.ENABLED)
+            self.assertEqual(self.http(base, "stop", {}, session)[0], 200)
+            self.wait(lambda: web.state["phase"] == MotorState.DISABLED, action=heartbeat)
+
+
+    def test_22_all_500hz_feedback_streams_independently_of_200hz_state(self):
+        with self.web_dashboard() as (web, base):
+            code, result = self.http(base, "session", {})
+            self.assertEqual(code, 200, result)
+            session = result["session"]
+            self.assertEqual(self.http(base, "control-rate", {"control_rate": 500}, session)[0], 200)
+            self.assertEqual(self.http(base, "release", {}, session)[0], 200)
+            self.wait(lambda: web.owner is None and web.state["control_rate"] == 500
+                      and abs(web.state["actual_control_rate"] - 500) < 30)
+            packets = []
+            with urlopen(base + "/api/stream", timeout=3) as response:
+                started = time.monotonic()
+                while time.monotonic() - started < 1.3:
+                    line = response.readline()
+                    if line.startswith(b"data: "):
+                        packets.append(json.loads(line[6:]))
+                        if len(packets) == 50:
+                            time.sleep(0.12)
+            self.assertGreater(len(packets), 500)
+            rate = (len(packets) - 1) / (packets[-1]["time"] - packets[0]["time"])
+            self.assertTrue(450 < rate < 550, rate)
+            self.assertTrue(all(b["sequence"] == a["sequence"] + 1 and
+                                b["feedback_count"] == a["feedback_count"] + 1
+                                for a, b in zip(packets, packets[1:])))
+            self.assertTrue(all(sample["source_skipped_samples"] == 0 for sample in packets))
+            print(f"Full feedback stream: {rate:.2f} Hz, {len(packets)} consecutive samples; state capped at 200 Hz")
+            code, result = self.http(base, "session", {})
+            self.assertEqual(code, 200, result)
+            self.assertEqual(self.http(base, "control-rate", {"control_rate": 200}, result["session"])[0], 200)
 
 
 if __name__ == "__main__":

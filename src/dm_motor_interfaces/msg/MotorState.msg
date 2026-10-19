@@ -28,6 +28,9 @@ float64 kp_limit
 float64 kd_limit
 float64 period_ms
 float64 max_period_ms
+float64 control_rate
+float64 actual_control_rate
+uint64 control_cycle_count
 uint64 deadline_misses
 string name
 uint8 mode
@@ -36,6 +39,12 @@ string control_owner
 float64 lease_remaining
 bool task_active
 float64 native_position
+# Native continuous radians: startup p_m anchor plus software feedback unwrapping.
+# position applies direction/software_offset; native_position remains compact feedback.
+float64 absolute_position
+bool absolute_position_valid
+# Signed feedback wrap crossings since the latest startup/device-zero anchor.
+int64 position_wraps
 float64 native_velocity
 float64 native_torque
 float64 direction
@@ -58,3 +67,6 @@ bool host_fault
 bool device_fault
 string status_text
 bool host_protection_enabled
+uint64 accepted_target_sequence
+uint64 applied_target_sequence
+float64 target_accept_latency_ms

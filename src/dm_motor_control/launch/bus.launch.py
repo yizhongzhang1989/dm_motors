@@ -35,6 +35,10 @@ def compose(context):
         raise ValueError("motors and buses must be mappings")
     shared = {key: value for key, value in parameters.items()
               if key not in ("motor_names", "bus_names", "motors", "buses")}
+    rate_text = LaunchConfiguration("control_rate", default="").perform(context)
+    rate = float(rate_text) if rate_text else None
+    if rate is not None and (not math.isfinite(rate) or not 20 <= rate <= 1000):
+        raise ValueError("control_rate must be finite in 20..1000 Hz")
     nodes = []
     dashboard_flag = LaunchConfiguration("dashboards").perform(context).lower()
     if dashboard_flag not in ("true", "false"):
@@ -109,6 +113,10 @@ def compose(context):
         bus_namespace = "/" + "/".join(part for part in (root, "can", bus_name) if part)
         values = {**shared, **values, "motor_name": name, "can_bus_namespace": bus_namespace,
                   "can_fd": bus_config[bus_name].get("can_fd", False)}
+        if rate is not None:
+            values["control_rate"] = rate
+            if values.get("state_rate", 0) > rate:
+                values["state_rate"] = rate
         namespace = "/" + "/".join(part for part in (root, name) if part)
         nodes.append(Node(
             package="dm_motor_control", executable="motor_node", name="motor_controller",
@@ -130,9 +138,11 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("config", default_value=default_config),
         DeclareLaunchArgument("namespace", default_value=""),
+        DeclareLaunchArgument("control_rate", default_value="",
+                              description="Override all motor control rates (20..1000 Hz); empty uses config."),
         DeclareLaunchArgument("dashboards", default_value="false"),
         DeclareLaunchArgument("dashboard_host", default_value="127.0.0.1"),
-        DeclareLaunchArgument("can_dashboard_port", default_value="8090"),
+        DeclareLaunchArgument("can_dashboard_port", default_value="8080"),
         DeclareLaunchArgument("motor_dashboard_base_port", default_value="8081"),
         OpaqueFunction(function=compose),
     ])

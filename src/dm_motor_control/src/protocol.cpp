@@ -40,7 +40,7 @@ Limits resolve_limits(const Mapping & m, Limits l)
   range(l.v, 0, m.v, "velocity_limit");
   range(l.t, 0, m.t, "torque_limit");
   range(l.kp, 0, 500, "kp_limit");
-  range(l.kd, 0, 5, "kd_limit");
+  range(l.kd, 0, max_kd, "kd_limit");
   return l;
 }
 void validate_command(const Command & c, const Mapping & m, const Limits & requested)
@@ -55,6 +55,7 @@ void validate_command(const Command & c, const Mapping & m, const Limits & reque
 }
 Frame mit_frame(uint8_t id, const Command & c, const Mapping & m)
 {
+  range(c.kd, 0, max_kd, "kd");
   const auto p = quantize(c.p, -m.p, m.p, 16);
   const auto v = quantize(c.v, -m.v, m.v, 12);
   const auto kp = quantize(c.kp, 0, 500, 12);

@@ -1,0 +1,10 @@
+uint8 RUNNING=1
+uint8 SUCCEEDED=2
+uint8 FAILED=3
+uint8 CANCELED=4
+std_msgs/Header header
+string client_id
+uint64 task_id
+uint8 state
+MotorTaskFeedback feedback
+MotorTaskResult result

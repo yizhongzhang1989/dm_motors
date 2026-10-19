@@ -32,8 +32,40 @@ frames, including RTR on classical CAN and BRS on FD. FD wire lengths are
 0–8, 12, 16, 20, 24, 32, 48, and 64. The legacy USB adapter only supports
 channel-zero standard classical frames: eight bytes, or four bytes padded
 to eight. Unsupported flags or lengths are rejected, never silently truncated.
+These parameters are startup-only/read-only: changing a ROS parameter cannot
+silently leave the actual device or polling timer at its old setting.
 SocketCAN ownership uses a process-lifetime abstract UNIX socket lock;
 serial ownership uses exclusive device access. No automatic reconnect exists.
+
+## Real-time data path
+
+Accepted TX requests wake transmission immediately in the subscription callback;
+they do not wait for the `io_rate` timer. Client rate ceilings, coalescing, TTLs,
+RX-readiness and maintenance ownership still apply. The periodic timer remains
+responsible for physical RX polling, watchdog/lease checks and rate-limited
+pending traffic; lowering it therefore still increases hardware receive latency.
+Fault heartbeats also trigger an immediate drain so registered STOP frames do
+not wait for the next periodic tick. Pending priority STOP frames precede other
+clients' normal frames within a drain batch.
+
+Private filtered RX is forwarded directly to device clients before optional
+public observation. Public `rx` and `tx_observed` publication runs on a separate
+bounded worker queue, so slow public recorders do not directly block the physical
+I/O callback. Its 8192-entry backlog discards the oldest observation on overflow,
+logs a warning, and reports `observer_dropped` / `observer_queue_depth` in status.
+These counters describe public observation only, not motor feedback decimation.
+Hardware receive timestamps are retained rather than replaced after routing.
+
+Serial parsing scans each input batch once and compacts its remainder once,
+preserving partial-frame resynchronization, adapter errors and all decoded frames.
+Normal scheduling no longer matches each sent frame against every client's STOP
+catalog; ownership-local matching is used on the ordinary path.
+
+This is not a hard-real-time guarantee. Status publication, registration and
+maintenance still share the broker executor with data callbacks, and private
+reliable RX delivery can still experience middleware backpressure. Avoid dynamic
+registration/configuration during latency-critical motion. No OS scheduler
+priority, physical baud rate or CAN bitrate is changed by these optimizations.
 
 ## Interface
 

@@ -223,4 +223,41 @@ TEST(Frames, ExtendedFdAndLegacyLimitations)
   EXPECT_THROW(parser.feed(bytes.data(), bytes.size()), std::runtime_error);
   EXPECT_THROW(parser.feed(bytes.data(), 5000), std::runtime_error);
 }
+TEST(Router, StopsPrecedeOtherClientsNormalTraffic)
+{
+  can_bus::Router router(42);
+  auto a = client("a", 3);
+  auto b = client("b", 4);
+  const auto first = router.add(a, 0);
+  const auto second = router.add(b, 0);
+  can_bus::Frame normal; normal.id = 3;
+  router.enqueue(first, 42, 1, .1, 0, normal, .01);
+  router.enqueue(second, 42, 1, .1, 1, b.stops.front(), .01);
+  const auto frames = router.drain(.02);
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0].id, 4u);
+  EXPECT_EQ(frames[0].data[7], 0xfd);
+  EXPECT_EQ(frames[1].id, 3u);
+}
+TEST(Frames, SerialParserResynchronizesAndPreservesEveryBatchedFrame)
+{
+  std::vector<uint8_t> bytes(512, 0x7e);
+  for (unsigned i = 0; i < 200; ++i) {
+    std::array<uint8_t, 16> frame{};
+    frame[0] = 0xaa; frame[1] = 0x11; frame[2] = 8;
+    frame[3] = 3; frame[7] = static_cast<uint8_t>(i); frame[15] = 0x55;
+    bytes.insert(bytes.end(), frame.begin(), frame.end());
+    bytes.push_back(0x7e);
+  }
+  can_bus::SerialParser parser;
+  auto frames = parser.feed(bytes.data(), 1001);
+  const auto tail = parser.feed(bytes.data() + 1001, bytes.size() - 1001);
+  frames.insert(frames.end(), tail.begin(), tail.end());
+  ASSERT_EQ(frames.size(), 200u);
+  for (unsigned i = 0; i < frames.size(); ++i) {
+    EXPECT_EQ(frames[i].id, 3u);
+    EXPECT_EQ(frames[i].data[0], i);
+    EXPECT_GT(frames[i].received_steady, 0u);
+  }
+}
 }
