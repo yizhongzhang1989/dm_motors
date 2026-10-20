@@ -27,7 +27,7 @@ def compose(parameters, dashboards=False, can_port="8080", motor_port="8081", co
         context.launch_configurations["namespace"] = "robot"
         context.launch_configurations["control_rate"] = control_rate
         context.launch_configurations.update({
-            "dashboards": "true" if dashboards else "false", "dashboard_host": "127.0.0.1",
+            "dashboards": "true" if dashboards else "false", "dashboard_host": "0.0.0.0",
             "can_dashboard_port": can_port, "motor_dashboard_base_port": motor_port})
         return composition.compose(context)
 
@@ -78,9 +78,10 @@ def test_declared_dashboard_port_defaults():
         entity.name: perform_substitutions(context, entity.default_value)
         for entity in composition.generate_launch_description().entities
         if isinstance(entity, DeclareLaunchArgument)
-        and entity.name in ("can_dashboard_port", "motor_dashboard_base_port")
+        and entity.name in ("dashboard_host", "can_dashboard_port", "motor_dashboard_base_port")
     }
-    assert defaults == {"can_dashboard_port": "8080", "motor_dashboard_base_port": "8081"}
+    assert defaults == {"dashboard_host": "0.0.0.0", "can_dashboard_port": "8080",
+                        "motor_dashboard_base_port": "8081"}
 
 
 @pytest.mark.parametrize("can_port,motor_port,expected", [
@@ -96,6 +97,7 @@ def test_composed_dashboard_ports_are_exact_and_overridable(monkeypatch, can_por
     }, dashboards=True, can_port=can_port, motor_port=motor_port)
     dashboards = [node for node in nodes if node["package"] in ("can_bus_dashboard", "dm_motor_dashboard")]
     assert [node["parameters"][0]["port"] for node in dashboards] == expected
+    assert all(node["parameters"][0]["host"] == "0.0.0.0" for node in dashboards)
     assert [node["namespace"] for node in dashboards] == ["/robot/can/main", "/robot/motor_1", "/robot/motor_2"]
 
 
@@ -135,6 +137,7 @@ def test_standalone_dashboard_ports_match_composition(monkeypatch, package, moto
              else [entity for entity in description.entities if isinstance(entity, dict)])
     parameters = evaluate_parameters(context, normalize_parameters(nodes[0]["parameters"]))[0]
     assert parameters["port"] == expected
+    assert parameters["host"] == "0.0.0.0"
 
 
 @pytest.mark.parametrize("parameters, message", [

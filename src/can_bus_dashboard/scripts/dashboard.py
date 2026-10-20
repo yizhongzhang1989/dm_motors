@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import secrets
 import signal
+import socket
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -147,7 +148,7 @@ class Dashboard(Node):
     def __init__(self, **kwargs):
         super().__init__("can_bus_dashboard", **kwargs)
         self.bus = self.declare_parameter("bus_namespace", "/can/main").value.rstrip("/")
-        self.host = self.declare_parameter("host", "127.0.0.1").value
+        self.host = self.declare_parameter("host", "0.0.0.0").value
         self.port = self.declare_parameter("port", 8080).value
         if not self.bus.startswith("/") or "//" in self.bus:
             raise ValueError("bus_namespace must be an absolute ROS namespace")
@@ -471,11 +472,21 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(403, "Origin must match dashboard host")
         host = self.headers.get("Host", "")
         expected_port = self.server.server_address[1]
-        parsed_host = urlsplit("http://" + host)
+        local_address = self.connection.getsockname()[0]
+        machine_name = socket.gethostname()
+        short_name = machine_name.split(".", 1)[0]
+        allowed_hosts = {
+            name.lower().removesuffix(".") for name in (
+                self.server.dashboard.host, local_address, "localhost", "127.0.0.1", "::1",
+                self.server.server_name, machine_name, short_name, f"{short_name}.local",
+            )
+        }
         try:
-            if parsed_host.port != expected_port or parsed_host.hostname not in (
-                    self.server.dashboard.host, "localhost", "127.0.0.1", "::1"):
-                raise ApiError(403, "Host not allowed")
+            parsed_host = urlsplit("http://" + host)
+            hostname = parsed_host.hostname
+            if (parsed_host.port != expected_port or hostname is None
+                    or hostname.lower().removesuffix(".") not in allowed_hosts):
+                raise ApiError(403, f"Host not allowed: {host!r}")
         except ValueError as exc:
             raise ApiError(403, "Invalid Host") from exc
 

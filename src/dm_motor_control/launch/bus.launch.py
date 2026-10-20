@@ -157,7 +157,7 @@ def generate_launch_description():
         DeclareLaunchArgument("control_rate", default_value="",
                               description="Override all motor control rates (20..1000 Hz); empty uses config."),
         DeclareLaunchArgument("dashboards", default_value="false"),
-        DeclareLaunchArgument("dashboard_host", default_value="127.0.0.1"),
+        DeclareLaunchArgument("dashboard_host", default_value="0.0.0.0"),
         DeclareLaunchArgument("can_dashboard_port", default_value="8080"),
         DeclareLaunchArgument("motor_dashboard_base_port", default_value="8081"),
         OpaqueFunction(function=compose),

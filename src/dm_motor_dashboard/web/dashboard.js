@@ -5,6 +5,7 @@ const modeFields = {1: ["position", "velocity", "kp", "kd", "torque"],
   2: ["position", "velocity_limit"], 3: ["velocity"],
   4: ["position", "velocity_limit", "current_ratio"]};
 const modeNames = {1: "MIT", 2: "位置 + 速度上限", 3: "速度", 4: "位置 + 速度上限 + 电流比例"};
+const mitGainScales = {kp: 500, kd: 5};
 const activeFields = () => modeFields[data?.state?.mode || 1] || [];
 const phases = ["DISABLED", "ENABLING", "ENABLED", "STOPPING", "FAULT"];
 const $ = (id) => document.getElementById(id);
@@ -31,7 +32,6 @@ let connectionAbort = new AbortController();
 let initialConnectPending = true;
 let capabilitiesKey = "";
 let chartPaused = false;
-let pendingConfirmation = null;
 let positionFollowsCurrent = true;
 let positionPointer = null;
 let pendingTarget = null;
@@ -48,26 +48,46 @@ const taskStates = {idle: "无任务", submitting: "等待接受", running: "执
 const taskBusy = () => ["submitting", "running"].includes(data?.task?.state) || Boolean(data?.state?.task_active);
 const numeric = (value, digits = 4) => Number.isFinite(value) ? value.toFixed(digits) : "--";
 
+function updatePinnedLayout() {
+  const height = Math.ceil($("status-dock").getBoundingClientRect().height);
+  const plotHeight = $("plot-panel").getBoundingClientRect().height;
+  const footerHeight = document.querySelector("footer").getBoundingClientRect().height;
+  document.documentElement.style.setProperty("--status-dock-height", `${height}px`);
+  $("plot-panel").classList.toggle("sticky-fit",
+    plotHeight > 0 && height + plotHeight + footerHeight + 32 <= innerHeight);
+}
+
+function selectPanel(id, focus = false) {
+  for (const tab of document.querySelectorAll("[data-panel]")) {
+    const selected = tab.dataset.panel === id;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    $(tab.dataset.panel).hidden = !selected;
+    if (selected && focus) tab.focus();
+  }
+  if (id === "workspace") { updatePinnedLayout(); draw(); }
+}
+
+const tabs = [...document.querySelectorAll("[data-panel]")];
+for (const [index, tab] of tabs.entries()) {
+  tab.addEventListener("click", () => selectPanel(tab.dataset.panel));
+  tab.addEventListener("keydown", event => {
+    const offset = {ArrowRight: 1, ArrowLeft: -1}[event.key];
+    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+      : offset === undefined ? null : (index + offset + tabs.length) % tabs.length;
+    if (next === null) return;
+    event.preventDefault();
+    selectPanel(tabs[next].dataset.panel, true);
+  });
+}
+$("task-shortcut").addEventListener("click", () => selectPanel("task-panel", true));
+document.querySelector(".skip-link").addEventListener("click", () => selectPanel("workspace"));
+
 function saveFile(name, content, type) {
   const url = URL.createObjectURL(new Blob([content], {type}));
   const link = document.createElement("a");
   link.href = url; link.download = name; link.click();
   queueMicrotask(() => URL.revokeObjectURL(url));
-}
-
-function finishConfirmation(accepted) {
-  if (!pendingConfirmation) return;
-  const resolve = pendingConfirmation;
-  pendingConfirmation = null;
-  $("confirmation").close();
-  resolve(accepted);
-}
-
-function confirmAction(message) {
-  if (pendingConfirmation) throw new ApiError(409, "已有操作正在等待确认。");
-  $("confirmation-message").textContent = message;
-  $("confirmation").showModal();
-  return new Promise(resolve => { pendingConfirmation = resolve; });
 }
 
 class ApiError extends Error {
@@ -110,14 +130,17 @@ async function api(path, body) {
 function notice(message) {
   if ($("notice").textContent === message) return;
   $("notice").textContent = message;
+  const error = /error|failed|rejected|unknown|故障|失败|拒绝|未知|中断|无效|超出|未确认/i.test(message);
+  $("notice").classList.toggle("error", error);
   const entry = document.createElement("li");
   const timestamp = document.createElement("time");
   timestamp.dateTime = new Date().toISOString();
   timestamp.textContent = new Date().toLocaleTimeString();
   entry.append(timestamp, document.createTextNode(message));
-  if (/error|failed|rejected|unknown|故障|失败|拒绝|未知|中断/i.test(message)) entry.className = "error";
+  if (error) entry.className = "error";
   $("event-log").prepend(entry);
   while ($("event-log").children.length > 100) $("event-log").lastElementChild.remove();
+  $("event-count").textContent = String($("event-log").children.length);
 }
 
 function syncSlider(field) {
@@ -171,14 +194,14 @@ function canSendPosition() {
   return canEditPosition() && data.armed && data.state.phase === 2 && data.state.ready
     && value >= minimum && value <= maximum
     && $("live-targets").checked
-    && !positionLiveBlocked && !pendingConfirmation && Number.isSafeInteger(data.control_generation);
+    && !positionLiveBlocked && Number.isSafeInteger(data.control_generation);
 }
 
 function canSendTarget() {
   return connected && session && data?.has_control && data.connected && data.armed
     && data.state?.phase === 2 && data.state.ready && data.state.feedback_fresh
     && data.state.absolute_position_valid !== false && !busy && !taskBusy()
-    && $("live-targets").checked && !positionLiveBlocked && !pendingConfirmation
+    && $("live-targets").checked && !positionLiveBlocked
     && Number($("mode-select").value) === data.state.mode
     && Number.isSafeInteger(data.control_generation);
 }
@@ -211,11 +234,13 @@ function renderPositionScroll() {
     ? "目标草稿超出 MIT 位置编码量程，滚轮停在边界，未发送；多圈位置控制请在失能后显式选择位置速度或力位模式。"
     : "目标草稿超出已配置行程限位或 float32 表示范围，滚轮停在边界，未发送。";
   else if (!$("live-targets").checked) message = "实时手动目标已关闭：只编辑草稿，需显式应用或提交任务。";
-  else if (positionLiveBlocked && data.armed) message = "实时滚动已暂停；修正参数并显式应用目标后恢复。";
+  else if (positionLiveBlocked && data.armed) message = "停止或连接状态同步中，实时目标已暂停；等待驱动状态确认，不回放旧目标。";
   else if (data.armed && !Number.isSafeInteger(data.control_generation)) message = "等待控制状态同步，暂不实时发送位置。";
   else if (canSendPosition()) {
     message = "参数变化立即提交 · 下一控制周期采用最新目标 · 松手保持，不周期重发。";
-    if (data.state.mode === 1 && data.target.kp <= 0) message += " 当前已应用 Kp=0，不产生位置控制。";
+    if (data.state.mode === 1 && mitGainEncoding("kp", data.target.kp)?.code === 0) {
+      message += " 当前服务目标的 Kp 编码为 0，不产生位置控制。";
+    }
     if ([2, 4].includes(data.state.mode) && data.target.velocity_limit <= 0) message += " 当前已应用速度上限为 0。";
   }
   if (enabled && value === minimum) message += " 已到下限，继续减小不再旋转；可反向调节。";
@@ -231,13 +256,12 @@ async function flushPositionTarget() {
   const epoch = positionUpdateEpoch, version = connectionVersion;
   positionSending = true;
   try {
-    await api("target", target);
+    const result = await api("target", target);
+    if (epoch === positionUpdateEpoch && version === connectionVersion) notice(result.message);
   } catch (error) {
     if (epoch === positionUpdateEpoch && version === connectionVersion) {
-      cancelPositionUpdates();
-      positionLiveBlocked = true;
       if (!(error instanceof ApiError)) connectionLost(error);
-      else notice(`位置更新被拒绝：${error.message}；已暂停实时滚动，请修正后显式应用目标。`);
+      else notice(`目标更新被拒绝：${error.message}；保持最后接受的目标，下一次有效修改会直接提交。`);
     }
   } finally {
     positionSending = false;
@@ -260,20 +284,51 @@ function queuePositionTarget() {
   void flushPositionTarget();
 }
 
+function mitGainEncoding(field, value) {
+  const maximum = mitGainScales[field];
+  if (!Number.isFinite(maximum) || !Number.isFinite(value) || value < 0 || value > maximum) return null;
+  const code = Math.trunc(value / maximum * 4095);
+  return {code, value: code * maximum / 4095};
+}
+
+function renderGainHints() {
+  for (const field of Object.keys(mitGainScales)) {
+    const hint = $(`encoding-${field}`), input = $(`target-${field}`);
+    hint.hidden = data?.state?.mode !== 1;
+    if (hint.hidden) continue;
+    const value = Number(input.value);
+    const encoded = input.value.trim() && input.checkValidity() ? mitGainEncoding(field, value) : null;
+    const lost = Boolean(encoded && value > 0 && encoded.code === 0);
+    hint.classList.toggle("warning", lost);
+    hint.title = encoded ? `MIT 固定尺度 0～${mitGainScales[field]}，12 位；预计值 ${encoded.value}，不是设备增益回读。`
+      : "输入无效，无法预测 MIT 编码。";
+    const text = !encoded ? "MIT 草稿编码：--（待输入有效数值）"
+      : `MIT 草稿预计 ≈ ${numeric(encoded.value, 6)}（码 ${encoded.code}/4095）`
+        + (lost ? `；正数已量化为 0，${field === "kp" ? "位置刚度" : "速度阻尼"}不起作用。` : "");
+    if (hint.textContent !== text) hint.textContent = text;
+  }
+}
+
 function renderDraft() {
   const known = connected && data?.connected && data?.state?.feedback_fresh && data?.target;
   let changed = 0;
-  for (const field of activeFields()) {
+  for (const field of fields) {
+    const active = activeFields().includes(field);
     const input = $(`target-${field}`);
-    const differs = Boolean(known) && (!input.value.trim() || Number(input.value) !== data.target[field]);
+    const differs = active && Boolean(known) && (!input.value.trim() || Number(input.value) !== data.target[field]);
     if (differs) changed += 1;
-    $(`applied-${field}`).textContent = known ? `服务目标：${data.target[field]}` : "服务目标：--（未连接 / 过期）";
+    const encoding = active && known && data.state.mode === 1 ? mitGainEncoding(field, data.target[field]) : null;
+    $(`applied-${field}`).textContent = !active ? "当前模式不使用此参数"
+      : known ? `服务目标：${data.target[field]}`
+        + (encoding ? ` · MIT 预计 ≈ ${numeric(encoding.value, 6)}（码 ${encoding.code}）` : "")
+      : "服务目标：--（未连接 / 过期）";
     $(`applied-${field}`).className = `applied${differs ? " edited" : ""}`;
   }
   $("draft-status").className = `subtle${changed ? " edited" : ""}`;
   $("draft-status").textContent = !known ? "等待新鲜状态；服务目标不是电机实测值。"
     : `${changed ? `${changed} 项草稿与服务目标不同，尚未应用。` : "草稿与服务目标一致。"}`
       + (data.armed && data.state?.phase === 2 ? " 服务目标不是实测反馈。" : " 当前未确认使能，不能发送目标。");
+  renderGainHints();
 }
 
 function resetInputs(followPosition = true) {
@@ -293,7 +348,6 @@ function resetInputs(followPosition = true) {
 
 function relinquish() {
   positionLiveBlocked = true;
-  finishConfirmation(false);
   if (feedbackStream) { feedbackStream.close(); feedbackStream = null; }
   $("plot-stats").textContent = "推流已断开 · 绘图暂停";
   if (session) {
@@ -324,6 +378,9 @@ function render() {
   const pendingMode = Boolean(state && $("mode-select").value
     && Number($("mode-select").value) !== state.mode);
   const owns = connected && Boolean(session) && data?.has_control;
+  const fresh = connected && data?.connected && state?.feedback_fresh;
+  $("status-panel").classList.toggle("stale", !fresh);
+  document.querySelector(".position-strip").classList.toggle("stale", !fresh);
   $("connection").textContent = !connected ? "未连接" : owns ? "已连接 · 拥有控制权" : "已连接 · 只读";
   $("connection").className = `badge${connected ? " ok" : ""}`;
   $("connect").disabled = connected || busy;
@@ -331,42 +388,58 @@ function render() {
   $("claim").disabled = !connected || owns || busy;
   $("enable").disabled = !owns || busy || !data.connected || !state?.feedback_fresh
     || !state.ready || state.absolute_position_valid === false
-    || !state.activity_available || state.phase !== 0;
-  $("apply").disabled = !owns || busy || !data.connected || !data.armed || state?.phase !== 2;
+    || state.phase !== 0;
+  $("apply").disabled = !owns || busy || !fresh || !data.armed || state?.phase !== 2
+    || !state.ready || state.absolute_position_valid === false;
   if (pendingMode) $("apply").disabled = true;
   if (taskBusy()) $("apply").disabled = true;
   $("zero").disabled = $("apply").disabled;
-  $("stop").disabled = !connected;
-  $("quick-stop").disabled = !connected;
+  $("stop").disabled = false;
+  $("quick-stop").disabled = false;
   $("reset").disabled = !owns || busy || !data.connected || !state?.feedback_fresh
     || state.absolute_position_valid === false || state.phase !== 4 || state.status !== 0;
-  const editable = owns && !busy && data.connected && state?.feedback_fresh
-    && state.absolute_position_valid !== false;
+  const editable = owns && !busy && fresh && state.absolute_position_valid !== false && !taskBusy();
   $("fill-position").disabled = !editable || pendingMode || !activeFields().includes("position");
   $("restore-target").disabled = !editable || pendingMode;
   $("live-targets").disabled = !owns || busy || taskBusy();
-  $("control-rate").disabled = !owns || busy || ratePending || !state?.ready || taskBusy();
+  $("control-rate").disabled = !owns || busy || ratePending || !fresh || !state?.ready || taskBusy();
+  $("control-guidance").textContent = !connected ? "请在右上角“连接管理”中连接；不会自动使能或恢复旧目标。"
+    : !fresh ? "反馈已过期，控制已禁用；请检查连接。"
+    : !owns ? "当前为只读监控，请获取控制权后操作。"
+    : busy ? "操作处理中；STOP / Esc 始终可用。"
+    : taskBusy() ? "任务正在执行，手动编辑已锁定；可查看任务或 STOP。"
+    : state.phase === 4 ? "驱动故障：先检查完整监控，再清除设备故障 / 复位主机故障。"
+    : !state.ready || state.absolute_position_valid === false ? "驱动或连续位置未就绪，禁止使能。"
+    : state.phase === 0 ? "已失能 · 可编辑草稿；点击使能从中性目标开始。"
+    : state.phase === 2 ? ($("live-targets").checked
+      ? "已使能 · 有效参数修改立即提交，STOP / Esc 请求失能。"
+      : "草稿模式 · 修改不会发送，需点击应用；当前输出继续。")
+    : "等待驱动确认状态；STOP / Esc 可随时请求失能。";
   if (document.activeElement !== $("control-rate") && !ratePending && Number.isFinite(state?.control_rate)) {
     $("control-rate").value = String(state.control_rate);
   }
   $("control-rate-status").textContent = `设定 ${numeric(state?.control_rate, 1)} Hz · `
     + `实测 ${numeric(state?.actual_control_rate, 1)} Hz（约 1 s 窗口） · 周期 ${numeric(state?.period_ms, 3)} ms`;
+  $("target-form").dataset.mode = String(state?.mode || 1);
   for (const field of fields) {
     const active = activeFields().includes(field);
+    const group = $(`target-${field}`).closest(".fields > div");
+    group.style.order = active ? "0" : "1";
+    group.classList.toggle("inactive-field", !active);
     $(`target-${field}`).parentElement.hidden = false;
     $(`target-${field}`).disabled = !editable || !active || pendingMode;
     $(`target-${field}`).title = active ? "" : "当前驱动模式不使用此参数。";
     if (field !== "position") $(`slider-${field}`).disabled = !editable || !active || pendingMode;
   }
   const disabledReady = editable && state?.phase === 0 && state.status === 0 && state.ready
-    && state.maintenance_available && !state.task_active;
+    && !state.task_active;
   for (const id of ["mode-select", "device-zero", "software-zero", "save-parameters"]) {
     $(id).disabled = !disabledReady;
   }
   $("clear-fault").disabled = !(disabledReady || (editable && state?.ready && !state.task_active
     && state.phase === 4 && state.status !== 1));
   $("parameter-select").disabled = !connected || !data?.capabilities?.ready;
-  $("read-parameter").disabled = $("parameter-select").disabled || !state?.maintenance_available || busy;
+  $("read-parameter").disabled = $("parameter-select").disabled || busy;
   $("read-all-parameters").disabled = $("read-parameter").disabled;
   $("export-state").disabled = !state;
   $("export-csv").disabled = !historyCount;
@@ -385,13 +458,16 @@ function render() {
   $("current-mode").textContent = `模式 ${state.mode || 1} · ${modeNames[state.mode || 1] || "未知"}`;
   $("driver-targets").textContent = JSON.stringify(state, null, 2);
   $("motor-id").textContent = `#${data.motor_id}`;
+  document.title = `电机 #${data.motor_id} · ${state.simulated ? "仿真" : "硬件"} · 达妙工作台`;
   updateReadings(connected && latestSample ? latestSample : state);
   $("temperature").textContent = `${state.mos_temperature} / ${state.rotor_temperature}`;
+  $("temperature").title = `MOS ${state.mos_temperature} °C / 转子 ${state.rotor_temperature} °C`;
   renderMonitoring(state, owns);
   const stale = !connected || !data.connected || !state.feedback_fresh;
-  $("phase").textContent = `${state.simulated ? "SIMULATION" : "HARDWARE"} · ${stale ? "状态过期 / 未确认" : phases[state.phase] || "UNKNOWN"}`;
+  const fullPhase = `${state.simulated ? "SIMULATION" : "HARDWARE"} · ${stale ? "状态过期 / 未确认" : phases[state.phase] || "UNKNOWN"}`;
+  $("phase").textContent = `${state.simulated ? "SIM" : "HW"} · ${stale ? "过期" : phases[state.phase] || "UNKNOWN"}`;
   $("phase").className = `badge${stale || state.phase === 4 ? " error" : state.phase === 2 ? " ok" : ""}`;
-  $("phase").title = `设备状态: ${state.status_text ?? state.status}; 主机故障: ${Boolean(state.host_fault)}; `
+  $("phase").title = `${fullPhase} · 设备状态: ${state.status_text ?? state.status}; 主机故障: ${Boolean(state.host_fault)}; `
     + `电机故障: ${Boolean(state.device_fault)}; 主机额外物理保护: ${Boolean(state.host_protection_enabled)}`;
   $("telemetry").textContent = `${stale ? "上次反馈 · " : ""}CAN ${state.motor_id} / MST ${state.master_id} · 状态码 0x${state.status.toString(16).toUpperCase()} · `
     + (state.absolute_position_valid === undefined ? "" :
@@ -516,15 +592,19 @@ function renderTask(owns) {
   for (const option of $("task-kind").options) option.disabled = !supported(option.value);
   for (const label of document.querySelectorAll("[data-task-kinds]")) {
     label.hidden = !label.dataset.taskKinds.split(" ").includes(kind);
+    for (const input of label.querySelectorAll("input, select, textarea")) input.disabled = label.hidden;
   }
   $("start-task").disabled = !owns || busy || !data?.armed || state?.phase !== 2
     || !state.feedback_fresh || !state.ready || taskBusy() || !supported(kind);
-  $("cancel-task").disabled = !connected || !taskBusy();
+  $("cancel-task").disabled = !taskBusy();
+  $("prepare-task").disabled = !owns || busy || taskBusy() || !state?.feedback_fresh;
   const task = data?.task;
   $("task-state").textContent = state?.task_active && !["submitting", "running"].includes(task?.state)
     ? "驱动任务活动（非本页面）" : taskStates[task?.state] ?? "无任务";
   $("task-state").className = `badge${task?.state === "succeeded" ? " ok" : ["failed", "unknown", "rejected"].includes(task?.state) ? " error" : ""}`;
-  const progress = task?.feedback?.progress;
+  const progress = task?.state === "succeeded" ? 1 : task?.feedback?.progress;
+  $("task-shortcut").hidden = !taskBusy();
+  $("task-shortcut").textContent = `查看运行任务 · ${numeric(progress * 100, 0)}% / 取消`;
   $("task-progress").value = Number.isFinite(progress) ? Math.min(1, Math.max(0, progress)) : 0;
   $("task-feedback").textContent = task ? `${task.message} `
     + (task.feedback ? `进度 ${numeric(progress * 100, 1)}% · ${numeric(task.feedback.elapsed, 2)} s · 位置误差 ${numeric(task.feedback.position_error, 6)} rad` : "")
@@ -572,7 +652,10 @@ function renderCapabilities() {
 }
 
 async function confirmOperation(id, output = "operation-status") {
-  if (!id) return null;
+  if (!id) {
+    $(output).textContent = "已提交 · 无异步操作 ID；请以新鲜驱动反馈确认结果。";
+    return null;
+  }
   const version = connectionVersion;
   for (let attempt = 0; attempt < 50; attempt += 1) {
     if (!connected || version !== connectionVersion) throw new ApiError(409, "连接已改变，操作结果未确认。");
@@ -588,7 +671,10 @@ async function confirmOperation(id, output = "operation-status") {
 function updateReadings(sample) {
   for (const field of ["position", "velocity", "torque"]) {
     const value = sample[field].toFixed(4);
-    if ($(field).textContent !== value) $(field).textContent = value;
+    if ($(field).textContent !== value) {
+      $(field).textContent = value;
+      $(field).title = value;
+    }
   }
 }
 
@@ -644,6 +730,7 @@ function startStream() {
 function draw(frameTime = performance.now()) {
   const canvas = $("chart");
   const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
   const ratio = devicePixelRatio || 1;
   const width = Math.round(rect.width * ratio);
   const height = Math.round(rect.height * ratio);
@@ -724,12 +811,12 @@ function draw(frameTime = performance.now()) {
 
 function animate(time) {
   if (connected && latestSample && feedbackStream && !document.hidden) {
-    if (!chartPaused) { draw(time); renderedFrames += 1; }
+    if (!chartPaused && !$("workspace").hidden) { draw(time); renderedFrames += 1; }
     updateReadings(latestSample);
     const elapsed = time - statsStarted;
     if (elapsed >= 1000) {
       $("plot-stats").textContent = `推流 ${(receivedSamples * 1000 / elapsed).toFixed(1)} Hz · `
-        + `${chartPaused ? "绘图已暂停，采集继续" : `绘图 ${(renderedFrames * 1000 / elapsed).toFixed(1)} / 50 FPS`} · `
+        + `${chartPaused || $("workspace").hidden ? "绘图已暂停，采集继续" : `绘图 ${(renderedFrames * 1000 / elapsed).toFixed(1)} / 50 FPS`} · `
         + `推流缺失 ${skippedSamples} 点 · ROS 缺失 ${latestSample.source_skipped_samples || 0} 点 · 缓存 ${historyCount} 帧`;
       $("export-csv").disabled = !historyCount;
       receivedSamples = 0;
@@ -766,7 +853,6 @@ async function poll() {
     }
     if (previousMode !== undefined && previousMode !== data.state?.mode) $("mode-select").value = String(data.state.mode);
     if (session && !data.has_control) {
-      finishConfirmation(false);
       session = "";
       notice("控制会话已结束，目标已清空。需重新获取控制权并显式使能。");
     }
@@ -860,7 +946,6 @@ $("enable").addEventListener("click", () => action(async () => {
 }));
 $("stop").addEventListener("click", async () => {
   positionLiveBlocked = true;
-  finishConfirmation(false);
   resetInputs();
   try { notice((await api("stop", {})).message); }
   catch (error) { notice(`失能未确认：${error.message}。必要时使用硬件断电。`); }
@@ -870,13 +955,20 @@ $("reset").addEventListener("click", () => action(async () => {
   notice(result.message);
   await confirmOperation(result.operation_id);
 }));
-for (const [id, operation] of [["clear-fault", "clear"],
-  ["device-zero", "device_zero"], ["software-zero", "software_zero"], ["save-parameters", "save"]]) {
+for (const [id, operation, output = "operation-status"] of [["clear-fault", "clear"],
+  ["device-zero", "device_zero", "zero-operation-status"],
+  ["software-zero", "software_zero", "zero-operation-status"], ["save-parameters", "save"]]) {
   $(id).addEventListener("click", () => action(async () => {
-    if (!await confirmAction(`确认${$(id).textContent}？电机必须保持失能，不会自动使能。`)) return;
-    const result = await api("operation", {operation});
-    notice(result.message);
-    await confirmOperation(result.operation_id);
+    $(output).textContent = `${$(id).textContent}：提交中…`;
+    try {
+      const result = await api("operation", {operation});
+      notice(result.message);
+      await confirmOperation(result.operation_id, output);
+      if (output === "zero-operation-status") await poll();
+    } catch (error) {
+      $(output).textContent = `${$(id).textContent}失败：${error.message}`;
+      throw error;
+    }
   }));
 }
 $("mode-select").addEventListener("change", () => {
@@ -948,7 +1040,6 @@ $("write-parameter").addEventListener("click", () => action(async () => {
     if (side === "minimum" ? value < boundary || (!inclusive && value === boundary)
       : value > boundary || (!inclusive && value === boundary)) throw new ApiError(400, "参数超出驱动公布的范围。");
   }
-  if (!await confirmAction(`确认将 ${descriptor.name} 写为 ${value} ${descriptor.unit}？\n只修改 RAM，不自动保存 Flash；提交后需等待独立回读确认。`)) return;
   await displayParameter(descriptor, await api("register-write", {address: descriptor.address, value}));
   notice("写入及独立回读已确认；未保存 Flash，电机保持失能。");
 }));
@@ -968,6 +1059,12 @@ function draftTarget() {
 }
 
 $("task-kind").addEventListener("change", () => renderTask(connected && Boolean(session) && data?.has_control));
+$("prepare-task").addEventListener("click", () => {
+  $("live-targets").checked = false;
+  $("live-targets").dispatchEvent(new Event("change"));
+  selectPanel("workspace");
+  $(`target-${activeFields()[0]}`).focus({preventScroll: true});
+});
 $("task-form").addEventListener("submit", event => {
   event.preventDefault();
   action(async () => {
@@ -981,6 +1078,12 @@ $("task-form").addEventListener("submit", event => {
       request[field] = applicable ? Number(input.value) : 0;
       if (!Number.isFinite(request[field])) throw new ApiError(400, `任务 ${field} 必须是有限数值。`);
     }
+    if (request.settling_time >= request.duration) {
+      throw new ApiError(400, `稳定时间必须小于总时长（当前 ${request.settling_time} / ${request.duration} s），未提交任务。`);
+    }
+    if (request.ramp_time > request.duration / 2) {
+      throw new ApiError(400, `斜坡时间不能超过总时长的一半（最多 ${request.duration / 2} s），未提交任务。`);
+    }
     if (kind === "trajectory") {
       const lines = $("task-points").value.trim().split(/\r?\n/);
       if (lines.length < 2 || lines.length > 256) throw new ApiError(400, "轨迹需要 2～256 个点。");
@@ -990,7 +1093,6 @@ $("task-form").addEventListener("submit", event => {
         request.times.push(Number(parts[0])); request.positions.push(Number(parts[1]));
       }
     }
-    if (!await confirmAction(`确认执行 ${kind.toUpperCase()}，时长 ${request.duration} s？\n使用当前目标草稿；结束后失能，不恢复手动目标。`)) return;
     notice((await api("task", request)).message);
     data.task = {state: "submitting", message: "等待驱动接受任务。"};
   });
@@ -998,7 +1100,7 @@ $("task-form").addEventListener("submit", event => {
 $("cancel-task").addEventListener("click", () => $("stop").click());
 $("quick-stop").addEventListener("click", () => $("stop").click());
 document.addEventListener("keydown", event => {
-  if (event.key === "Escape" && connected && !event.repeat) { event.preventDefault(); $("stop").click(); }
+  if (event.key === "Escape" && !event.repeat) { event.preventDefault(); $("stop").click(); }
 });
 $("pause-chart").addEventListener("click", () => {
   chartPaused = !chartPaused;
@@ -1032,13 +1134,9 @@ $("export-csv").addEventListener("click", () => {
   }
   saveFile("motor-feedback.csv", lines.join("\n"), "text/csv;charset=utf-8");
 });
-$("clear-events").addEventListener("click", () => $("event-log").replaceChildren());
-$("confirmation-accept").addEventListener("click", () => finishConfirmation(true));
-$("confirmation-cancel").addEventListener("click", () => finishConfirmation(false));
-$("confirmation-stop").addEventListener("click", () => $("stop").click());
-$("confirmation").addEventListener("cancel", event => {
-  event.preventDefault();
-  finishConfirmation(false);
+$("clear-events").addEventListener("click", () => {
+  $("event-log").replaceChildren();
+  $("event-count").textContent = "0";
 });
 for (const field of fields) {
   $(`target-${field}`).addEventListener("input", () => {
@@ -1215,7 +1313,6 @@ $("target-form").addEventListener("submit", (event) => {
   });
 });
 $("zero").addEventListener("click", () => action(async () => {
-  if (!await confirmAction("确认应用零目标？\n位置模式可能向原零点运动；MIT 会清零 Kp/Kd/前馈力矩，不是锁轴或抱闸。")) return;
   resetInputs(false);
   const epoch = positionUpdateEpoch;
   notice((await api("target", Object.fromEntries(activeFields().map((field) => [field, 0])))).message
@@ -1236,9 +1333,14 @@ document.addEventListener("visibilitychange", () => {
   else if (!document.hidden) initialConnect();
 });
 window.addEventListener("pagehide", relinquish);
-window.addEventListener("resize", () => draw());
+window.addEventListener("resize", () => { updatePinnedLayout(); draw(); });
 $("endpoint").textContent = `服务地址：${location.origin} · 浏览器心跳 150 ms · 无登录鉴权，仅用于可信隔离网络`;
 render();
+const pinnedLayoutObserver = new ResizeObserver(updatePinnedLayout);
+for (const element of [$("status-dock"), $("plot-panel"), document.querySelector("footer")]) {
+  pinnedLayoutObserver.observe(element);
+}
+updatePinnedLayout();
 draw();
 setInterval(() => animate(performance.now()), 20);
 initialConnect();

@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 os.environ["ROS_DOMAIN_ID"] = str(100 + os.getpid() % 100)
 from ament_index_python.packages import get_package_prefix
@@ -47,11 +47,12 @@ class Integration(unittest.TestCase):
         cls.wire_tx = cls.probe.create_subscription(Frame, cls.bus + "/wire_tx", loopback, 64)
         cls.register = cls.probe.create_client(RegisterClient, cls.bus + "/register_client")
         with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
+            sock.bind(("0.0.0.0", 0))
             port = sock.getsockname()[1]
         cls.node = dashboard.Dashboard(parameter_overrides=[
-            Parameter("bus_namespace", value=cls.bus), Parameter("port", value=port)])
-        cls.server = dashboard.BoundedServer(("127.0.0.1", port), cls.node,
+            Parameter("bus_namespace", value=cls.bus), Parameter("host", value="0.0.0.0"),
+            Parameter("port", value=port)])
+        cls.server = dashboard.BoundedServer(("0.0.0.0", port), cls.node,
                                               Path(__file__).parents[1] / "web")
         cls.executor = SingleThreadedExecutor()
         cls.executor.add_node(cls.node)
@@ -60,7 +61,8 @@ class Integration(unittest.TestCase):
         cls.http_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.spin_thread.start()
         cls.http_thread.start()
-        cls.base = f"http://127.0.0.1:{port}"
+        cls.base = f"http://127.0.0.2:{port}"
+        cls.opener = build_opener(ProxyHandler({}))
         cls.addClassCleanup(cls.cleanup)
         cls.wait(lambda: cls.node.connected() and cls.node.capabilities_known
                  and cls.node.status["endpoint_ready"]
@@ -100,11 +102,12 @@ class Integration(unittest.TestCase):
         raise AssertionError("condition timed out")
 
     def api(self, path, body=None, status=200, headers=None):
-        headers = {"Content-Type": "application/json", **(headers or {})}
+        headers = {"Content-Type": "application/json", "Origin": self.base,
+                   "Sec-Fetch-Site": "same-origin", **(headers or {})}
         request = Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
                           headers=headers)
         try:
-            response = urlopen(request, timeout=2)
+            response = self.opener.open(request, timeout=2)
         except HTTPError as exc:
             response = exc
         with response:
@@ -116,6 +119,19 @@ class Integration(unittest.TestCase):
                 "readonly": False, "route": {"can_id": can_id, "channel": 0, "extended": False},
                 "stop_frames": [{"can_id": can_id, "channel": 0, "extended": False, "data": [0]*8}],
                 **changes}
+
+    def test_00_wildcard_accepts_actual_destination_address_and_assets(self):
+        self.assertEqual(self.server.server_address[0], "0.0.0.0")
+        self.assertTrue(self.api("/api/state")["connected"])
+        for path, content_type in (
+                ("/", "text/html"), ("/dashboard.js", "text/javascript"), ("/dashboard.css", "text/css")):
+            with self.opener.open(self.base + path, timeout=2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(content_type, response.headers["Content-Type"])
+                self.assertTrue(response.read())
+        loopback = self.base.replace("127.0.0.2", "127.0.0.1")
+        with self.opener.open(loopback + "/api/state", timeout=2) as response:
+            self.assertTrue(json.load(response)["connected"])
 
     def test_01_monitor_validation_and_conflict(self):
         state = self.api("/api/state")
@@ -179,6 +195,49 @@ class Integration(unittest.TestCase):
         self.wait(lambda: self.node.session is None, 2)
         self.api("/api/heartbeat", {"session": session}, 409)
         time.sleep(0.35)
+
+    def test_04_wildcard_still_rejects_forged_hosts_and_cross_origin_requests(self):
+        port = self.server.server_address[1]
+        for host in (f"untrusted.invalid:{port}", f"127.0.0.3:{port}", f"127.0.0.2:{port + 1}"):
+            self.api("/api/state", status=403, headers={"Host": host, "Origin": f"http://{host}"})
+            self.api("/api/heartbeat", {"session": "invalid"}, 403,
+                     {"Host": host, "Origin": f"http://{host}"})
+        self.api("/api/state", status=403, headers={"Host": "[invalid", "Origin": ""})
+        self.api("/api/heartbeat", {"session": "invalid"}, 403, {"Origin": "http://untrusted.invalid"})
+        self.api("/api/heartbeat", {"session": "invalid"}, 403, {"Sec-Fetch-Site": "cross-site"})
+
+    def test_05_accepts_machine_hostnames_without_trusting_other_domains(self):
+        port = self.server.server_address[1]
+        machine_name = socket.gethostname()
+        names = (
+            machine_name, machine_name.upper(), self.server.server_name,
+            machine_name.split(".", 1)[0], f"{machine_name.split('.')[0]}.local", f"{machine_name}.",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                host = f"{name}:{port}"
+                headers = {"Host": host, "Origin": f"http://{host}"}
+                self.assertTrue(self.api("/api/state", headers=headers)["connected"])
+                with self.opener.open(Request(self.base + "/", headers=headers), timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn(b"dashboard.js", response.read())
+                result = self.api("/api/heartbeat", {"session": "invalid"}, 409, headers)
+                self.assertIn("No live debug session", result["error"])
+                self.api("/api/heartbeat", {"session": "invalid"}, 403,
+                         {"Host": host, "Origin": "http://untrusted.invalid"})
+        host = f"{machine_name}:{port}"
+        headers = {"Host": host, "Origin": f"http://{host}"}
+        session = self.api("/api/session", self.claim(readonly=True, stop_frames=[]),
+                           headers=headers)["session"]
+        try:
+            self.api("/api/heartbeat", {"session": session}, headers=headers)
+        finally:
+            self.api("/api/release", {"session": session}, headers=headers)
+
+    def test_06_rejected_host_is_identified(self):
+        host = f"untrusted.invalid:{self.server.server_address[1]}"
+        result = self.api("/api/state", status=403, headers={"Host": host, "Origin": f"http://{host}"})
+        self.assertIn(host, result["error"])
 
 
 if __name__ == "__main__":

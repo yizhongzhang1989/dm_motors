@@ -39,7 +39,7 @@ def test_default_configuration_enables_all_dashboards_and_simulation():
         "config": str(Path(get_package_share_directory("dm_motor_control")) / "config/sim_bus.yaml"),
         "namespace": "",
         "control_rate": "",
-        "dashboard_host": "127.0.0.1",
+        "dashboard_host": "0.0.0.0",
         "can_dashboard_port": "8080",
         "motor_dashboard_base_port": "8081",
         "dashboards": "true",
@@ -50,9 +50,11 @@ def test_default_configuration_enables_all_dashboards_and_simulation():
     ("sim_bus.yaml", 7, "sim"),
     ("dual_serial.yaml", 6, "serial"),
 ])
-def test_included_launch_builds_exact_device_and_dashboard_graph(monkeypatch, filename, node_count, backend):
+@pytest.mark.parametrize("dashboard_host", ["0.0.0.0", "127.0.0.1", "10.20.30.40"])
+def test_included_launch_builds_exact_device_and_dashboard_graph(
+        monkeypatch, filename, node_count, backend, dashboard_host):
     config = str(Path(get_package_share_directory("dm_motor_control")) / "config" / filename)
-    _, include, forwarded = configured_launch(config=config, namespace="bench")
+    _, include, forwarded = configured_launch(config=config, namespace="bench", dashboard_host=dashboard_host)
     context = LaunchContext()
     context.launch_configurations.update(forwarded)
     monkeypatch.setattr(launch_ros.actions, "Node", lambda **kwargs: kwargs)
@@ -70,18 +72,18 @@ def test_included_launch_builds_exact_device_and_dashboard_graph(monkeypatch, fi
     assert [node["parameters"][0]["motor_id"] for node in motors] == [1, 2]
     dashboards = [node for node in nodes if node["package"] in ("can_bus_dashboard", "dm_motor_dashboard")]
     assert [node["parameters"][0]["port"] for node in dashboards] == [8080, 8081, 8082]
-    assert all(node["parameters"][0]["host"] == "127.0.0.1" for node in dashboards)
+    assert all(node["parameters"][0]["host"] == dashboard_host for node in dashboards)
     assert sum(node["executable"] == "can_motor_simulator" for node in nodes) == (backend == "sim")
 
 
 def test_configuration_namespace_and_port_overrides_are_forwarded():
     _, _, forwarded = configured_launch(
-        config="/tmp/custom-motors.yaml", namespace="robot", dashboard_host="0.0.0.0",
+        config="/tmp/custom-motors.yaml", namespace="robot", dashboard_host="10.20.30.40",
         can_dashboard_port="9080", motor_dashboard_base_port="9081", control_rate="100")
     assert forwarded == {
         "config": "/tmp/custom-motors.yaml", "namespace": "robot",
         "control_rate": "100",
-        "dashboard_host": "0.0.0.0", "can_dashboard_port": "9080",
+        "dashboard_host": "10.20.30.40", "can_dashboard_port": "9080",
         "motor_dashboard_base_port": "9081", "dashboards": "true",
     }
 
@@ -128,6 +130,8 @@ def test_hardware_entry_selects_serial_and_never_adds_simulator(monkeypatch):
     nodes = compose.execute(context)
     assert len(nodes) == 6
     assert next(node for node in nodes if node["package"] == "can_bus")["parameters"][0]["backend"] == "serial"
+    dashboards = [node for node in nodes if node["package"] in ("can_bus_dashboard", "dm_motor_dashboard")]
+    assert len(dashboards) == 3 and all(node["parameters"][0]["host"] == "0.0.0.0" for node in dashboards)
     assert not any(node["executable"] == "can_motor_simulator" for node in nodes)
     motors = [node["parameters"][0] for node in nodes if node["executable"] == "motor_node"]
     assert len(motors) == 2

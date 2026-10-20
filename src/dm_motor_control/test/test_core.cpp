@@ -96,6 +96,30 @@ TEST(Protocol, GoldenMitBytesAndRoundTrip)
   EXPECT_NEAR(input.kd, output.kd, 5.0 / 4095);
   EXPECT_NEAR(input.t, output.t, 20.0 / 4095);
 }
+TEST(Protocol, SmallPositiveMitKpQuantizesToZero)
+{
+  const Command input{0, 0, 0.01, 0.2, 0};
+  const Mapping mapping{12.5, 50, 10};
+  const std::array<uint8_t, 8> observed{0x7f, 0xff, 0x7f, 0xf0, 0x00, 0x0a, 0x37, 0xff};
+  for (uint8_t id : {1, 2}) {
+    const auto frame = mit_frame(id, input, mapping);
+    EXPECT_EQ(frame.data, observed);
+    const auto decoded = decode_mit(frame, mapping);
+    EXPECT_DOUBLE_EQ(decoded.kp, 0);
+    EXPECT_DOUBLE_EQ(decoded.kd, 163.0 * 5 / 4095);
+  }
+  for (double gain : {0.0, 0.01, 0.1, 0.1221}) {
+    Command command;
+    command.kp = gain;
+    EXPECT_DOUBLE_EQ(decode_mit(mit_frame(1, command, mapping), mapping).kp, 0);
+  }
+  Command command;
+  command.kp = 0.13;
+  command.kd = 0.0001;
+  const auto decoded = decode_mit(mit_frame(1, command, mapping), mapping);
+  EXPECT_DOUBLE_EQ(decoded.kp, 500.0 / 4095);
+  EXPECT_DOUBLE_EQ(decoded.kd, 0);
+}
 TEST(Protocol, FeedbackRoutingAndFaultCode)
 {
   auto f = feedback_frame(7, 42, {0xb, 0.2, -0.5, 0.1, 60, 70}, {});

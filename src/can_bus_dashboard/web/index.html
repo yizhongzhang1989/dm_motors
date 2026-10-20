@@ -1,42 +1,109 @@
 <!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Generic CAN dashboard</title><link rel="stylesheet" href="/dashboard.css"></head>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+  <title>CAN 总线 · 监控工作台</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
 <body>
-<header><h1>CAN bus monitor</h1><span id="connection">Connecting…</span></header>
-<p>Transport-only observation. Written means driver-write observed, not CAN acknowledgment or device execution.</p>
-<section><h2>Bus status</h2><div id="status" class="grid"></div><p id="notice"></p></section>
-<section><h2>Frames by ID</h2><p>Rates: trailing one-second observed window, capped at 1000 samples per key.
-Up to 512 recent ID/direction keys. Status counters are authoritative broker totals.</p>
-<div class="scroll"><table><thead><tr><th>Direction</th><th>ID</th><th>Channel</th><th>Flags</th><th>Count</th><th>Hz</th><th>Latest bytes</th></tr></thead><tbody id="ids"></tbody></table></div></section>
-<section><h2>Recent bounded frame log</h2><label>ID filter (hex or decimal) <input id="filter" placeholder="0x600"></label>
-<label>Direction <select id="direction"><option value="">All</option><option value="rx">Received</option><option value="written">Written</option><option value="submitted">Submitted</option></select></label>
-<p>Latest 1000 server frames; this view displays at most 200 matching frames. Error frames are marked ERROR separately.</p>
-<div class="scroll log"><table><thead><tr><th>#</th><th>Direction</th><th>ID</th><th>Channel</th><th>Flags</th><th>Data</th></tr></thead><tbody id="frames"></tbody></table></div></section>
-<section class="danger"><h2>Exclusive manual debugging — potentially destructive</h2>
-<p>Raw frames can activate devices, move machinery, or change firmware. No device opcode is interpreted.
-Never use this to bypass a motor client. A conflicting route is refused by the broker.
-Active sends require your own device-safe opaque stop frames; the dashboard cannot verify their effect.</p>
-<label><input type="checkbox" id="confirm"> I explicitly authorize hardware debugging and understand the consequences.</label>
-<fieldset id="debug" disabled>
-<label>Owner <input id="owner" value="operator" maxlength="64"></label>
-<label>Duration (1–300 seconds) <input id="duration" type="number" min="1" max="300" value="30"></label>
-<label>Exact CAN ID <input id="canid" value="0x600"></label>
-<label>Channel <input id="channel" type="number" min="0" max="0" value="0"></label>
-<label><input id="extended" type="checkbox"> Extended ID</label>
-<label>Optional exact payload prefix (hex bytes) <input id="prefix" placeholder="empty matches all payloads on ID"></label>
-<label><input id="readonly" type="checkbox"> Explicit read-only claim (sends active=false; still exclusive)</label>
-<label>Opaque stop frames (JSON array; same claimed ID/channel/prefix)
-<textarea id="stops" rows="3">[{"can_id":1536,"channel":0,"extended":false,"data":[0,0,0,0,0,0,0,0]}]</textarea></label>
-<button id="claim">Claim route</button><button id="release" disabled>Release (expiry, not immediate)</button>
-<p id="session">No debug session</p>
-<label>Single frame data (hex bytes) <input id="data" value="01 02 03 04 05 06 07 08"></label>
-<label><input id="fd" type="checkbox"> FD</label><label><input id="brs" type="checkbox"> BRS</label>
-<label><input id="rtr" type="checkbox"> RTR (classical only)</label>
-<button id="send" disabled>Submit exactly one frame</button>
-<p>Legacy adapter: channel 0, standard classical, only 4/8 bytes; four bytes are zero-padded to eight.
-No automatic repeat. Browser heartbeat expires after 1s; broker heartbeat is 50ms, lease 0.3s.
-Release/shutdown stops heartbeats; opaque stops are dispatched on broker lease expiry.</p>
-</fieldset><p id="result" role="status"></p></section>
-<script src="/dashboard.js"></script>
-</body></html>
+  <a class="skip-link" href="#overview-panel">跳到帧概览</a>
+  <main>
+    <header id="status-dock" class="app-header">
+      <div class="identity">
+        <span class="app-mark" aria-hidden="true">CAN</span>
+        <div class="identity-text">
+          <h1>CAN 总线</h1>
+          <div class="identity-badges"><span id="backend-label" class="badge">待发现</span><span id="connection" class="badge">连接中</span></div>
+          <div id="bus-namespace" class="bus-namespace">等待连接</div>
+        </div>
+      </div>
+      <section id="status-panel" class="panel status-panel" aria-label="总线实时状态，窄屏可左右滚动查看" tabindex="0">
+        <div class="metrics">
+          <div class="metric"><div class="eyebrow">接收 / RX</div><div id="rx-count" class="value">--</div><small id="rx-rate">-- 帧/s</small></div>
+          <div class="metric" title="驱动写出不等于 CAN ACK 或设备执行"><div class="eyebrow">写出 / TX</div><div id="tx-count" class="value">--</div><small id="tx-rate">-- 帧/s</small></div>
+          <div class="metric"><div class="eyebrow">拒绝发送</div><div id="rejected-count" class="value">--</div><small>总线累计计数</small></div>
+          <div class="metric"><div class="eyebrow">注册客户端</div><div id="clients-count" class="value">--</div><small id="quiet-state">等待状态</small></div>
+        </div>
+      </section>
+      <div class="header-actions"><button id="release" class="danger" disabled>释放调试租约</button></div>
+    </header>
+    <div id="health-banner" class="health-banner" role="status">正在连接总线；默认仅监控，不注册客户端、不发送帧。</div>
+    <div class="notice-bar" hidden><span class="notice-label">操作反馈</span><div id="result" role="status" aria-live="polite"></div></div>
+    <nav class="section-nav" role="tablist" aria-label="CAN 工作区">
+      <button id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="overview-panel" data-panel="overview-panel">帧概览</button>
+      <button id="tab-frames" type="button" role="tab" aria-selected="false" aria-controls="frames-panel" data-panel="frames-panel" tabindex="-1">实时帧记录</button>
+      <button id="tab-diagnostics" type="button" role="tab" aria-selected="false" aria-controls="diagnostics-panel" data-panel="diagnostics-panel" tabindex="-1">总线诊断</button>
+      <button id="tab-debug" type="button" role="tab" aria-selected="false" aria-controls="debug-panel" data-panel="debug-panel" tabindex="-1">手动调试 <span class="restricted">单帧</span></button>
+    </nav>
+    <div id="traffic-tools" class="traffic-tools">
+      <label for="filter">CAN ID<input id="filter" type="text" placeholder="全部 · 如 0x600 / 1536" aria-describedby="filter-error"></label>
+      <label for="direction">方向<select id="direction"><option value="">全部方向</option><option value="rx">RX · 接收</option><option value="written">TX · 驱动写出</option><option value="submitted">提交 · 尚未确认写出</option></select></label>
+      <button id="reset-filter" class="secondary" type="button">清除筛选</button>
+      <div class="tool-spacer"></div>
+      <button id="pause-frames" class="secondary" type="button" aria-pressed="false">暂停列表</button>
+      <button id="export-frames" class="secondary" type="button" disabled>导出帧 CSV</button>
+      <p id="filter-error" class="input-error" role="alert" hidden></p>
+    </div>
+    <section id="overview-panel" class="panel view-panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+      <div class="section-heading"><div><div class="eyebrow">LIVE TRAFFIC</div><h2>按 CAN ID 聚合</h2></div><span id="id-count" class="badge">等待帧</span></div>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="按 ID 聚合的帧"><table><thead><tr><th>方向</th><th>CAN ID</th><th>通道</th><th>标记</th><th>观察计数</th><th>帧/s</th><th>最新数据 / HEX</th></tr></thead><tbody id="ids"></tbody></table></div>
+      <p class="subtle table-caption">最多保留 512 个 ID / 方向组合。速率按至少一秒的完整计数窗口测量，预热时为 0；总量以顶部总线计数为准。</p>
+    </section>
+    <section id="frames-panel" class="panel view-panel" role="tabpanel" aria-labelledby="tab-frames" tabindex="0" hidden>
+      <div class="section-heading"><h2>最近帧记录</h2><span id="frame-count" class="badge">等待帧</span></div>
+      <div class="table-scroll frame-log" tabindex="0" role="region" aria-label="最近的 CAN 帧"><table><thead><tr><th>序号</th><th>方向</th><th>CAN ID</th><th>通道</th><th>标记</th><th>数据 / HEX</th></tr></thead><tbody id="frames"></tbody></table></div>
+      <p class="subtle table-caption">从服务端最近 1000 帧中筛选，显示并导出最新 200 条匹配记录。暂停仅冻结列表，监控与租约心跳继续；ERROR 为观察到的错误帧。</p>
+    </section>
+    <section id="diagnostics-panel" class="panel view-panel" role="tabpanel" aria-labelledby="tab-diagnostics" tabindex="0" hidden>
+      <div class="section-heading"><h2>总线与客户端诊断</h2><button id="export-state" class="secondary" disabled>导出状态 JSON</button></div>
+      <div class="status-strip"><span id="bus-endpoint">等待接口信息</span><span id="queue-status">队列 --</span><span id="observer-status">观察链路 --</span><span id="status-age">等待新鲜状态</span></div>
+      <dl id="status" class="data-grid"></dl>
+      <h3>注册客户端</h3>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="注册客户端"><table><thead><tr><th>名称</th><th>心跳确认序号</th><th>接收就绪</th><th>故障</th></tr></thead><tbody id="clients"></tbody></table></div>
+      <details><summary>全部原始状态与能力字段</summary><pre id="raw-status">等待总线状态</pre></details>
+    </section>
+    <section id="debug-panel" class="panel view-panel" role="tabpanel" aria-labelledby="tab-debug" tabindex="0" hidden>
+      <div class="section-heading"><h2>独占手动调试</h2><span id="session" class="badge">无调试会话</span></div>
+      <div class="warning-box"><strong>原始帧可能使设备运动或修改固件。</strong><p>本页面不解释设备指令，也无法验证停止帧效果。不要绕过电机客户端；与已有路由冲突的申请会被总线拒绝。软件租约不替代硬件急停。</p></div>
+      <p id="debug-guidance" class="subtle">填写路由后直接申请；不会在打开页面时自动发送帧。</p>
+      <p id="notice" class="subtle server-notice" role="status" hidden></p>
+      <fieldset id="debug" disabled>
+        <div class="debug-grid">
+          <fieldset id="claim-fields">
+            <legend>1 · 申请独占路由</legend>
+            <form id="claim-form">
+              <div class="fields">
+                <label>操作者<input id="owner" value="operator" maxlength="64" required></label>
+                <label>有效时长 / s<input id="duration" type="number" min="1" max="300" value="30" required></label>
+                <label>精确 CAN ID<input id="canid" value="0x600" required></label>
+                <label>通道<input id="channel" type="number" min="0" max="0" value="0" required></label>
+                <label class="check-label"><input id="extended" type="checkbox">扩展帧 ID</label>
+                <label class="wide-field">可选精确数据前缀 / HEX<input id="prefix" placeholder="留空匹配该 ID 的所有数据"></label>
+                <label class="check-label wide-field"><input id="readonly" type="checkbox">非活动租约（active=false，仍可发送帧）</label>
+                <label class="wide-field">设备停止帧 / JSON 数组<textarea id="stops" rows="4" spellcheck="false">[{"can_id":1536,"channel":0,"extended":false,"data":[0,0,0,0,0,0,0,0]}]</textarea><small>必须匹配申请的 ID、通道与前缀。默认零字节仅是示例，不代表设备安全停止。非活动租约可填 []。</small></label>
+              </div>
+              <button id="claim" type="submit">申请独占路由</button>
+            </form>
+          </fieldset>
+          <fieldset id="send-fields" disabled>
+            <legend>2 · 提交单帧</legend>
+            <p id="claimed-route" class="route-summary">申请成功后显示固定路由；修改路由需要先释放。</p>
+            <form id="send-form">
+              <label for="data">数据 / HEX（每字节两位，空格分隔）</label>
+              <textarea id="data" rows="4" spellcheck="false">01 02 03 04 05 06 07 08</textarea>
+              <div class="flag-options"><label class="check-label"><input id="fd" type="checkbox">CAN FD</label><label class="check-label"><input id="brs" type="checkbox">BRS</label><label class="check-label"><input id="rtr" type="checkbox">RTR</label></div>
+              <p id="frame-help" class="subtle">等待后端能力。</p>
+              <button id="send" type="submit" disabled>仅提交一帧</button>
+            </form>
+            <p class="subtle">不会自动重复发送。提交成功不等于驱动写出，更不等于 CAN ACK 或设备执行。</p>
+          </fieldset>
+        </div>
+      </fieldset>
+      <details><summary>释放、过期与旧适配器限制</summary><p class="subtle">释放会停止续约；已激活租约通常在 0.3 s 内过期，未确认的注册最长 2 s。总线到期后派发不透明停止帧。浏览器心跳 250 ms，超过 1 s 无心跳即过期；隐藏或离开页面也会释放，返回不会恢复调试。申请过程中可以在页头取消，迟到结果不会重新建立会话。旧串口适配器仅支持通道 0、标准经典帧、4 / 8 字节；4 字节由适配器补零为 8 字节。</p></details>
+    </section>
+    <footer>纯传输层观察，不解释电机协议。默认仅监控，不自动发送。服务无登录鉴权，仅用于可信隔离网络；软件停止不能替代硬件急停。</footer>
+  </main>
+</body>
+</html>

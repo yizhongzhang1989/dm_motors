@@ -76,7 +76,7 @@ def generate_launch_description():
         "namespace": "",
         "control_rate": "",
         "dashboards": "true",
-        "dashboard_host": "127.0.0.1",
+        "dashboard_host": "0.0.0.0",
         "can_dashboard_port": "8080",
         "motor_dashboard_base_port": "8081",
     }
