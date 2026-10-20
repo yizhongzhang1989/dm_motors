@@ -454,7 +454,7 @@ class DriverSimulationTest(FollowHarness):
                 port = endpoint.getsockname()[1]
             name = f"motor_{motor}"
             self.launch("dashboard_" + name, [
-                self.executable("dm_motor_dashboard", "dashboard.py"), "--ros-args",
+                self.executable("dm_motor_control", "dashboard.py"), "--ros-args",
                 "-r", f"__ns:={self.namespace}/{name}", "-p", f"motor_id:={motor}", "-p", f"port:={port}"])
             endpoints[name] = f"http://127.0.0.1:{port}"
 
@@ -496,7 +496,7 @@ class DriverSimulationTest(FollowHarness):
             endpoint.bind(("127.0.0.1", 0))
             port = endpoint.getsockname()[1]
         self.launch("dashboard", [
-            self.executable("dm_motor_lead_follow_dashboard", "dashboard.py"), "--ros-args",
+            self.executable("dm_motor_lead_follow", "dashboard.py"), "--ros-args",
             "-r", f"__ns:={self.namespace}", "-p", f"port:={port}"])
         origin = f"http://127.0.0.1:{port}"
         snapshot = {}

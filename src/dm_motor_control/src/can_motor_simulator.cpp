@@ -1,4 +1,5 @@
 #include "dm_motor_control/runtime.hpp"
+#include "common/config.hpp"
 
 #include <can_bus/msg/frame.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -15,18 +16,20 @@ class MotorSimulator final : public rclcpp::Node
 public:
   MotorSimulator() : Node("motor_simulator")
   {
-    const auto bus = declare_parameter<std::string>("can_bus_namespace", "/can/main");
+    const common::Config defaults(
+      declare_parameter<std::string>("config_file", common::default_config_path()));
+    const auto bus = declare_parameter<std::string>("can_bus_namespace", defaults.get<std::string>("packages.dm_motor_control.nodes.motor_node.can_bus_namespace"));
     const auto names = declare_parameter<std::vector<std::string>>(
-      "motor_names", std::vector<std::string>{"motor"});
+      "motor_names", std::vector<std::string>{defaults.get<std::string>("packages.dm_motor_control.nodes.motor_node.motor_name")});
     std::vector<MotorConfig> configs;
     std::vector<uint8_t> identities;
     for (const auto & name : names) {
       MotorConfig config;
       config.name = name;
       const auto prefix = "motors." + name + ".";
-      const int id = declare_parameter<int>(prefix + "motor_id", 1);
-      const int master = declare_parameter<int>(prefix + "master_id", 0);
-      const int mode = declare_parameter<int>(prefix + "mode", 1);
+      const int id = declare_parameter<int>(prefix + "motor_id", defaults.get<int>("packages.dm_motor_control.nodes.motor_node.motor_id"));
+      const int master = declare_parameter<int>(prefix + "master_id", defaults.get<int>("packages.dm_motor_control.nodes.motor_node.master_id"));
+      const int mode = declare_parameter<int>(prefix + "mode", defaults.get<int>("packages.dm_motor_control.nodes.motor_node.mode"));
       if (id < 1 || id > 15 || master < 0 || master > 0x7ff || mode < 1 || mode > 4) {
         throw std::invalid_argument("Invalid simulated motor ID/master/mode");
       }

@@ -17,6 +17,31 @@ and `can_bitrate` (positive integer, default `1000000`). Select an explicit
 device/interface for hardware backends. The launch file changes no physical
 interface settings.
 
+The optional web dashboard is included in this package and runs as a separate
+process. Add `dashboard_port:=config` to the bus launch to use the centralized
+port (8080 by default), or specify an integer override; omit the
+argument for no dashboard. `dashboard_host` defaults to `0.0.0.0` (trusted LAN
+access). The hardware `port` argument is unrelated to the HTTP `dashboard_port`.
+To attach only a dashboard to an already running bus:
+
+```bash
+ros2 launch can_bus dashboard.launch.py bus_namespace:=/can/main dashboard_port:=config
+```
+
+Both launch files require an explicit HTTP port to start a dashboard. Invalid
+or occupied ports abort before starting nodes. See [Dashboard](DASHBOARD.md).
+
+All runtime defaults come from [config/dm_motors.yaml](../../config/dm_motors.yaml)
+through `common`, including direct C++ node and Python dashboard launches.
+Use `config_file:=/path/to/site.yaml` (launch), `-p config_file:=...` (ROS node),
+or `COMMON_CONFIG` to select a different complete configuration.
+Explicit launch/ROS parameters override file defaults. Changes take effect at
+process startup, not in the control loop. Missing/invalid files fail explicitly.
+Profiles are keyed by package and full launch filename, for example
+`packages.can_bus.launches["can_bus.launch.py"]`; the standalone dashboard uses
+its own `dashboard.launch.py` profile. Direct executable defaults live under
+`packages.can_bus.nodes`. There is no motor-specific schema in `common`.
+
 The executable can also be run directly; this example uses no hardware:
 
 ```bash

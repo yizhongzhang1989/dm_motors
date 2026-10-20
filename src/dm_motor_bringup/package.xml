@@ -13,14 +13,14 @@
   <exec_depend>ros2launch</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>can_bus</exec_depend>
-  <exec_depend>can_bus_dashboard</exec_depend>
+  <exec_depend>common</exec_depend>
   <exec_depend>dm_motor_control</exec_depend>
-  <exec_depend>dm_motor_dashboard</exec_depend>
   <exec_depend>dm_motor_lead_follow</exec_depend>
-  <exec_depend>dm_motor_lead_follow_dashboard</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_index_python</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>dm_motor_interfaces</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -1,4 +1,5 @@
 #include "can_bus/router.hpp"
+#include "common/config.hpp"
 #include "can_bus/msg/frame.hpp"
 #include "can_bus/msg/status.hpp"
 #include "can_bus/msg/tx_frame.hpp"
@@ -228,17 +229,19 @@ public:
   {
     rcl_interfaces::msg::ParameterDescriptor startup;
     startup.read_only = true;
-    backend_ = declare_parameter<std::string>("backend", "sim", startup);
-    const auto port = declare_parameter<std::string>("port", "", startup);
+    const common::Config config(
+      declare_parameter<std::string>("config_file", common::default_config_path(), startup));
+    backend_ = declare_parameter<std::string>("backend", config.get<std::string>("packages.can_bus.nodes.can_bus_node.backend"), startup);
+    const auto port = declare_parameter<std::string>("port", config.get<std::string>("packages.can_bus.nodes.can_bus_node.port"), startup);
     port_ = port;
-    router_.allow_fd = declare_parameter<bool>("can_fd", false, startup);
-    const auto bitrate = declare_parameter<int>("can_bitrate", 1000000, startup);
+    router_.allow_fd = declare_parameter<bool>("can_fd", config.get<bool>("packages.can_bus.nodes.can_bus_node.can_fd"), startup);
+    const auto bitrate = declare_parameter<int>("can_bitrate", config.get<int>("packages.can_bus.nodes.can_bus_node.can_bitrate"), startup);
     if (bitrate <= 0 || bitrate > 5000000) {
       throw std::invalid_argument("can_bitrate must be 1..5000000 bits per second");
     }
     bitrate_ = static_cast<uint32_t>(bitrate);
-    const auto rate = declare_parameter<double>("io_rate", 1000, startup);
-    declare_parameter<double>("client_timeout", .5, startup);
+    const auto rate = declare_parameter<double>("io_rate", config.get<double>("packages.can_bus.nodes.can_bus_node.io_rate"), startup);
+    declare_parameter<double>("client_timeout", config.get<double>("packages.can_bus.nodes.can_bus_node.client_timeout"), startup);
     if (!std::isfinite(rate) || rate < 10 || rate > 10000) {
       throw std::invalid_argument("io_rate outside [10,10000]");
     }

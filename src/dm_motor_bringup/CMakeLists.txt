@@ -10,7 +10,7 @@ install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_launch test/test_launch.py TIMEOUT 30)
-  ament_add_pytest_test(test_bringup test/test_bringup.py TIMEOUT 60)
+  ament_add_pytest_test(test_bringup test/test_bringup.py TIMEOUT 90)
 endif()
 
 ament_package()

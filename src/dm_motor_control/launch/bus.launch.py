@@ -1,26 +1,22 @@
 """Compose generic CAN owners and independent motor nodes from one configuration."""
 
-from pathlib import Path
 import re
 import math
 
-import yaml
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
+from common.dashboard import check_endpoints
+from common.launch import config_argument, ConfigValue, config_for_context, profile_arguments
+from dm_motor_control.launch_utils import load_parameters, dashboard_ports, node_parameters
+
+PACKAGE, LAUNCH = "dm_motor_control", "bus.launch.py"
 
 
 def compose(context):
-    config_path = Path(LaunchConfiguration("config").perform(context)).expanduser()
-    with config_path.open(encoding="utf-8") as stream:
-        document = yaml.safe_load(stream)
-    if not isinstance(document, dict) or not isinstance(document.get("/**"), dict):
-        raise ValueError("Configuration must contain /**: ros__parameters")
-    parameters = document["/**"].get("ros__parameters")
-    if not isinstance(parameters, dict):
-        raise ValueError("ros__parameters must be a mapping")
+    config = config_for_context(context)
+    parameters = load_parameters(context)
     names = parameters.get("motor_names", [])
     buses = parameters.get("bus_names", [])
     if (not isinstance(names, list) or not isinstance(buses, list) or not names or not buses
@@ -40,17 +36,9 @@ def compose(context):
     if rate is not None and (not math.isfinite(rate) or not 20 <= rate <= 1000):
         raise ValueError("control_rate must be finite in 20..1000 Hz")
     nodes = []
-    dashboard_flag = LaunchConfiguration("dashboards").perform(context).lower()
-    if dashboard_flag not in ("true", "false"):
-        raise ValueError("dashboards must be true or false")
-    dashboards = dashboard_flag == "true"
     host = LaunchConfiguration("dashboard_host").perform(context)
-    can_port = int(LaunchConfiguration("can_dashboard_port").perform(context))
-    motor_port = int(LaunchConfiguration("motor_dashboard_base_port").perform(context))
-    if dashboards:
-        ports = [can_port + i for i in range(len(buses))] + [motor_port + i for i in range(len(names))]
-        if any(port < 1 or port > 65535 for port in ports) or len(set(ports)) != len(ports):
-            raise ValueError("Dashboard ports must be unique and within 1..65535")
+    can_ports, motor_ports = dashboard_ports(context, parameters)
+    check_endpoints(host, [*can_ports.values(), *motor_ports.values()])
     identities = set()
     motor_options = {}
     command_ids = {bus_name: set() for bus_name in buses}
@@ -83,6 +71,7 @@ def compose(context):
         if bus_name not in bus_config or not isinstance(bus_config[bus_name], dict):
             raise ValueError(f"Missing bus configuration: {bus_name}")
         options = dict(bus_config[bus_name])
+        options["config_file"] = str(config.path)
         if "can_bitrate" in options:
             bitrate = options["can_bitrate"]
             if (isinstance(bitrate, bool) or not isinstance(bitrate, (int, float))
@@ -101,17 +90,19 @@ def compose(context):
         nodes.append(Node(
             package="can_bus", executable="can_bus_node", name="can_bus",
             namespace=bus_namespace, parameters=[options], output="screen"))
-        if dashboards:
+        if bus_name in can_ports:
             nodes.append(Node(
-                package="can_bus_dashboard", executable="dashboard.py", name="can_dashboard",
+                package="can_bus", executable="dashboard.py", name="can_dashboard",
                 namespace=bus_namespace,
-                parameters=[{"bus_namespace": bus_namespace, "host": host,
-                             "port": can_port + buses.index(bus_name)}], output="screen"))
+                parameters=[{**node_parameters(context, "can_bus", "dashboard"),
+                             "bus_namespace": bus_namespace, "host": host,
+                             "port": can_ports[bus_name], "config_file": str(config.path)}], output="screen"))
         selected = [name for name in names if motor_options[name]["bus"] == bus_name]
         if not selected:
             raise ValueError(f"Bus {bus_name} is unused by this motor configuration; launch it separately")
         if backend == "sim":
-            sim_parameters = {"motor_names": selected, "can_bus_namespace": bus_namespace}
+            sim_parameters = {"motor_names": selected, "can_bus_namespace": bus_namespace,
+                              "config_file": str(config.path)}
             for name in selected:
                 values = motor_options[name]
                 sim_parameters.update({
@@ -128,7 +119,8 @@ def compose(context):
         bus_name = values.pop("bus")
         bus_namespace = "/" + "/".join(part for part in (root, "can", bus_name) if part)
         values = {**values, "motor_name": name, "can_bus_namespace": bus_namespace,
-                  "can_fd": bus_config[bus_name].get("can_fd", False)}
+                  "can_fd": bus_config[bus_name]["can_fd"],
+                  "config_file": str(config.path)}
         if rate is not None:
             values["control_rate"] = rate
             if values.get("state_rate", 0) > rate:
@@ -137,28 +129,31 @@ def compose(context):
         nodes.append(Node(
             package="dm_motor_control", executable="motor_node", name="motor_controller",
             namespace=namespace, parameters=[values], output="screen"))
-        if dashboards:
+        if name in motor_ports:
             nodes.append(Node(
-                package="dm_motor_dashboard", executable="dashboard.py", name="dashboard",
+                package="dm_motor_control", executable="dashboard.py", name="dashboard",
                 namespace=namespace,
-                parameters=[{"motor_id": values.get("motor_id", 1), "host": host,
-                             "port": motor_port + names.index(name),
-                             "command_timeout": values.get("command_timeout", 0.25)}],
+                parameters=[{**node_parameters(context, PACKAGE, "dashboard"),
+                             "motor_id": values.get("motor_id", 1), "host": host,
+                             "port": motor_ports[name],
+                             "command_timeout": values["command_timeout"], "config_file": str(config.path)}],
                 output="screen"))
     return nodes
 
 
 def generate_launch_description():
-    default_config = PathJoinSubstitution(
-        [FindPackageShare("dm_motor_control"), "config", "sim_bus.yaml"])
     return LaunchDescription([
-        DeclareLaunchArgument("config", default_value=default_config),
-        DeclareLaunchArgument("namespace", default_value=""),
-        DeclareLaunchArgument("control_rate", default_value="",
+        config_argument(),
+        *profile_arguments(PACKAGE, LAUNCH),
+        DeclareLaunchArgument("config", default_value="",
+                              description="Optional ROS topology override; empty uses common system configuration."),
+        DeclareLaunchArgument("namespace", default_value=ConfigValue("namespace", PACKAGE, LAUNCH)),
+        DeclareLaunchArgument("control_rate", default_value=ConfigValue("control_rate", PACKAGE, LAUNCH),
                               description="Override all motor control rates (20..1000 Hz); empty uses config."),
-        DeclareLaunchArgument("dashboards", default_value="false"),
-        DeclareLaunchArgument("dashboard_host", default_value="0.0.0.0"),
-        DeclareLaunchArgument("can_dashboard_port", default_value="8080"),
-        DeclareLaunchArgument("motor_dashboard_base_port", default_value="8081"),
+        DeclareLaunchArgument("dashboard_host", default_value=ConfigValue("dashboard_host", PACKAGE, LAUNCH)),
+        DeclareLaunchArgument("can_dashboard_ports", default_value="",
+                             description="Named bus port mapping or config; omitted disables CAN dashboards."),
+        DeclareLaunchArgument("motor_dashboard_ports", default_value="",
+                             description="Named motor port mapping or config; omitted disables motor dashboards."),
         OpaqueFunction(function=compose),
     ])

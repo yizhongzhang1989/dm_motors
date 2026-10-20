@@ -1,5 +1,6 @@
 #include "dm_motor_control/runtime.hpp"
 #include "dm_motor_control/can_transport.hpp"
+#include "common/config.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -206,17 +207,18 @@ struct Axis
 class MotorNode final : public rclcpp::Node
 {
 public:
-  MotorNode() : Node("motor_controller", rclcpp::NodeOptions().start_parameter_services(false))
+  MotorNode() : Node("motor_controller", rclcpp::NodeOptions().start_parameter_services(false)),
+    config_(declare_parameter<std::string>("config_file", common::default_config_path()))
   {
-    rate_ = declare_parameter<double>("control_rate", 200.0);
-    state_rate_limit_ = declare_parameter<double>("state_rate", 0.0);
+    rate_ = parameter<double>("", "control_rate");
+    state_rate_limit_ = parameter<double>("", "state_rate");
     state_rate_ = state_rate_limit_;
     if (state_rate_ == 0) {state_rate_ = rate_;}
     finite(rate_, "control_rate"); finite(state_rate_, "state_rate");
     if (rate_ < 20 || rate_ > 1000 || state_rate_ < 1 || state_rate_ > rate_) {
       throw std::invalid_argument("control_rate must be 20..1000; state_rate 1..control_rate or 0");
     }
-    max_task_duration_ = declare_parameter<double>("max_task_duration", 60.0);
+    max_task_duration_ = parameter<double>("", "max_task_duration");
     positive(max_task_duration_, "max_task_duration");
     if (max_task_duration_ > 3600) {throw std::invalid_argument("max_task_duration must be <=3600");}
     if (!declare_parameter<std::vector<std::string>>(
@@ -350,38 +352,39 @@ public:
   }
 
 private:
+  common::Config config_;
   template<typename T>
-  T parameter(const std::string & prefix, const std::string & name, const T & value)
+  T parameter(const std::string & prefix, const std::string & name)
   {
-    return declare_parameter<T>(prefix + name, value);
+    return declare_parameter<T>(prefix + name, config_.get<T>("packages.dm_motor_control.nodes.motor_node." + name));
   }
 
   MotorConfig motor_config(const std::string & prefix, const std::string & name)
   {
     MotorConfig result;
     result.name = name;
-    const int id = parameter<int>(prefix, "motor_id", 1);
-    const int master = parameter<int>(prefix, "master_id", 0);
+    const int id = parameter<int>(prefix, "motor_id");
+    const int master = parameter<int>(prefix, "master_id");
     if (id < 1 || id > 15 || master < 0 || master > 0x7ff) {
       throw std::invalid_argument("motor_id must be 1..15; master_id must be 0..2047");
     }
     result.id = static_cast<uint8_t>(id); result.master = static_cast<uint16_t>(master);
-    const int desired_mode = parameter<int>(prefix, "mode", 1);
+    const int desired_mode = parameter<int>(prefix, "mode");
     if (desired_mode < 1 || desired_mode > 4) {throw std::invalid_argument("mode must be 1..4");}
     result.mode = mode(static_cast<uint8_t>(desired_mode));
-    result.configure_mode_on_startup = parameter<bool>(prefix, "configure_mode_on_startup", false);
-    result.command_timeout = parameter<double>(prefix, "command_timeout", 0.25);
-    result.feedback_timeout = parameter<double>(prefix, "feedback_timeout", 0.1);
-    result.watchdog = parameter<double>(prefix, "watchdog_timeout", 0.2);
+    result.configure_mode_on_startup = parameter<bool>(prefix, "configure_mode_on_startup");
+    result.command_timeout = parameter<double>(prefix, "command_timeout");
+    result.feedback_timeout = parameter<double>(prefix, "feedback_timeout");
+    result.watchdog = parameter<double>(prefix, "watchdog_timeout");
     for (const double timeout : {result.command_timeout, result.feedback_timeout, result.watchdog}) {
       if (!std::isfinite(timeout) || timeout < 2.0 / rate_ || timeout > 2.0) {
         throw std::invalid_argument("timeouts must be >= two periods and <=2 seconds");
       }
     }
-    result.limits = {parameter<double>(prefix, "position_limit", 0.0),
-      parameter<double>(prefix, "velocity_limit", 0.0),
-      parameter<double>(prefix, "torque_limit", 0.0),
-      parameter<double>(prefix, "kp_limit", 500.0), parameter<double>(prefix, "kd_limit", max_kd)};
+    result.limits = {parameter<double>(prefix, "position_limit"),
+      parameter<double>(prefix, "velocity_limit"),
+      parameter<double>(prefix, "torque_limit"),
+      parameter<double>(prefix, "kp_limit"), parameter<double>(prefix, "kd_limit")};
     return result;
   }
 
@@ -391,43 +394,43 @@ private:
     auto axis = std::make_unique<Axis>();
     axis->config = std::move(config);
     axis->endpoint = endpoint;
-    axis->profile = parameter<std::string>(prefix, "profile", "j4310_v12");
-    axis->fault_group = parameter<std::string>(prefix, "fault_group", "");
+    axis->profile = parameter<std::string>(prefix, "profile");
+    axis->fault_group = parameter<std::string>(prefix, "fault_group");
     if (!axis->fault_group.empty() && !identifier(axis->fault_group)) {
       throw std::invalid_argument("fault_group must be empty or a ROS identifier");
     }
     if (axis->profile != "j4310_v12" && axis->profile != "j4310_v11") {
       throw std::invalid_argument("Unverified profile: only j4310_v11/j4310_v12 are supported");
     }
-    axis->direction = parameter<double>(prefix, "direction", 1.0);
-    axis->host_protection = parameter<bool>(prefix, "host_protection_enabled", false);
+    axis->direction = parameter<double>(prefix, "direction");
+    axis->host_protection = parameter<bool>(prefix, "host_protection_enabled");
     if (axis->direction != -1 && axis->direction != 1) {
       throw std::invalid_argument("direction must be -1 or 1");
     }
-    axis->offset = parameter<double>(prefix, "software_offset", 0.0);
+    axis->offset = parameter<double>(prefix, "software_offset");
     finite(axis->offset, "software_offset");
     const double unset = std::numeric_limits<double>::max();
-    axis->lower = parameter<double>(prefix, "position_min", -unset);
-    axis->upper = parameter<double>(prefix, "position_max", unset);
+    axis->lower = parameter<double>(prefix, "position_min");
+    axis->upper = parameter<double>(prefix, "position_max");
     finite(axis->lower, "position_min"); finite(axis->upper, "position_max");
     axis->explicit_bounds = axis->lower != -unset || axis->upper != unset;
     if (axis->lower >= axis->upper) {throw std::invalid_argument("position_min must be < position_max");}
-    axis->measured_velocity = parameter<double>(prefix, "measured_velocity_limit", 0.0);
-    axis->measured_torque = parameter<double>(prefix, "measured_torque_limit", 0.0);
-    axis->estimated_torque = parameter<double>(prefix, "estimated_torque_limit", 0.0);
-    axis->mos_stop = parameter<double>(prefix, "mos_temperature_stop", 0.0);
-    axis->rotor_stop = parameter<double>(prefix, "rotor_temperature_stop", 0.0);
+    axis->measured_velocity = parameter<double>(prefix, "measured_velocity_limit");
+    axis->measured_torque = parameter<double>(prefix, "measured_torque_limit");
+    axis->estimated_torque = parameter<double>(prefix, "estimated_torque_limit");
+    axis->mos_stop = parameter<double>(prefix, "mos_temperature_stop");
+    axis->rotor_stop = parameter<double>(prefix, "rotor_temperature_stop");
     for (double value : {axis->measured_velocity, axis->measured_torque, axis->estimated_torque,
         axis->mos_stop, axis->rotor_stop})
     {
       finite(value, "feedback protection");
       if (value < 0) {throw std::invalid_argument("feedback protection must be >=0 (0 disables)");}
     }
-    axis->violation_limit = parameter<int>(prefix, "protection_samples", 3);
+    axis->violation_limit = parameter<int>(prefix, "protection_samples");
     if (axis->violation_limit < 1 || axis->violation_limit > 100) {
       throw std::invalid_argument("protection_samples must be 1..100");
     }
-    parameter<bool>(prefix, "legacy_control", false);  // Accepted for old configurations; command input is now always open.
+    parameter<bool>(prefix, "legacy_control");  // Accepted for old configurations; command input is now always open.
     axis->requested.mode = axis->config.mode;
     axis->active.mode = axis->config.mode;
     axis->applied.mode = axis->config.mode;
@@ -436,7 +439,7 @@ private:
 
   void configure_single()
   {
-    const auto name = parameter<std::string>("", "motor_name", "motor");
+    const auto name = parameter<std::string>("", "motor_name");
     if (!identifier(name)) {throw std::invalid_argument("motor_name must be a ROS identifier");}
     auto config = motor_config("", name);
     if (config.configure_mode_on_startup) {
@@ -445,11 +448,11 @@ private:
         static_cast<unsigned>(config.mode));
     }
     auto axis = axis_config("", config, "");
-    const auto bus_namespace = parameter<std::string>("", "can_bus_namespace", "/can/main");
+    const auto bus_namespace = parameter<std::string>("", "can_bus_namespace");
     if (bus_namespace.empty() || bus_namespace.front() != '/') {
       throw std::invalid_argument("can_bus_namespace must be an absolute ROS namespace");
     }
-    const bool fd = parameter<bool>("", "can_fd", false);
+    const bool fd = parameter<bool>("", "can_fd");
     const auto client_name = std::string(get_fully_qualified_name());
     auto remote = std::make_unique<CanTransport>(*this, bus_namespace, client_name,
       config.id, config.master, fd, rate_, config.feedback_timeout, axis->fault_group);

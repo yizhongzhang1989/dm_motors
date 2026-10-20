@@ -10,6 +10,7 @@ from launch.utilities import perform_substitutions
 from launch_ros.utilities import evaluate_parameters, normalize_parameters
 import pytest
 import yaml
+from common.config import ConfigManager
 
 
 spec = importlib.util.spec_from_file_location(
@@ -18,7 +19,7 @@ composition = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(composition)
 
 
-def compose(parameters, dashboards=False, can_port="8080", motor_port="8081", control_rate=""):
+def compose(parameters, dashboards=False, can_port="{main: 8080}", motor_port="{one: 8081, two: 8082}", control_rate=""):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as config:
         yaml.safe_dump({"/**": {"ros__parameters": parameters}}, config)
         config.flush()
@@ -27,8 +28,9 @@ def compose(parameters, dashboards=False, can_port="8080", motor_port="8081", co
         context.launch_configurations["namespace"] = "robot"
         context.launch_configurations["control_rate"] = control_rate
         context.launch_configurations.update({
-            "dashboards": "true" if dashboards else "false", "dashboard_host": "0.0.0.0",
-            "can_dashboard_port": can_port, "motor_dashboard_base_port": motor_port})
+            "dashboard_host": "0.0.0.0",
+            "can_dashboard_ports": can_port if dashboards else "",
+            "motor_dashboard_ports": motor_port if dashboards else ""})
         return composition.compose(context)
 
 
@@ -78,15 +80,19 @@ def test_declared_dashboard_port_defaults():
         entity.name: perform_substitutions(context, entity.default_value)
         for entity in composition.generate_launch_description().entities
         if isinstance(entity, DeclareLaunchArgument)
-        and entity.name in ("dashboard_host", "can_dashboard_port", "motor_dashboard_base_port")
+        and entity.name in ("dashboard_host", "can_dashboard_ports", "motor_dashboard_ports")
     }
-    assert defaults == {"dashboard_host": "0.0.0.0", "can_dashboard_port": "8080",
-                        "motor_dashboard_base_port": "8081"}
+    assert defaults == {"dashboard_host": "0.0.0.0", "can_dashboard_ports": "",
+                        "motor_dashboard_ports": ""}
 
 
 @pytest.mark.parametrize("can_port,motor_port,expected", [
-    ("8080", "8081", [8080, 8081, 8082]),
-    ("9080", "9081", [9080, 9081, 9082]),
+    ("{main: 8080}", "{motor_1: 8081, motor_2: 8082}", [8080, 8081, 8082]),
+    ("{main: 9080}", "{motor_1: 9181, motor_2: 9388}", [9080, 9181, 9388]),
+    ("", "{motor_1: 9081, motor_2: 9382}", [9081, 9382]),
+    ("{main: 9080}", "", [9080]),
+    ("", "", []),
+    ("config", "config", [8080, 8081, 8082]),
 ])
 def test_composed_dashboard_ports_are_exact_and_overridable(monkeypatch, can_port, motor_port, expected):
     monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
@@ -95,15 +101,21 @@ def test_composed_dashboard_ports_are_exact_and_overridable(monkeypatch, can_por
         "buses": {"main": {"backend": "sim"}},
         "motors": {"motor_1": {"motor_id": 1}, "motor_2": {"motor_id": 2}},
     }, dashboards=True, can_port=can_port, motor_port=motor_port)
-    dashboards = [node for node in nodes if node["package"] in ("can_bus_dashboard", "dm_motor_dashboard")]
+    dashboards = [node for node in nodes if node["executable"] == "dashboard.py"]
     assert [node["parameters"][0]["port"] for node in dashboards] == expected
     assert all(node["parameters"][0]["host"] == "0.0.0.0" for node in dashboards)
-    assert [node["namespace"] for node in dashboards] == ["/robot/can/main", "/robot/motor_1", "/robot/motor_2"]
+    namespaces = (["/robot/can/main"] if can_port else []) + (
+        ["/robot/motor_1", "/robot/motor_2"] if motor_port else [])
+    assert [node["namespace"] for node in dashboards] == namespaces
 
 
-@pytest.mark.parametrize("can_port,motor_port", [("8081", "8081"), ("65536", "8081")])
+@pytest.mark.parametrize("can_port,motor_port", [
+    ("{main: 8081}", "{one: 8081}"), ("{main: 65536}", "{one: 8081}"),
+    ("8080", "{one: 8081}"), ("{main: 8080}", "{missing: 8081}"),
+    ("{main: 8080}", "{one: true}"),
+])
 def test_dashboard_port_conflicts_and_overflow_are_rejected(can_port, motor_port):
-    with pytest.raises(ValueError, match="ports must be unique"):
+    with pytest.raises(ValueError, match="ports must be unique|dashboard_ports"):
         compose({
             "motor_names": ["one"], "bus_names": ["main"],
             "buses": {"main": {"backend": "sim"}},
@@ -112,11 +124,13 @@ def test_dashboard_port_conflicts_and_overflow_are_rejected(can_port, motor_port
 
 
 @pytest.mark.parametrize("package,motor_id,override,expected", [
-    ("can_bus_dashboard", None, None, 8080),
-    ("can_bus_dashboard", None, "9200", 9200),
-    ("dm_motor_dashboard", "1", None, 8081),
-    ("dm_motor_dashboard", "2", None, 8082),
-    ("dm_motor_dashboard", "2", "9200", 9200),
+    ("can_bus", None, None, None),
+    ("can_bus", None, "9200", 9200),
+    ("dm_motor_control", "1", None, None),
+    ("dm_motor_control", "2", "", None),
+    ("dm_motor_control", "2", "9200", 9200),
+    ("dm_motor_control", "2", "config", 8081),
+    ("can_bus", None, "config", 8080),
 ])
 def test_standalone_dashboard_ports_match_composition(monkeypatch, package, motor_id, override, expected):
     path = Path(__file__).resolve().parents[2] / package / "launch/dashboard.launch.py"
@@ -128,16 +142,56 @@ def test_standalone_dashboard_ports_match_composition(monkeypatch, package, moto
     if motor_id is not None:
         context.launch_configurations["motor_id"] = motor_id
     if override is not None:
-        context.launch_configurations["port"] = override
+        context.launch_configurations["dashboard_port"] = override
     description = module.generate_launch_description()
     for entity in description.entities:
         if isinstance(entity, DeclareLaunchArgument):
             entity.execute(context)
-    nodes = (module.launch_dashboard(context) if package == "dm_motor_dashboard"
-             else [entity for entity in description.entities if isinstance(entity, dict)])
+    nodes = module.launch_dashboard(context)
+    if expected is None:
+        assert nodes == []
+        return
     parameters = evaluate_parameters(context, normalize_parameters(nodes[0]["parameters"]))[0]
     assert parameters["port"] == expected
     assert parameters["host"] == "0.0.0.0"
+    assert nodes[0]["package"] == package
+
+
+@pytest.mark.parametrize("port,expected", [("", 1), ("9200", 2)])
+def test_motor_component_launch_dashboard_is_opt_in(monkeypatch, port, expected):
+    spec = importlib.util.spec_from_file_location(
+        "motor_optional_dashboard", Path(__file__).resolve().parents[1] / "launch/motor.launch.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
+    context = LaunchContext()
+    context.launch_configurations.update(
+        dashboard_port=port, start_can_bus="false", namespace="robot/axis",
+        can_bus_namespace="/robot/can/main", motor_id="2", command_timeout="0.15")
+    for entity in module.generate_launch_description().entities:
+        if isinstance(entity, DeclareLaunchArgument):
+            entity.execute(context)
+    nodes = module.launch_motor(context)
+    assert len(nodes) == expected
+    if port:
+        dashboard = nodes[-1]
+        assert dashboard["package"] == "dm_motor_control"
+        assert dashboard["namespace"] == "robot/axis"
+        assert dashboard["parameters"][0] == {
+            "motor_id": 2, "host": "0.0.0.0", "port": 9200, "command_timeout": 0.15,
+            "client_timeout": 0.75, "config_file": str(ConfigManager().path)}
+
+
+def test_instance_ports_do_not_depend_on_motor_order(monkeypatch):
+    monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
+    nodes = compose({
+        "motor_names": ["motor_2", "motor_1"], "bus_names": ["main"],
+        "buses": {"main": {"backend": "sim"}},
+        "motors": {"motor_1": {"motor_id": 1}, "motor_2": {"motor_id": 2}},
+    }, dashboards=True, can_port="", motor_port="{motor_1: 9181, motor_2: 9388}")
+    actual = {node["namespace"]: node["parameters"][0]["port"]
+              for node in nodes if node["executable"] == "dashboard.py"}
+    assert actual == {"/robot/motor_1": 9181, "/robot/motor_2": 9388}
 
 
 @pytest.mark.parametrize("parameters, message", [

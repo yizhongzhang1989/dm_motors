@@ -1,0 +1,212 @@
+# Common configuration schema v2. Package and full launch filename select a profile.
+# nodes: defaults for direct executables; launches: arguments and per-component overrides.
+# Ports are explicit per instance; omitted CLI port arguments still disable dashboards.
+version: 2
+packages:
+  can_bus:
+    nodes:
+      can_bus_node:
+        backend: sim
+        port: ''
+        can_fd: false
+        can_bitrate: 1000000
+        io_rate: 1000.0
+        client_timeout: 0.5
+      dashboard:
+        bus_namespace: /can/main
+        host: 0.0.0.0
+        port: 8080
+    launches:
+      can_bus.launch.py:
+        parameters:
+          namespace: can/main
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8080
+      dashboard.launch.py:
+        parameters:
+          bus_namespace: /can/main
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8080
+  dm_motor_control:
+    nodes:
+      motor_node:
+        motor_name: motor
+        motor_id: 1
+        master_id: 0
+        can_bus_namespace: /can/main
+        can_fd: false
+        control_rate: 200.0
+        state_rate: 0.0
+        max_task_duration: 60.0
+        mode: 1
+        configure_mode_on_startup: false
+        profile: j4310_v12
+        legacy_control: false
+        direction: 1.0
+        software_offset: 0.0
+        watchdog_timeout: 0.2
+        command_timeout: 0.25
+        feedback_timeout: 0.1
+        position_limit: 0.0
+        velocity_limit: 0.0
+        torque_limit: 0.0
+        kp_limit: 500.0
+        kd_limit: 1.0
+        position_min: -1.7976931348623157e308
+        position_max: 1.7976931348623157e308
+        host_protection_enabled: false
+        measured_velocity_limit: 0.0
+        measured_torque_limit: 0.0
+        estimated_torque_limit: 0.0
+        mos_temperature_stop: 0.0
+        rotor_temperature_stop: 0.0
+        protection_samples: 3
+        fault_group: ''
+      dashboard:
+        motor_id: 1
+        host: 0.0.0.0
+        port: 8081
+        client_timeout: 0.75
+        command_timeout: 0.25
+    launches:
+      motor.launch.py:
+        parameters:
+          namespace: ''
+          start_can_bus: true
+          can_bus_namespace: ''
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8081
+      dashboard.launch.py:
+        parameters:
+          namespace: ''
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8081
+      bus.launch.py:
+        parameters:
+          namespace: ''
+          control_rate: ''
+          dashboard_host: 0.0.0.0
+          can_dashboard_ports:
+            main: 8080
+          motor_dashboard_ports:
+            motor_1: 8081
+            motor_2: 8082
+        system:
+          bus_names:
+          - main
+          motor_names:
+          - motor_1
+          - motor_2
+          buses:
+            main:
+              backend: serial
+              port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+          motors:
+            motor_1:
+              bus: main
+              motor_id: 1
+              configure_mode_on_startup: true
+            motor_2:
+              bus: main
+              motor_id: 2
+              configure_mode_on_startup: true
+  dm_motor_lead_follow:
+    nodes:
+      lead_follow_node:
+        leader: motor_1
+        follower: motor_2
+        swap_roles: false
+        direction: 1
+        rate: 100.0
+        kp: 8.0
+        kd: 0.5
+        feedback_timeout: 0.1
+        target_validity: 0.1
+        operator_timeout: 1.0
+        motion_limits_enabled: false
+        target_speed: 0.5
+        max_error: 0.5
+        max_travel: 2.0
+        max_speed: 2.0
+        max_torque: 3.0
+        max_temperature: 55.0
+      dashboard:
+        controller_namespace: lead_follow
+        host: 0.0.0.0
+        port: 8083
+    launches:
+      lead_follow.launch.py:
+        parameters:
+          namespace: ''
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8083
+      dashboard.launch.py:
+        parameters:
+          namespace: ''
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8083
+  dm_motor_bringup:
+    launches:
+      dual_motor.launch.py:
+        parameters:
+          namespace: ''
+          control_rate: ''
+          dashboard_host: 0.0.0.0
+          can_dashboard_ports:
+            main: 8080
+          motor_dashboard_ports:
+            motor_1: 8081
+            motor_2: 8082
+        system:
+          bus_names:
+          - main
+          motor_names:
+          - motor_1
+          - motor_2
+          buses:
+            main:
+              backend: serial
+              port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+          motors:
+            motor_1:
+              bus: main
+              motor_id: 1
+              configure_mode_on_startup: true
+            motor_2:
+              bus: main
+              motor_id: 2
+              configure_mode_on_startup: true
+      lead_follow.launch.py:
+        parameters:
+          namespace: ''
+          control_rate: ''
+          dashboard_host: 0.0.0.0
+          can_dashboard_ports:
+            main: 8080
+          motor_dashboard_ports:
+            motor_1: 8081
+            motor_2: 8082
+          dashboard_port: 8083
+        system:
+          bus_names:
+          - main
+          motor_names:
+          - motor_1
+          - motor_2
+          buses:
+            main:
+              backend: serial
+              port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+          motors:
+            motor_1:
+              bus: main
+              motor_id: 1
+              configure_mode_on_startup: true
+            motor_2:
+              bus: main
+              motor_id: 2
+              configure_mode_on_startup: true
+        nodes:
+          dm_motor_lead_follow:
+            lead_follow_node:
+              rate: 100.0

@@ -12,7 +12,7 @@ import unittest
 import sys
 import yaml
 
-from ament_index_python.packages import get_package_prefix
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
@@ -637,7 +637,7 @@ class SharedBusIntegration(unittest.TestCase):
             self.node.destroy_publisher(publisher)
             self.node.destroy_service(service)
 
-    def test_default_shared_launch_is_responsive_and_starts_disabled(self):
+    def test_explicit_simulated_shared_launch_is_responsive_and_starts_disabled(self):
         namespace = f"{self.namespace}_launch"
         states = {}
         subscriptions = [
@@ -648,7 +648,8 @@ class SharedBusIntegration(unittest.TestCase):
         ]
         log = tempfile.TemporaryFile(mode="w+")
         process = subprocess.Popen(
-            ["ros2", "launch", "dm_motor_control", "bus.launch.py", f"namespace:={namespace}"],
+            ["ros2", "launch", "dm_motor_control", "bus.launch.py", f"namespace:={namespace}",
+             "config:=" + str(Path(get_package_share_directory("dm_motor_control")) / "test/config/sim_bus.yaml")],
             stdout=log, stderr=subprocess.STDOUT)
         try:
             try:

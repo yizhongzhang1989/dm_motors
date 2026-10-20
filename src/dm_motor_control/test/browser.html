@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard 浏览器回归测试</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui; background: #0b111b; color: #e5edf8; }
+    body { margin: 24px; }
+    h1 { font-size: 22px; }
+    pre { white-space: pre-wrap; line-height: 1.7; padding: 20px; background: #141f2f; border-radius: 8px; }
+    button { padding: 10px 18px; font: inherit; cursor: pointer; }
+    iframe { display: block; margin-top: 16px; }
+    [data-status="passed"] { color: #8ce8b4; }
+    [data-status="failed"] { color: #ffb4bb; }
+  </style>
+</head>
+<body>
+  <h1>Dashboard 浏览器回归测试</h1>
+  <p>仅使用静态文件和模拟 API，不连接 ROS，不发送真实 CAN 帧。运行时请保持此页可见。</p>
+  <button id="run" type="button">重新运行</button>
+  <pre id="results" role="status">准备测试…</pre>
+  <script>
+    async function sources(base, files = ["index.html", "dashboard.js", "dashboard.css"]) {
+      return await Promise.all(files.map(async file => {
+        const response = await fetch(base + file, {cache: "no-store"});
+        if (!response.ok) throw new Error(`${file}: HTTP ${response.status}`);
+        return await response.text();
+      }));
+    }
+    async function run() {
+      const output = document.getElementById("results"), button = document.getElementById("run");
+      button.disabled = true;
+      output.dataset.status = "running";
+      output.textContent = "正在验证电机界面…";
+      try {
+        for (const source of await sources("", ["test_dashboard.js", "../../can_bus/test/test_dashboard.js"])) {
+          const script = document.createElement("script");
+          script.textContent = source;
+          document.head.append(script);
+          script.remove();
+        }
+        const motor = await runDashboardTests(...await sources("../web/"));
+        output.textContent = `电机：${motor.checks} 项断言通过。\n正在验证 CAN 界面…`;
+        const can = await runCanDashboardTests(...await sources("../../can_bus/web/"));
+        output.dataset.status = "passed";
+        output.textContent = JSON.stringify({motor, can, total: motor.checks + can.checks}, null, 2);
+      } catch (error) {
+        output.dataset.status = "failed";
+        output.textContent = error.stack || String(error);
+      } finally {
+        button.disabled = false;
+      }
+    }
+    document.getElementById("run").addEventListener("click", run);
+    void run();
+  </script>
+</body>
+</html>

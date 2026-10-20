@@ -1,4 +1,5 @@
 #include "dm_motor_lead_follow/follow.hpp"
+#include "common/config.hpp"
 
 #include <array>
 #include <chrono>
@@ -55,14 +56,16 @@ class LeadFollowNode final : public rclcpp::Node
 public:
   LeadFollowNode() : Node("lead_follow")
   {
+    const common::Config defaults(
+      declare_parameter<std::string>("config_file", common::default_config_path()));
     rcl_interfaces::msg::ParameterDescriptor fixed;
     fixed.read_only = true;
-    axes_[0].name = declare_parameter<std::string>("leader", "motor_1", fixed);
-    axes_[1].name = declare_parameter<std::string>("follower", "motor_2", fixed);
-    rate_ = declare_parameter<double>("rate", 100.0, fixed);
-    feedback_timeout_ = declare_parameter<double>("feedback_timeout", 0.1, fixed);
-    validity_ = declare_parameter<double>("target_validity", 0.1, fixed);
-    operator_timeout_ = declare_parameter<double>("operator_timeout", 1.0, fixed);
+    axes_[0].name = declare_parameter<std::string>("leader", defaults.get<std::string>("packages.dm_motor_lead_follow.nodes.lead_follow_node.leader"), fixed);
+    axes_[1].name = declare_parameter<std::string>("follower", defaults.get<std::string>("packages.dm_motor_lead_follow.nodes.lead_follow_node.follower"), fixed);
+    rate_ = declare_parameter<double>("rate", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.rate"), fixed);
+    feedback_timeout_ = declare_parameter<double>("feedback_timeout", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.feedback_timeout"), fixed);
+    validity_ = declare_parameter<double>("target_validity", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.target_validity"), fixed);
+    operator_timeout_ = declare_parameter<double>("operator_timeout", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.operator_timeout"), fixed);
     if (!std::isfinite(operator_timeout_) || operator_timeout_ < 0.3 || operator_timeout_ > 5) {
       throw std::invalid_argument("operator_timeout must be 0.3..5 seconds");
     }
@@ -75,21 +78,21 @@ public:
     if (get_parameter("use_sim_time").as_bool()) {
       throw std::invalid_argument("lead_follow requires the system ROS clock, not use_sim_time");
     }
-    const auto direction = declare_parameter<int64_t>("direction", 1);
+    const auto direction = declare_parameter<int64_t>("direction", defaults.get<int64_t>("packages.dm_motor_lead_follow.nodes.lead_follow_node.direction"));
     if (direction != 1 && direction != -1) {
       throw std::invalid_argument("direction must be 1 or -1");
     }
     settings_.direction = static_cast<int>(direction);
-    swap_roles_ = declare_parameter<bool>("swap_roles", false);
-    settings_.kp = declare_parameter<double>("kp", 8.0);
-    settings_.kd = declare_parameter<double>("kd", 0.5);
-    settings_.motion_limits_enabled = declare_parameter<bool>("motion_limits_enabled", false);
-    settings_.target_speed = declare_parameter<double>("target_speed", 0.5);
-    settings_.max_error = declare_parameter<double>("max_error", 0.5);
-    settings_.max_travel = declare_parameter<double>("max_travel", 2.0);
-    settings_.max_speed = declare_parameter<double>("max_speed", 2.0);
-    settings_.max_torque = declare_parameter<double>("max_torque", 3.0);
-    settings_.max_temperature = declare_parameter<double>("max_temperature", 55.0);
+    swap_roles_ = declare_parameter<bool>("swap_roles", defaults.get<bool>("packages.dm_motor_lead_follow.nodes.lead_follow_node.swap_roles"));
+    settings_.kp = declare_parameter<double>("kp", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.kp"));
+    settings_.kd = declare_parameter<double>("kd", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.kd"));
+    settings_.motion_limits_enabled = declare_parameter<bool>("motion_limits_enabled", defaults.get<bool>("packages.dm_motor_lead_follow.nodes.lead_follow_node.motion_limits_enabled"));
+    settings_.target_speed = declare_parameter<double>("target_speed", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.target_speed"));
+    settings_.max_error = declare_parameter<double>("max_error", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.max_error"));
+    settings_.max_travel = declare_parameter<double>("max_travel", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.max_travel"));
+    settings_.max_speed = declare_parameter<double>("max_speed", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.max_speed"));
+    settings_.max_torque = declare_parameter<double>("max_torque", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.max_torque"));
+    settings_.max_temperature = declare_parameter<double>("max_temperature", defaults.get<double>("packages.dm_motor_lead_follow.nodes.lead_follow_node.max_temperature"));
     settings_.validate();
     std::ostringstream identity;
     std::random_device random;

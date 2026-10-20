@@ -25,38 +25,42 @@ colcon build --packages-up-to dm_motor_bringup --symlink-install \
   --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
 
-# 真实 CAN、两台电机、三个通用 dashboard、独立主从面板和控制器；不自动使能
-ros2 launch dm_motor_bringup lead_follow.launch.py
-# 只关闭通用面板：dashboards:=false；完全无网页：再加 follow_dashboard:=false
+# 显式选择四个面板；不自动使能
+ros2 launch dm_motor_bringup lead_follow.launch.py \
+  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+# 省略全部端口则只启动 CAN、电机和主从节点，不启动任何面板
 ```
 
 如果已经启动电机系统，**只添加控制器，不要重复启动总线/电机**：
 
 ```bash
-ros2 launch dm_motor_lead_follow lead_follow.launch.py
+ros2 launch dm_motor_lead_follow lead_follow.launch.py dashboard_port:=config
 # 部署前缀与电机系统相同；角色交换示例
 ros2 launch dm_motor_lead_follow lead_follow.launch.py namespace:=robot \
-  leader:=motor_2 follower:=motor_1
+  leader:=motor_2 follower:=motor_1 dashboard_port:=config
 ```
 
 `leader` / `follower` 是相对于 `namespace` 的电机命名空间，也接受绝对路径。
-`follow_config:=/绝对路径/配置.yaml` 可覆盖控制器配置；角色由 launch 参数选择。
-直接 `ros2 run dm_motor_lead_follow lead_follow_node --ros-args --params-file ...` 时，
-角色读取 YAML。总线配置仍用 bringup 的 `config` 参数，不和 `follow_config` 混用。
+运行默认值统一来自 [config/dm_motors.yaml](../../config/dm_motors.yaml) 中
+`packages.dm_motor_lead_follow.nodes.lead_follow_node`，再应用所选 package/launch 的覆盖。
+端口由当前入口的 `parameters.dashboard_port` 单独定义，不再有 `follow_config` 或独立主从参数文件。
+`config_file:=/绝对路径/配置.yaml` 可覆盖整套配置；角色等显式 launch 参数具有更高优先级。
+直接运行节点也可使用 `--ros-args -p config_file:=...`，或环境变量 `COMMON_CONFIG`。
+旧 ROS 拓扑覆盖文件使用 `config:=...`，仅用于显式测试等场景，不和公共 `config_file` 混用。
 
 真机应先依照工作空间主 README 完成供电、安装、物理停止和单机保护检查，再启动：
 
 ```bash
-ros2 launch dm_motor_bringup lead_follow.launch.py
-# 完全无网页模式：
-# ros2 launch dm_motor_bringup lead_follow.launch.py dashboards:=false follow_dashboard:=false
+ros2 launch dm_motor_bringup lead_follow.launch.py dashboard_port:=config
+# 完全无网页：省略 dashboard_port（以及其它面板端口参数）
 ```
 
-该入口默认读取 `dm_motor_control/config/dual_serial.yaml`，一次启动真实 CAN 服务、
-两台电机、原有三个通用 dashboard、独立主从面板和控制器，不启动协议模拟器。
+该入口读取 `packages.dm_motor_bringup.launches["lead_follow.launch.py"]` 的 `system` 拓扑，
+一次启动真实 CAN 服务、
+两台电机和主从控制器；以上命令仅显式开启主从面板，不启动其它面板或协议模拟器。
 连接前核对该配置中的串口路径、电机 ID 和通信参数；
-自定义总线配置可通过 `config:=/绝对路径/配置.yaml` 指定。
-支持 `namespace`、`leader`、`follower`、`follow_config` 和 dashboard 参数。
+自定义整套参数通过 `config_file:=/绝对路径/配置.yaml` 指定。
+支持 `namespace`、`leader`、`follower` 和 dashboard 参数。
 bringup 只保留无 `_hardware` 后缀的真机入口，不再提供单独的仿真 launch。
 离线回归继续通过显式模拟配置运行，不代表默认启动会使用模拟器。
 如果真机电机系统已运行，仍只启动上面的独立控制器入口，不要重复启动总线。
@@ -89,9 +93,9 @@ ros2 service call /lead_follow/stop std_srvs/srv/Trigger '{}'
 最后接受的有效目标生效，主从下一个周期可能覆盖手动目标，必须由用户自行协调输入源。
 任何来源显式停止一台后，主从控制器会停止另一台。
 其他控制者使一台失能后，跟随控制器将停止另一台。
-独立 [Lead Follow Dashboard](../dm_motor_lead_follow_dashboard/README.md) 默认位于
-<http://127.0.0.1:8083/>，支持统一开始/停止、主从交换、方向、增益与运动限制配置。
-所有 Dashboard 默认监听 `0.0.0.0`，其它机器可将上述地址替换为服务主机的局域网 IP，
+包内 [Lead Follow Dashboard](DASHBOARD.md) 使用 `dashboard_port:=config` 后默认位于
+<http://127.0.0.1:8083/>，省略端口则不启动；支持统一开始/停止、主从交换、方向、增益与运动限制配置。
+开启的 Dashboard 默认监听 `0.0.0.0`，其它机器可将上述地址替换为服务主机的局域网 IP，
 不需要额外指定 host。网络和防火墙仍须允许访问，仅用于可信内网。
 它不改变三个通用面板。通过该面板开始时，关闭/隐藏控制页面或面板进程失联会触发操作心跳停止。
 通过上述 CLI Trigger 开始的跟随不要求网页心跳，关闭原有通用网页**不会**停止，必须显式调用 stop。
@@ -100,7 +104,7 @@ ros2 service call /lead_follow/stop std_srvs/srv/Trigger '{}'
 
 ## 参数
 
-默认值见 [config/lead_follow.yaml](config/lead_follow.yaml)。
+默认值见唯一运行配置 [config/dm_motors.yaml](../../config/dm_motors.yaml)。
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
