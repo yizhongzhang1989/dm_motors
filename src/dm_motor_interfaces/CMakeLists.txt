@@ -9,6 +9,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MotorFeedback.msg"
   "msg/MotorRequest.msg" "msg/MotorReply.msg"
   "msg/MotorConfiguration.msg"
+  "msg/LeadFollowState.msg"
+  "srv/LeadFollowControl.srv"
   "msg/MotorTask.msg" "msg/MotorTaskFeedback.msg" "msg/MotorTaskResult.msg" "msg/MotorTaskEvent.msg"
   DEPENDENCIES std_msgs)
 ament_export_dependencies(rosidl_default_runtime)

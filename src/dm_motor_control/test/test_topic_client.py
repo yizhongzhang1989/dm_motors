@@ -88,6 +88,16 @@ class TopicTransportTests(unittest.TestCase):
         self.assertFalse(self.transport.pending)
         self.transport.targets.publish.assert_called_once()
 
+    def test_tokenless_target_helpers_preserve_streaming_semantics(self):
+        target = MotorSetpoint(sequence=1, valid_for=0.1)
+        self.transport.publish_target(target)
+        self.assertFalse(target.hold_until_lease_expiry)
+        self.transport.endpoint("target").call_async(MotorSetpoint(sequence=2, valid_for=0.1))
+        request = self.transport.targets.publish.call_args.args[0]
+        self.assertFalse(request.hold_until_lease_expiry)
+        self.assertEqual(request.token, "")
+        self.assertEqual(request.valid_for, 0.1)
+
     def test_missing_control_reply_is_explicitly_unknown(self):
         future = self.transport.endpoint("operation").call_async(
             MotorRequest(operation=MotorRequest.ENABLE, token="lease"))

@@ -147,7 +147,7 @@ class RosIntegration(unittest.TestCase):
         self.enable()
         self.publish(0.1)
         self.wait(lambda: self.state.phase == MotorState.FAULT and self.state.status == 0)
-        self.assertEqual(self.state.error, "command publisher timeout")
+        self.assertIn("command publisher timeout", self.state.error)
         response = self.enable_client.call_async(SetBool.Request(data=True))
         self.wait(response.done)
         self.assertFalse(response.result().success)
@@ -233,7 +233,10 @@ class RosIntegration(unittest.TestCase):
                 self.assertLess(html.index('id="status-panel"'), html.index('id="workspace"'))
                 self.assertLess(html.index('id="plot-panel"'), html.index('id="control-panel"'))
                 self.assertLess(html.index('id="chart"'), html.index('id="control-panel"'))
-                self.assertGreater(html.index('id="enable"'), html.index('id="control-panel"'))
+                self.assertLess(html.index('id="enable"'), html.index('</header>'))
+                self.assertLess(html.index('id="stop"'), html.index('</header>'))
+                for removed in ("connect", "claim", "release", "disconnect", "quick-stop"):
+                    self.assertNotIn(f'id="{removed}"', html)
                 for element_id in ("status-panel", "workspace", "plot-panel", "control-panel",
                                    "chart", "enable", "stop", "reset", "target-form", "notice"):
                     self.assertEqual(html.count(f'id="{element_id}"'), 1)
@@ -308,7 +311,9 @@ class RosIntegration(unittest.TestCase):
             code, body = self.http(base, "session", {})
             self.assertEqual(code, 200)
             session = body["session"]
-            self.assertEqual(self.http(base, "session", {})[0], 409)
+            code, shared = self.http(base, "session", {})
+            self.assertEqual(code, 200)
+            self.assertEqual(shared["session"], session)
             self.assertEqual(self.http(base, "heartbeat", {}, "other-session")[0], 409)
             self.assertEqual(self.http(base, "target",
                                       {"torque": float("nan")}, session)[0], 400)
@@ -357,14 +362,14 @@ class RosIntegration(unittest.TestCase):
             self.assertFalse(web.armed)
             self.assertEqual(web.target, web.neutral_target())
 
-    def test_13_driver_lease_exclusion_and_browser_expiry(self):
+    def test_13_nonexclusive_sessions_and_browser_expiry_preserve_monitoring(self):
         external = self.call(self.lease_client, ControlLease.Request(
             operation=ControlLease.Request.ACQUIRE, owner="external-test", duration=1.0))
         try:
             with self.web_dashboard() as (web, base):
                 code, body = self.http(base, "session", {})
-                self.assertEqual(code, 409, body)
-                self.assertIsNone(web.owner)
+                self.assertEqual(code, 200, body)
+                self.assertIsNotNone(web.owner)
         finally:
             self.call(self.lease_client, ControlLease.Request(
                 operation=ControlLease.Request.RELEASE, token=external.token))
@@ -376,10 +381,7 @@ class RosIntegration(unittest.TestCase):
                                            owner="external-test", duration=1.0)
             future = self.lease_client.call_async(request)
             self.wait(future.done)
-            self.assertFalse(future.result().success)
-            future = self.enable_client.call_async(SetBool.Request(data=True))
-            self.wait(future.done)
-            self.assertFalse(future.result().success, "Legacy enable must not bypass explicit lease")
+            self.assertTrue(future.result().success)
             started = time.monotonic()
             self.wait(lambda: time.monotonic() - started > 1.2,
                       action=lambda: self.http(base, "heartbeat", {}, session))
@@ -390,7 +392,7 @@ class RosIntegration(unittest.TestCase):
             self.assertIsInstance(snapshot["state"]["requested_target"], dict)
             self.wait(lambda: web.owner is None)
             self.assertEqual(self.http(base, "heartbeat", {}, session)[0], 409)
-            self.wait(lambda: web.stop_future is not None and web.stop_future.done())
+            self.assertIsNone(web.stop_future, "Observing browser expiry must not issue global STOP")
             previous_count = self.state.feedback_count
             self.wait(lambda: self.state.phase == MotorState.DISABLED and
                       self.state.status == 0 and self.state.feedback_fresh and
@@ -521,7 +523,6 @@ class RosIntegration(unittest.TestCase):
                 code, response = self.http(base, "task", task, session)
                 self.assertEqual(code, 200, response)
                 self.wait(lambda: web.task["state"] == "running", action=heartbeat)
-                self.assertEqual(self.http(base, "target", target, session)[0], 409)
                 if cancel:
                     self.assertEqual(self.http(base, "stop", {})[0], 200)
                     self.wait(lambda: web.task["state"] == "stopped", action=heartbeat)

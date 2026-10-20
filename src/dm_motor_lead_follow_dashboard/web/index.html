@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Lead Follow · 主从控制</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <header>
+    <div><div class="eyebrow">DAMIAO / LEAD FOLLOW</div><h1>主从跟随控制</h1>
+      <p>独立主从控制面板 · 保留启动位置偏置 · 不自动使能</p></div>
+    <div class="header-actions"><span id="phase" class="badge" role="status">正在连接</span>
+      <div class="run-actions" role="group" aria-label="主从开始与停止">
+        <button id="start" type="submit" form="settings" class="primary" disabled>开始</button>
+        <button id="stop" type="button" class="danger">停止 <kbd>Space</kbd></button>
+      </div>
+    </div>
+  </header>
+  <div id="notice" role="status" aria-live="polite">正在读取控制器状态…</div>
+  <main>
+    <section class="panel controls" aria-labelledby="control-title">
+      <div class="section-title"><h2 id="control-title">控制与配置</h2><span id="environment" class="badge">—</span></div>
+      <p id="availability" class="availability" role="status">等待设备状态…</p>
+      <form id="settings">
+        <fieldset id="edit-fields" disabled>
+          <label for="swap_roles">主电机 / 从电机</label>
+          <select id="swap_roles" name="swap_roles"><option value="false">正在读取电机…</option><option value="true">交换主从</option></select>
+          <label for="direction">跟随方向（逻辑坐标）</label>
+          <select id="direction" name="direction"><option value="1">同向 +1</option><option value="-1">反向 −1</option></select>
+          <div class="fields">
+            <label>Kp <span>Nm/rad</span><input id="kp" name="kp" type="number" min="0.1" max="500" step="any" required></label>
+            <label>Kd <span>Nm/(rad/s)</span><input id="kd" name="kd" type="number" min="0" max="5" step="any" required></label>
+          </div>
+          <label class="toggle"><input id="motion_limits_enabled" name="motion_limits_enabled" type="checkbox">启用额外运动限制</label>
+          <p class="hint">关闭后不限制跟随斜率、误差和额外运动阈值；驱动保护、反馈与关节范围检查始终有效。</p>
+          <fieldset id="limit-fields">
+            <div class="fields">
+              <label>目标速度 <span>rad/s</span><input id="target_speed" name="target_speed" type="number" min="0.001" step="any" required></label>
+              <label>最大误差 <span>rad</span><input id="max_error" name="max_error" type="number" min="0.001" step="any" required></label>
+              <label>相对行程 <span>rad</span><input id="max_travel" name="max_travel" type="number" min="0.001" step="any" required></label>
+              <label>反馈速度 <span>rad/s</span><input id="max_speed" name="max_speed" type="number" min="0.001" step="any" required></label>
+              <label>反馈力矩 <span>Nm</span><input id="max_torque" name="max_torque" type="number" min="0.001" step="any" required></label>
+              <label>停止温度 <span>°C</span><input id="max_temperature" name="max_temperature" type="number" min="1" step="any" required></label>
+            </div>
+          </fieldset>
+        </fieldset>
+        <p id="dirty" class="hint">配置来自控制器</p>
+      </form>
+      <div class="safety"><strong>离开控制页面会停止</strong>
+        <p>点击右上角「开始」将直接提交当前配置并请求使能，无需先启用网页操作，也不再二次确认。操作前请确认现场安全。</p>
+        <p>隐藏/关闭本页、心跳丢失或面板进程退出，将停止本页启动的跟随。停止完成以反馈确认为准。</p>
+        <p>真机先确认固定、供电及物理断电条件；不设控制权互斥，最新有效目标生效。请自行协调单机、主从和 Topic 发送源，避免交替目标。</p></div>
+    </section>
+    <div class="telemetry">
+      <section class="motor-grid" aria-label="双电机反馈">
+        <article class="panel motor leader"><div class="section-title"><h2>主电机</h2><span id="leader-status" class="badge">—</span></div>
+          <p id="leader-name" class="motor-name">—</p><div class="position"><b id="leader-position">—</b><span>rad</span></div>
+          <dl><dt>速度 / rad/s</dt><dd id="leader-velocity">—</dd><dt>力矩 / Nm</dt><dd id="leader-torque">—</dd>
+            <dt>MOS / 转子温度</dt><dd id="leader-temperature">—</dd><dt>反馈频率 / Hz</dt><dd id="leader-rate">—</dd>
+            <dt>反馈年龄 / ms</dt><dd id="leader-age">—</dd>
+            <dt>最近输入源</dt><dd id="leader-owner" class="control-owner">—</dd></dl></article>
+        <article class="panel motor follower"><div class="section-title"><h2>从电机</h2><span id="follower-status" class="badge">—</span></div>
+          <p id="follower-name" class="motor-name">—</p><div class="position"><b id="follower-position">—</b><span>rad</span></div>
+          <dl><dt>速度 / rad/s</dt><dd id="follower-velocity">—</dd><dt>力矩 / Nm</dt><dd id="follower-torque">—</dd>
+            <dt>MOS / 转子温度</dt><dd id="follower-temperature">—</dd><dt>反馈频率 / Hz</dt><dd id="follower-rate">—</dd>
+            <dt>反馈年龄 / ms</dt><dd id="follower-age">—</dd>
+            <dt>最近输入源</dt><dd id="follower-owner" class="control-owner">—</dd></dl></article>
+      </section>
+      <section class="panel">
+        <div class="section-title"><h2>位置跟随</h2><span id="rate" class="muted">—</span></div>
+        <div class="metrics"><div><span>理想目标 / rad</span><b id="ideal">—</b></div>
+          <div><span>发送目标 / rad</span><b id="target">—</b></div><div><span>跟随误差 / rad</span><b id="error">—</b></div></div>
+        <div class="legend"><span class="cyan">映射后的主位置</span><span class="violet">从反馈</span><span class="amber">发送目标</span></div>
+        <canvas id="chart" height="240" aria-label="理想目标、从电机反馈和发送目标的历史曲线"></canvas>
+        <p id="origins" class="hint">从目标 = 从启动位置 + 方向 ×（主反馈 − 主启动位置）</p>
+      </section>
+      <section class="panel"><div class="section-title"><h2>控制器与事件</h2><span id="controller" class="muted">—</span></div>
+        <p id="controller-message">等待控制器反馈</p><ol id="events" aria-label="最近事件"></ol></section>
+    </div>
+  </main>
+  <footer>本面板只控制 Lead Follow。CAN 与单电机 Dashboard 保持独立、通用。<span id="connection">等待连接</span></footer>
+</body>
+</html>

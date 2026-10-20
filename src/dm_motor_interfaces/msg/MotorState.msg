@@ -36,7 +36,10 @@ uint64 deadline_misses
 string name
 uint8 mode
 bool ready
+# Deprecated compatibility field, always empty (no exclusive command owner).
 string control_owner
+# Last accepted input source, for observation only; never an exclusive owner.
+string active_source
 float64 lease_remaining
 bool task_active
 float64 native_position

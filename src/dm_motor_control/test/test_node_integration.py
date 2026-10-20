@@ -200,7 +200,7 @@ class SharedBusIntegration(unittest.TestCase):
         allowed_writes = {24, 25, 26, 27, 28, 31, 32, 33, 34}
         self.assertEqual({item.address for item in caps.registers if item.raw_write_allowed},
                          allowed_writes)
-        self.assertFalse(caps.legacy_control)
+        self.assertTrue(caps.legacy_control)
         response = self.call("left", "registers", RegisterAccess.Request(addresses=[0x15, 0x3C]))
         values = [self.result("left", op) for op in response.operation_ids]
         self.assertTrue(all(v.state == GetOperation.Response.CONFIRMED for v in values),
@@ -254,15 +254,40 @@ class SharedBusIntegration(unittest.TestCase):
                   self.states["left"].phase in (MotorState.DISABLED, MotorState.FAULT), timeout=2)
         self.assertFalse(self.states["left"].target_active)
 
-    def test_lease_exclusion_and_unauthorized_target(self):
-        self.call("left", "control_lease", ControlLease.Request(
-            operation=ControlLease.Request.ACQUIRE, owner="second", duration=1.0), success=False)
+    def test_sessions_are_nonexclusive_and_streams_need_no_token(self):
+        second = self.call("left", "control_lease", ControlLease.Request(
+            operation=ControlLease.Request.ACQUIRE, owner="second", duration=1.0)).token
         self.enable("left")
         start_count = self.states["left"].rejected_commands
-        self.publish("left", MotorTarget(mode=1, torque=1.0), token="invalid")
-        self.wait(lambda: self.states["left"].rejected_commands > start_count)
+        self.publish("left", MotorTarget(mode=1, torque=0.1), token="not-an-authorization-token")
+        self.wait(lambda: self.states["left"].active_target.torque == 0.1)
+        self.call("left", "control_lease", ControlLease.Request(
+            operation=ControlLease.Request.RELEASE, token=second))
         self.assertEqual(self.states["left"].phase, MotorState.ENABLED)
-        self.assertLess(abs(self.states["left"].torque), 0.02)
+        self.assertEqual(self.states["left"].rejected_commands, start_count)
+        self.assertEqual(self.states["left"].control_owner, "")
+
+    def test_direct_manual_target_replaces_internal_task_without_stopping(self):
+        self.enable("left")
+        goal = RunTask.Goal(
+            token=self.tokens["left"], kind=RunTask.Goal.TORQUE,
+            target=MotorTarget(mode=1, torque=0.02), duration=2.0,
+            max_velocity=1.0, max_acceleration=2.0, tolerance=0.03,
+            settling_time=0.1, ramp_time=0.1)
+        future = self.actions["left"].send_goal_async(goal)
+        self.wait(future.done)
+        handle = future.result()
+        self.assertTrue(handle.accepted)
+        self.wait(lambda: self.states["left"].task_active)
+        result = handle.get_result_async()
+        self.wait(lambda: self.states["left"].active_target.torque == -0.02,
+                  action=lambda: self.publish("left", MotorTarget(mode=1, torque=-0.02), token="direct"))
+        self.wait(result.done, action=lambda: self.publish(
+            "left", MotorTarget(mode=1, torque=-0.02), token="direct"))
+        self.assertFalse(result.result().result.success)
+        self.assertIn("Superseded", result.result().result.message)
+        self.assertEqual(self.states["left"].phase, MotorState.ENABLED)
+        self.assertFalse(self.states["left"].task_active)
 
     def test_shared_bus_modes_and_direction(self):
         for mode in (2, 3, 4, 1):

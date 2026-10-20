@@ -27,14 +27,11 @@
         </div>
       </section>
       <div class="header-actions">
-        <details class="connection-menu"><summary aria-label="连接管理" title="连接管理">连接</summary><div class="connection-options">
-          <span id="connection" class="badge">未连接</span>
-          <button id="connect">连接并获取控制权</button>
-          <button id="claim" class="secondary" disabled>获取控制权</button>
-          <button id="disconnect" class="secondary" disabled>断开</button>
-          <div id="endpoint" class="subtle"></div>
-        </div></details>
-        <button id="quick-stop" class="danger" disabled>STOP / 失能 <kbd>Esc</kbd></button>
+        <span id="connection" class="badge" role="status">连接中</span>
+        <div class="power-actions" role="group" aria-label="电机使能与失能">
+          <button id="enable" disabled title="显式使能，中性目标启动，不恢复旧目标">使能</button>
+          <button id="stop" class="danger" title="停止当前输出并失能，快捷键 Esc">失能 <kbd>Esc</kbd></button>
+        </div>
       </div>
     </header>
     <div id="health-banner" class="health-banner" role="status">等待驱动连接；不会自动使能或运动。</div>
@@ -55,6 +52,7 @@
         <span id="absolute-valid" class="badge">连续位置待确认</span>
         <span id="control-owner" class="subtle">无控制权</span>
       </div>
+      <p id="endpoint" class="subtle"></p>
       <p id="telemetry" class="subtle">连接后显示实际反馈频率、CAN ID 和控制周期。</p>
       <div class="monitor-grid">
         <div><h3>位置与坐标</h3><dl id="position-data" class="data-grid"></dl></div>
@@ -84,8 +82,6 @@
     <section id="control-panel" class="panel control-panel" aria-label="电机控制">
       <div class="section-heading"><h2>电机控制</h2><span id="current-mode" class="subtle">等待模式</span></div>
       <div class="motor-actions">
-        <button id="enable" disabled>使能（中性目标）</button>
-        <button id="stop" class="danger" disabled>STOP / 失能</button>
         <button id="reset" class="secondary" disabled>复位主机故障</button>
         <div class="zero-actions" role="group" aria-label="设置零位">
           <button id="device-zero" type="button" class="secondary" aria-describedby="zero-operation-status" title="把当前位置设为电机设备零点，修改设备坐标基准；不是运动回零。需已失能。" disabled>设置设备零位</button>
@@ -247,7 +243,7 @@
     </section>
     <footer>浏览器失联、页面关闭或隐藏会停止本会话输出并请求失能。软件停止不是硬件急停。
       本服务无登录鉴权，任何能够访问的机器都可以控制，仅用于可信隔离网络。
-      跨网访问请用 VPN 或防火墙限制来源；HTTPS 仅加密，不提供访问控制。浏览器控制权绑定驱动租约，其它 ROS 控制源必须先取得同一驱动的独占租约。</footer>
+      跨网访问请用 VPN 或防火墙限制来源；HTTPS 仅加密，不提供访问控制。不设排他控制权：面板、主从和 Topic 都可发命令，最后接受的有效目标生效。请自行协调发送源；STOP 对所有来源生效。</footer>
   </main>
 </body>
 </html>

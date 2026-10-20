@@ -164,7 +164,7 @@ class MotorTopics:
             message = copy.deepcopy(request)
             message.client_id = self.client_id
             message.request_id = request_id
-            message.hold_until_lease_expiry = True
+            message.hold_until_lease_expiry = bool(message.token) or message.hold_until_lease_expiry
             publisher = self.targets
         else:
             message = MotorRequest()
@@ -190,7 +190,7 @@ class MotorTopics:
     def publish_target(self, message):
         if not self.targets.get_subscription_count():
             raise RuntimeError("Motor target topic subscriber unavailable.")
-        message.hold_until_lease_expiry = True
+        message.hold_until_lease_expiry = bool(message.token) or message.hold_until_lease_expiry
         message.client_id = self.client_id
         message.request_id = self.next_id()
         self.targets.publish(message)

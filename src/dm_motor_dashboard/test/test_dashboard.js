@@ -61,6 +61,8 @@ async function runDashboardTests(html, source, css) {
   let failStop = false;
   let holdTarget = false;
   let releaseTarget = null;
+  let holdSession = false;
+  let releaseSession = null;
   const intervals = [];
   const resizeObservers = [];
   win.addEventListener("error", (event) => errors.push(event.message));
@@ -168,6 +170,9 @@ async function runDashboardTests(html, source, css) {
     if (path === "target" && holdTarget) {
       return await new Promise(resolve => { releaseTarget = () => resolve(response); });
     }
+    if (path === "session" && holdSession) {
+      return await new Promise(resolve => { releaseSession = () => resolve(response); });
+    }
     if (["124", "125"].includes(path) && holdOperation) {
       return await new Promise(resolve => { releaseOperation = () => resolve(response); });
     }
@@ -219,9 +224,18 @@ async function runDashboardTests(html, source, css) {
   };
   const targetCount = () => requests.filter((request) => request.path === "target").length;
   try {
+    failState = true;
     win.eval(source);
     await settle();
+    assert(el("connection").textContent === "重连中" && !el("stop").disabled && el("enable").disabled,
+      "Initial connection failure keeps STOP available and schedules automatic observation retry");
+    failState = false;
+    await poll();
     await layout();
+    assert(!requests.some(request => ["session", "enable", "target"].includes(request.path)),
+      "Opening the page only observes; no session, enable or target is sent");
+    assert(["connect", "claim", "release", "disconnect", "quick-stop"].every(id => !el(id)),
+      "Connection/session controls and duplicate STOP are removed");
     assert(!el("target-position").disabled, "Owner can prepare disabled-motor drafts");
     assert(!doc.querySelector("dialog"), "Dashboard commands have no second-confirmation dialog");
     snapshot.state.activity_available = false;
@@ -262,8 +276,12 @@ async function runDashboardTests(html, source, css) {
     singleRow("Desktop header");
     const readoutFont = parseFloat(win.getComputedStyle(el("position")).fontSize);
     assert(readoutFont >= 26, "The single-row layout uses larger, readable desktop values");
-    assert(doc.querySelector(".connection-options").contains(el("connection")),
-      "Full connection status remains available inside the connection menu");
+    assert(doc.querySelector(".header-actions").contains(el("connection")),
+      "Online status is visible without a connection menu");
+    assert(doc.querySelector(".power-actions").contains(el("enable"))
+      && doc.querySelector(".power-actions").contains(el("stop"))
+      && !el("control-panel").contains(el("enable")),
+      "Enable and disable are grouped exclusively in the top-right header");
     assert(el("status-panel").tabIndex === 0, "The narrow-screen telemetry scroller is keyboard focusable");
     assert(el("phase").textContent === "SIM · DISABLED" && el("phase").title.includes("SIMULATION"),
       "The compact phase label retains its complete environment and phase in the tooltip");
@@ -637,10 +655,10 @@ async function runDashboardTests(html, source, css) {
     assert(requests.filter(r => r.path === "register-write").length === 1
       && requests.some(r => r.path === "register-write" && r.body.value === 2),
       "A single parameter-write click submits immediately without a confirmation step");
-    assert(el("write-parameter").disabled && !el("quick-stop").disabled,
+    assert(el("write-parameter").disabled && !el("stop").disabled,
       "Only duplicate writes are blocked while device readback is pending; STOP remains available");
     const pendingOperationStops = requests.filter(r => r.path === "stop").length;
-    el("quick-stop").click();
+    el("stop").click();
     await settle();
     assert(requests.filter(r => r.path === "stop").length === pendingOperationStops + 1,
       "Header STOP submits immediately while a write is awaiting device readback");
@@ -685,7 +703,7 @@ async function runDashboardTests(html, source, css) {
     holdOperation = true;
     el("device-zero").click(); await settle();
     assert(el("zero-operation-status").textContent.includes("提交中")
-      && el("device-zero").disabled && el("software-zero").disabled && !el("quick-stop").disabled,
+      && el("device-zero").disabled && el("software-zero").disabled && !el("stop").disabled,
       "A pending zero operation has visible progress and prevents duplicate submissions without blocking STOP");
     el("device-zero").click(); el("software-zero").click(); await settle();
     assert(requests.filter(r => r.path === "operation").length === zeroRequests + 1,
@@ -967,10 +985,10 @@ async function runDashboardTests(html, source, css) {
     const task = requests.find(r => r.path === "task").body;
     assert(task.kind === "torque" && task.target.torque === 0.02, "Task uses explicit current target draft");
     assert(task.amplitude === 0 && task.frequency === 0 && task.ramp_time > 0, "Only applicable task fields enabled");
-    assert(el("apply").disabled && !el("cancel-task").disabled, "Task owns output and can be cancelled");
-    assert(el("position-scroll").getAttribute("aria-disabled") === "true", "Tasks disable live position scrolling");
+    assert(!el("apply").disabled && !el("cancel-task").disabled, "Task can be replaced by manual output or cancelled");
+    assert(el("position-scroll").getAttribute("aria-disabled") === "false", "Tasks do not own the manual input path");
     assert(el("task-progress").value === 0.5, "Task progress displayed");
-    assert(fields.every(field => el(`target-${field}`).disabled), "Running tasks lock all manual fields, not only the wheel");
+    assert(fields.every(field => !el(`target-${field}`).disabled), "Running tasks do not exclude manual command editing");
     el("tab-control").click();
     assert(!el("task-shortcut").hidden, "An active task remains visible outside its tab");
     el("task-shortcut").click();
@@ -1037,7 +1055,7 @@ async function runDashboardTests(html, source, css) {
     el("start-task").click(); await settle();
     assert(requests.filter(r => r.path === "task").length === invalidTasks && el("notice").textContent.includes("轨迹"),
       "Invalid trajectory input is rejected with globally visible feedback");
-    el("quick-stop").click(); await settle(); await poll();
+    el("stop").click(); await settle(); await poll();
     el("tab-control").click();
     assert(el("event-log").children.length > 0, "Operator events retained");
     el("pause-chart").click();
@@ -1156,16 +1174,14 @@ async function runDashboardTests(html, source, css) {
     snapshot.state.feedback_fresh = true;
     snapshot.has_control = false;
     await poll();
-    assert(el("target-position").disabled && el("restore-target").disabled, "Read-only client cannot edit");
-    assert(el("device-zero").disabled && el("software-zero").disabled, "Read-only clients cannot change either zero reference");
-    el("claim").click();
-    await settle();
+    assert(!el("target-position").disabled && !el("restore-target").disabled,
+      "Fresh feedback allows draft editing without a manual connection/session button");
+    const lazyClaims = requests.filter(r => r.path === "session").length;
+    const lazyTargets = targetCount();
     edit("target-kp", 2);
-    snapshot.has_control = false;
     await poll();
-    assert(el("target-kp").value === "0", "Lost ownership clears draft");
-    el("claim").click();
-    await settle();
+    assert(requests.filter(r => r.path === "session").length === lazyClaims && targetCount() === lazyTargets,
+      "Session expiry never restores old output or creates a session just for monitoring");
     edit("target-kp", 3);
     snapshot.armed = true;
     snapshot.state.phase = 2;
@@ -1178,12 +1194,12 @@ async function runDashboardTests(html, source, css) {
     assert(fields.every((field) => Number(el(`target-${field}`).value) === 0), "Disconnect clears drafts");
     const disconnectedStops = requests.filter(r => r.path === "stop").length;
     const disconnectedClaims = requests.filter(r => r.path === "session").length;
-    assert(!el("quick-stop").disabled && !el("stop").disabled, "STOP remains actionable without a connected control session");
+    assert(!el("stop").disabled, "STOP remains actionable without a connected control session");
     assert(el("device-zero").disabled && el("software-zero").disabled, "Disconnected zero controls do not submit operations");
     assert(!el("cancel-task").disabled, "A last-known active task can still be stopped without reconnecting");
     el("cancel-task").click(); await settle();
     failStop = true;
-    el("quick-stop").click(); await settle();
+    el("stop").click(); await settle();
     assert(el("notice").textContent.includes("失能未确认") && el("notice").classList.contains("error"),
       "An unreachable STOP is explicitly reported, never presented as confirmed");
     failStop = false;
@@ -1193,13 +1209,23 @@ async function runDashboardTests(html, source, css) {
       && requests.filter(r => r.path === "session").length === disconnectedClaims,
       "Disconnected task cancellation, STOP and Esc submit directly without connecting or acquiring ownership first");
     failState = false;
-    el("connect").closest("details").open = true;
-    el("connect").click(); await settle();
-    assert(snapshot.has_control && el("connect").disabled, "Explicit reconnection reclaims without enabling");
-    el("disconnect").click(); await settle();
-    assert(!snapshot.has_control && !snapshot.armed && !el("connect").disabled,
-      "Explicit disconnect releases ownership and leaves the motor disabled");
-    el("connect").click(); await settle();
+    await poll();
+    assert(!snapshot.has_control && !snapshot.armed && el("connection").textContent === "在线",
+      "Automatic reconnection restores monitoring, not command sessions or enable");
+    assert(requests.filter(r => r.path === "session").length === disconnectedClaims,
+      "Reconnect never creates a keepalive session");
+    const enablesBeforeStop = requests.filter(r => r.path === "enable").length;
+    holdSession = true;
+    el("enable").click(); await settle();
+    assert(typeof releaseSession === "function", "First operation waits for its lazy session");
+    el("stop").click(); await settle();
+    holdSession = false;
+    releaseSession(); await settle(); await poll();
+    assert(requests.filter(r => r.path === "enable").length === enablesBeforeStop && !snapshot.armed,
+      "STOP cancels an enable waiting for a session; a late response never enables the motor");
+    el("enable").click(); await settle(); await poll();
+    assert(snapshot.armed && snapshot.has_control, "Explicit enable lazily creates its operation session");
+    const monitoringStream = stream;
     const sessionsBeforeHide = requests.filter(r => r.path === "session").length;
     Object.defineProperty(doc, "hidden", {configurable: true, value: true});
     doc.dispatchEvent(new win.Event("visibilitychange")); await settle();
@@ -1207,12 +1233,15 @@ async function runDashboardTests(html, source, css) {
       "Hiding a motor page releases control and prevents further commands");
     Object.defineProperty(doc, "hidden", {configurable: true, value: false});
     doc.dispatchEvent(new win.Event("visibilitychange")); await settle();
+    await poll();
     assert(requests.filter(r => r.path === "session").length === sessionsBeforeHide,
-      "Returning to a motor page does not reacquire control or resume motion");
-    el("connect").click(); await settle();
+      "Returning to a motor page does not reacquire a session or resume motion");
+    assert(stream === monitoringStream && !el("status-panel").classList.contains("stale"),
+      "Hiding and returning keep monitoring connected");
+    assert(!el("enable").disabled, "Explicit enable is available again without a connection button");
+    el("enable").click(); await settle(); await poll();
     win.dispatchEvent(new win.Event("pagehide")); await settle();
     assert(!snapshot.has_control && !snapshot.armed, "Leaving a motor page submits release without restoring targets");
-    el("connect").closest("details").open = false;
     el("tab-events").click();
     assert(Number(el("event-count").textContent) === el("event-log").children.length, "Event counter matches the bounded log");
     el("clear-events").click();
@@ -1235,7 +1264,7 @@ async function runDashboardTests(html, source, css) {
       assert(el("control-panel").getBoundingClientRect().top < el("plot-panel").getBoundingClientRect().top,
         "Mobile prioritizes controls before the large chart");
       const connectionText = el("connection").textContent, phaseText = el("phase").textContent;
-      el("connection").textContent = "已连接 · 拥有控制权";
+      el("connection").textContent = "反馈离线";
       for (const width of [1366, 1024, 900, 768, 640, 550, 390, 320]) {
         iframe.style.width = `${width}px`;
         await layout();
@@ -1262,7 +1291,7 @@ async function runDashboardTests(html, source, css) {
             `${phase} is readable without truncation at ${width}px`);
         }
         el("phase").textContent = phaseText;
-        for (const id of ["position", "velocity", "torque", "temperature", "quick-stop"]) {
+        for (const id of ["position", "velocity", "torque", "temperature", "enable", "stop"]) {
           const bounds = el(id).getBoundingClientRect();
           assert(bounds.height > 0 && bounds.top >= 0 && bounds.bottom <= dock.getBoundingClientRect().bottom,
             `${id} remains visible in the pinned ${width}px panel`);
@@ -1271,7 +1300,7 @@ async function runDashboardTests(html, source, css) {
         const readings = el("status-panel");
         const area = readings.getBoundingClientRect();
         const fixedIdentity = doc.querySelector(".identity").getBoundingClientRect().left;
-        const fixedStop = el("quick-stop").getBoundingClientRect().right;
+        const fixedStop = el("stop").getBoundingClientRect().right;
         readings.scrollLeft = 0;
         if (width >= 640) assert(readings.scrollWidth <= readings.clientWidth + 1,
           `All four values fit without horizontal scrolling at ${width}px`);
@@ -1286,20 +1315,14 @@ async function runDashboardTests(html, source, css) {
             && el("temperature").getBoundingClientRect().right <= area.right + 1,
             "The last readout is fully reachable at the end of the telemetry strip");
           assert(doc.querySelector(".identity").getBoundingClientRect().left === fixedIdentity
-            && el("quick-stop").getBoundingClientRect().right === fixedStop,
+            && el("stop").getBoundingClientRect().right === fixedStop,
             "Identity and STOP do not move when scrolling the readings");
           readings.scrollLeft = 0;
         }
-        const menu = doc.querySelector(".connection-menu");
-        menu.open = true;
-        const options = doc.querySelector(".connection-options").getBoundingClientRect();
-        assert(options.left >= 0 && options.right <= win.innerWidth,
-          `Connection management fits within the ${width}px viewport`);
-        assert(options.top >= dock.getBoundingClientRect().bottom,
-          "Connection management never covers the pinned status or STOP");
         assert(el("connection").getBoundingClientRect().height > 0,
-          "Connection ownership remains readable in the menu");
-        menu.open = false;
+          "Online status remains visible above the power controls");
+        assert(el("enable").getBoundingClientRect().right <= el("stop").getBoundingClientRect().left,
+          "Enable and disable remain adjacent and ordered in the top-right");
         for (const tab of doc.querySelectorAll("[data-panel]")) {
           tab.click();
           assert(doc.querySelectorAll(".view-panel:not([hidden])").length === 1,
@@ -1328,23 +1351,13 @@ async function runDashboardTests(html, source, css) {
         assert(pinned.bottom <= height - 80, `The ${width}x${height} status leaves usable space for controls`);
         assert(win.getComputedStyle(el("plot-panel")).position === "static",
           "Short viewports can scroll all chart content instead of clipping a sticky plot");
-        for (const id of ["position", "velocity", "torque", "temperature", "phase", "quick-stop"]) {
+        for (const id of ["position", "velocity", "torque", "temperature", "phase", "enable", "stop"]) {
           const bounds = el(id).getBoundingClientRect();
           assert(bounds.height > 0 && bounds.top >= 0 && bounds.bottom <= pinned.bottom,
             `${id} is visible in the compact top panel`);
         }
         assert(doc.documentElement.scrollWidth <= win.innerWidth + 1,
           `Compact status has no horizontal overflow at ${width}x${height}`);
-        const menu = doc.querySelector(".connection-menu");
-        menu.open = true;
-        const popup = doc.querySelector(".connection-options");
-        assert(popup.getBoundingClientRect().top >= pinned.bottom
-          && popup.getBoundingClientRect().bottom <= height,
-          "The connection menu fits below the fixed bar in short viewports");
-        popup.scrollTop = popup.scrollHeight;
-        assert(el("disconnect").getBoundingClientRect().bottom <= popup.getBoundingClientRect().bottom,
-          "Disconnect is reachable even when the connection menu must scroll");
-        menu.open = false;
         win.scrollTo(0, 0);
       }
     }

@@ -1,0 +1,19 @@
+/**:
+  ros__parameters:
+    leader: motor_1
+    follower: motor_2
+    direction: 1
+    swap_roles: false
+    operator_timeout: 1.0
+    rate: 100.0
+    kp: 8.0
+    kd: 0.5
+    feedback_timeout: 0.1
+    target_validity: 0.1
+    motion_limits_enabled: false
+    target_speed: 0.5
+    max_error: 0.5
+    max_travel: 2.0
+    max_speed: 2.0
+    max_torque: 3.0
+    max_temperature: 55.0

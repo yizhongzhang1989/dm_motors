@@ -13,7 +13,7 @@ from ament_index_python.packages import get_package_prefix
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-from dm_motor_interfaces.msg import MotorSetpoint, MotorState, MotorTarget
+from dm_motor_interfaces.msg import MotorCommand, MotorSetpoint, MotorState, MotorTarget
 from dm_motor_control.topic_client import (
     ControlLease, MotorOperation, RegisterAccess, GetOperation, SetTarget, create_motor_client,
 )
@@ -156,6 +156,57 @@ class SplitProcesses(unittest.TestCase):
                                 for frame in frames))
         finally:
             self.node.destroy_subscription(subscription)
+
+    def test_tokenless_multi_publisher_targets_and_unrelated_keepalive_release(self):
+        name = "one"
+        self.call(self.operations[name], MotorOperation.Request(operation=MotorOperation.Request.ENABLE))
+        self.wait(lambda: self.states[name].phase == MotorState.ENABLED)
+        a = self.call(self.leases[name], ControlLease.Request(operation=1, owner="observer-a", duration=0.3)).token
+        b = self.call(self.leases[name], ControlLease.Request(operation=1, owner="observer-b", duration=2.0)).token
+        second = self.node.create_publisher(
+            MotorSetpoint, name + "/setpoint",
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+        direct = self.node.create_publisher(
+            MotorCommand, name + "/command",
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+        self.wait(lambda: second.get_subscription_count() and direct.get_subscription_count())
+        sequence = {"a": 1000, "b": 1}
+
+        def publish(publisher, source, torque):
+            sequence[source] += 1
+            message = MotorSetpoint(client_id=source, sequence=sequence[source], valid_for=0.2,
+                                    target=MotorTarget(mode=1, torque=torque))
+            message.header.stamp = self.node.get_clock().now().to_msg()
+            publisher.publish(message)
+
+        self.wait(lambda: self.states[name].active_target.torque == 0.02,
+                  action=lambda: publish(self.publishers[name], "a", 0.02))
+        self.wait(lambda: self.states[name].active_target.torque == -0.02,
+                  action=lambda: publish(second, "b", -0.02))
+        self.call(self.leases[name], ControlLease.Request(operation=3, token=b))
+        until = time.monotonic() + 0.4
+        self.wait(lambda: time.monotonic() >= until,
+                  action=lambda: publish(second, "b", -0.02))
+        self.assertEqual(self.states[name].phase, MotorState.ENABLED)
+        self.assertEqual(self.states[name].control_owner, "")
+        self.assertEqual(self.states[name].active_source, "b")
+        self.assertEqual(self.states[name].rejected_commands, 0)
+        self.call(self.leases[name], ControlLease.Request(operation=2, token=a, duration=1.0), success=False)
+
+        def publish_command():
+            message = MotorCommand(torque=0.03)
+            message.header.stamp = self.node.get_clock().now().to_msg()
+            direct.publish(message)
+
+        self.wait(lambda: self.states[name].active_target.torque == 0.03, action=publish_command)
+        self.call(self.operations[name], MotorOperation.Request(operation=MotorOperation.Request.DISABLE))
+        self.wait(lambda: self.states[name].status == 0)
+        publish(second, "b", -0.02)
+        until = time.monotonic() + 0.1
+        self.wait(lambda: time.monotonic() >= until)
+        self.assertEqual(self.states[name].status, 0, "Target must never automatically re-enable")
+        self.node.destroy_publisher(second)
+        self.node.destroy_publisher(direct)
 
     def test_motor_process_death_does_not_take_down_other_motor_or_bus(self):
         self.enable("one")

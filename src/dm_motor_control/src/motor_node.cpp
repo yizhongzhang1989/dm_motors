@@ -82,6 +82,30 @@ struct CachedControl
   Request request;
   Reply reply;
 };
+struct InputTarget
+{
+  api::msg::MotorSetpoint::ConstSharedPtr message;
+  std::string source;
+};
+struct SourceOrder
+{
+  int64_t stamp{0};
+  uint64_t sequence{0};
+  double received{0};
+};
+struct Keepalive
+{
+  double deadline{0};
+};
+std::string publisher_key(const rclcpp::MessageInfo & info)
+{
+  std::ostringstream stream;
+  stream << std::hex << std::setfill('0');
+  for (auto byte : info.get_rmw_message_info().publisher_gid.data) {
+    stream << std::setw(2) << static_cast<unsigned>(byte);
+  }
+  return stream.str();
+}
 constexpr double pi = 3.14159265358979323846;
 
 void finite(double value, const char * name)
@@ -145,18 +169,17 @@ struct Axis
   double measured_velocity{0}, measured_torque{0}, estimated_torque{0};
   double mos_stop{0}, rotor_stop{0};
   int violations{0}, violation_limit{3};
-  bool legacy_allowed{false}, legacy_owner{false};
-  std::string owner, token;
-  double lease_deadline{0};
+  std::map<std::string, Keepalive> keepalives;
+  std::map<std::string, SourceOrder> source_order;
+  std::string active_session, active_source;
   uint64_t sequence{0}, rejected{0};
   uint64_t applied_sequence{0};
   double accepted_target_age_ms{0}, applied_target_age_ms{0};
-  api::msg::MotorSetpoint::ConstSharedPtr latest_target;
+  std::shared_ptr<const InputTarget> latest_target;
   double target_deadline{0};
   bool streamed_target{false};
   bool held_target{false};
   int64_t stamp{0};
-  std::optional<rmw_gid_t> legacy_gid;
   Target requested, active, applied;
   bool applied_target_active{false};
   std::shared_ptr<GoalHandle> task;
@@ -404,7 +427,7 @@ private:
     if (axis->violation_limit < 1 || axis->violation_limit > 100) {
       throw std::invalid_argument("protection_samples must be 1..100");
     }
-    axis->legacy_allowed = parameter<bool>(prefix, "legacy_control", false);
+    parameter<bool>(prefix, "legacy_control", false);  // Accepted for old configurations; command input is now always open.
     axis->requested.mode = axis->config.mode;
     axis->active.mode = axis->config.mode;
     axis->applied.mode = axis->config.mode;
@@ -436,15 +459,26 @@ private:
     axes_.push_back(std::move(axis)); buses_.push_back(std::move(bus));
   }
 
-  bool has_lease(const Axis & axis, double time) const
+  double session_deadline(const Axis & axis, const std::string & token) const
   {
-    return !axis.owner.empty() && axis.lease_deadline > time;
+    const auto found = axis.keepalives.find(token);
+    return found == axis.keepalives.end() ? 0 : found->second.deadline;
   }
 
-  void authorize(const Axis & axis, const std::string & token, double time) const
+  void check_order(Axis & axis, const std::string & source, int64_t stamp, uint64_t sequence, double time)
   {
-    if (!has_lease(axis, time) || token.empty() || token != axis.token || axis.legacy_owner) {
-      throw std::runtime_error("valid exclusive driver control lease required");
+    for (auto it = axis.source_order.begin(); it != axis.source_order.end();) {
+      if (time - it->second.received > 5.0) {it = axis.source_order.erase(it);}
+      else {++it;}
+    }
+    const auto previous = axis.source_order.find(source);
+    if (stamp <= axis.stamp || (previous != axis.source_order.end() &&
+      (stamp <= previous->second.stamp || (sequence && sequence <= previous->second.sequence))))
+    {
+      throw std::invalid_argument("stale or replayed target from this publisher");
+    }
+    if (previous == axis.source_order.end() && axis.source_order.size() >= 256) {
+      throw std::runtime_error("target publisher history capacity reached");
     }
   }
 
@@ -462,7 +496,7 @@ private:
     axis.sequence = 0;
     axis.applied_sequence = 0;
     axis.accepted_target_age_ms = 0; axis.applied_target_age_ms = 0;
-    std::atomic_store(&axis.latest_target, api::msg::MotorSetpoint::ConstSharedPtr{});
+    std::atomic_store(&axis.latest_target, std::shared_ptr<const InputTarget>{});
     axis.streamed_target = false;
     axis.held_target = false;
     axis.applied_target_active = false;
@@ -471,7 +505,8 @@ private:
     axis.requested.mode = axis.bus->snapshot(axis.config.name, steady_seconds()).mode;
     axis.active.mode = axis.requested.mode;
     axis.applied.mode = axis.requested.mode;
-    axis.legacy_gid.reset();
+    axis.source_order.clear();
+    axis.active_session.clear(); axis.active_source.clear();
   }
 
   void end_task(Axis & axis, bool success, const std::string & reason)
@@ -594,22 +629,27 @@ private:
   }
 
   template<typename Message>
-  void accept_target(Axis & axis, const Message & msg, bool held, double time)
+  void accept_target(Axis & axis, const Message & msg, const std::string & source, bool held, double time)
   {
-    authorize(axis, msg.token, time);
     require_ready(axis);
-    if (axis.task) {throw std::runtime_error("cancel active task before changing targets");}
     const rclcpp::Time stamp(msg.header.stamp, get_clock()->get_clock_type());
     const double age = (now() - stamp).seconds();
     if (!std::isfinite(msg.valid_for) || msg.valid_for <= 0 ||
-      msg.valid_for > axis.config.command_timeout || age > msg.valid_for || age < -0.05 ||
-      stamp.nanoseconds() <= axis.stamp || msg.sequence <= axis.sequence)
+      msg.valid_for > axis.config.command_timeout || age > msg.valid_for || age < -0.05)
     {
       throw std::invalid_argument("stale, replayed or future target timestamp/sequence/validity");
     }
+    check_order(axis, source, stamp.nanoseconds(), msg.sequence, time);
+    if (held && session_deadline(axis, msg.token) <= time) {
+      throw std::invalid_argument("held target requires a live non-exclusive keepalive session; use streaming targets without a token");
+    }
     const auto target = from_message(msg.target);
     submit(axis, target, time);
-    axis.requested = target; axis.stamp = stamp.nanoseconds(); axis.sequence = msg.sequence;
+    end_task(axis, false, "Superseded by a newer manual target");
+    axis.source_order[source] = {stamp.nanoseconds(), msg.sequence, time};
+    axis.requested = target; axis.sequence = msg.sequence;
+    axis.active_source = msg.client_id.empty() ? source : msg.client_id;
+    axis.active_session = held ? msg.token : "";
     axis.accepted_target_age_ms = age * 1000;
     axis.streamed_target = true; axis.held_target = held;
     axis.target_deadline = time + std::max(0.0, msg.valid_for - std::max(0.0, age));
@@ -638,10 +678,13 @@ private:
         msg.target_accept_latency_ms = axis.applied_target_age_ms;
         pending_feedback_.emplace_back(axis.feedback_publisher, std::move(msg));
       });
-    const auto receive_target = [this, &axis](api::msg::MotorSetpoint::ConstSharedPtr msg) {
-        const auto previous = std::atomic_exchange(&axis.latest_target, std::move(msg));
-        if (previous && previous->request_id) {
-          target_reply(axis, *previous, false, "Superseded by a newer target before the control cycle.");
+    const auto receive_target = [this, &axis](api::msg::MotorSetpoint::ConstSharedPtr msg,
+        const rclcpp::MessageInfo & info) {
+        std::shared_ptr<const InputTarget> input = std::make_shared<InputTarget>(
+          InputTarget{std::move(msg), publisher_key(info)});
+        const auto previous = std::atomic_exchange(&axis.latest_target, std::move(input));
+        if (previous && previous->message->request_id) {
+          target_reply(axis, *previous->message, false, "Superseded by a newer target before the control cycle.");
         }
       };
     rclcpp::SubscriptionOptions target_options;
@@ -654,31 +697,28 @@ private:
     axis.legacy = create_subscription<api::msg::MotorCommand>(axis.endpoint + "command", command_qos,
       [this, &axis](const api::msg::MotorCommand & msg, const rclcpp::MessageInfo & info) {
         std::lock_guard<std::mutex> guard(mutex_);
-        if (!axis.legacy_owner || !has_lease(axis, steady_seconds())) {
-          ++axis.rejected;
-          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-            "Legacy target rejected: enable legacy_control explicitly and acquire legacy enable");
-          return;
-        }
-        const auto & gid = info.get_rmw_message_info().publisher_gid;
-        if (axis.legacy_gid && std::memcmp(axis.legacy_gid->data, gid.data, RMW_GID_STORAGE_SIZE) != 0) {
-          ++axis.rejected;
-          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Second legacy publisher rejected");
-          return;
-        }
-        axis.legacy_gid = gid;
         try {
+          require_ready(axis);
           const rclcpp::Time stamp(msg.header.stamp, get_clock()->get_clock_type());
           const double age = (now() - stamp).seconds();
-          if (stamp.nanoseconds() <= axis.stamp || age > axis.config.command_timeout || age < -0.05) {
+          if (age > axis.config.command_timeout || age < -0.05) {
             throw std::invalid_argument("stale, replayed or future command timestamp");
           }
+          const auto source = publisher_key(info);
+          const double time = steady_seconds();
+          check_order(axis, source, stamp.nanoseconds(), 0, time);
           Target target{Mode::Mit, msg.position, msg.velocity, msg.kp, msg.kd, msg.torque, 0, 0};
-          submit(axis, target, steady_seconds());
-          axis.requested = target; axis.stamp = stamp.nanoseconds();
+          submit(axis, target, time);
+          end_task(axis, false, "Superseded by a newer command");
+          const auto previous = std::atomic_exchange(&axis.latest_target, std::shared_ptr<const InputTarget>{});
+          if (previous && previous->message->request_id) {
+            target_reply(axis, *previous->message, false, "Superseded by a newer command.");
+          }
+          axis.source_order[source] = {stamp.nanoseconds(), 0, time};
+          axis.requested = target; axis.sequence = 0;
+          axis.active_source = source; axis.active_session.clear(); axis.held_target = false;
           axis.streamed_target = true;
-          axis.target_deadline = steady_seconds() + axis.config.command_timeout;
-          axis.lease_deadline = steady_seconds() + 2.0;
+          axis.target_deadline = time + axis.config.command_timeout - std::max(0.0, age);
         } catch (const std::exception & error) {
           ++axis.rejected;
           axis.bus->fail(axis.config.name, error.what());
@@ -692,33 +732,33 @@ private:
         try {
           require_ready(axis);
           if (req->operation == Request::ACQUIRE) {
-            if (!axis.owner.empty()) {throw std::runtime_error("driver control already held or expiry STOP pending");}
             if (req->owner.empty() || req->owner.size() > 128) {throw std::invalid_argument("owner must be 1..128 characters");}
             if (!std::isfinite(req->duration) || req->duration < 0.3 || req->duration > 5) {
               throw std::invalid_argument("lease duration must be 0.3..5 seconds");
             }
-            auto state = axis.bus->snapshot(axis.config.name, time);
-            if ((state.phase != Phase::Disabled && state.phase != Phase::Fault) ||
-              state.feedback_age < 0 || state.feedback_age > axis.config.feedback_timeout) {
-              throw std::runtime_error("acquire requires fresh disabled/fault motor feedback");
+            if (axis.keepalives.size() >= 256) {
+              throw std::runtime_error("keepalive session capacity reached");
             }
-            axis.token = new_token(); axis.owner = req->owner; axis.legacy_owner = false;
-            axis.lease_deadline = time + req->duration; reset_targets(axis);
+            response->token = new_token();
+            axis.keepalives[response->token] = {time + req->duration};
           } else {
-            authorize(axis, req->token, time);
+            if (req->token.empty() || session_deadline(axis, req->token) <= time) {
+              throw std::runtime_error("unknown or expired keepalive session");
+            }
             if (req->operation == Request::RENEW) {
               if (!std::isfinite(req->duration) || req->duration < 0.3 || req->duration > 5) {
                 throw std::invalid_argument("lease duration must be 0.3..5 seconds");
               }
-              axis.lease_deadline = time + req->duration;
+              axis.keepalives.at(req->token).deadline = time + req->duration;
+              response->token = req->token;
             } else if (req->operation == Request::RELEASE) {
-              stop_axis(axis, "Control lease released");
-              axis.owner.clear(); axis.token.clear(); axis.lease_deadline = 0;
+              if (axis.active_session == req->token) {stop_axis(axis, "Active source keepalive released");}
+              axis.keepalives.erase(req->token);
             } else {throw std::invalid_argument("unknown control lease operation");}
           }
-          response->success = true; response->token = axis.token;
-          response->remaining = std::max(0.0, axis.lease_deadline - time);
-          response->message = "Lease operation accepted; release requests STOP, check state for confirmation.";
+          response->success = true;
+          response->remaining = std::max(0.0, session_deadline(axis, response->token) - time);
+          response->message = "Non-exclusive keepalive accepted; no control ownership acquired. Release stops only this session's active output.";
         } catch (const std::exception & error) {rejection(*response, error);}
       };
     axis.handlers[Request::OPERATION] =
@@ -728,10 +768,12 @@ private:
         try {
           if (req->operation == Request::DISABLE) {stop_axis(axis, "STOP requested");}
           else {
-            require_ready(axis); authorize(axis, req->token, time);
+            require_ready(axis);
             if (axis.task) {throw std::runtime_error("cancel task before maintenance");}
             if (req->operation == Request::ENABLE) {
               reset_targets(axis); axis.bus->enable(axis.config.name, time);
+              if (session_deadline(axis, req->token) > time) {axis.active_session = req->token;}
+              axis.active_source = req->client_id;
             } else if (req->operation == Request::RESET_HOST_FAULT) {
               axis.bus->reset(axis.config.name, time); reset_targets(axis);
             } else if (req->operation == Request::SET_MODE) {
@@ -776,7 +818,6 @@ private:
           {
             throw std::invalid_argument("1..16 addresses required; writes require one raw word per address");
           }
-          if (req->write) {authorize(axis, req->token, time);}
           for (size_t i = 0; i < req->addresses.size(); ++i) {
             const auto & catalog = register_catalog();
             const auto item = std::find_if(catalog.begin(), catalog.end(), [&](const RegisterInfo & entry) {
@@ -850,7 +891,7 @@ private:
         configuration.protection_samples = axis.violation_limit; configuration.fault_group = axis.fault_group;
         response->control_rate = rate_;
         response->profile = axis.profile; response->backend = axis.transport->backend(); response->modes = {1, 2, 3, 4};
-        response->simulated = axis.transport->simulated(); response->legacy_control = axis.legacy_allowed;
+        response->simulated = axis.transport->simulated(); response->legacy_control = true;
         response->evidence = "J4310-2EC V1.1/V1.2 manuals 2026-09-14; hardware certification is per deployment.";
         response->message = axis.transport->error() + axis.bus->initialization_error() + state.error;
         for (const auto & item : register_catalog()) {
@@ -872,16 +913,11 @@ private:
         try {
           if (!req->data) {
             stop_axis(axis, "STOP requested");
-            if (axis.legacy_owner) {axis.owner.clear(); axis.token.clear(); axis.legacy_owner = false;}
           } else {
             require_ready(axis);
-            if (!axis.legacy_allowed || (!axis.owner.empty() && !axis.legacy_owner)) {
-              throw std::runtime_error("Use tokenized operation ENABLE; legacy enable disabled or driver owned");
-            }
             reset_targets(axis);
             axis.bus->enable(axis.config.name, steady_seconds());
-            axis.owner = "legacy"; axis.legacy_owner = true; axis.token.clear();
-            axis.lease_deadline = steady_seconds() + 2.0;
+            axis.active_source = req->client_id;
           }
           response->success = true;
           response->message = "Request sent, not yet confirmed. Check state.phase/status.";
@@ -891,11 +927,7 @@ private:
       [this, &axis](const Request::SharedPtr, Reply::SharedPtr response) {
         std::lock_guard<std::mutex> guard(mutex_);
         try {
-          if (!axis.legacy_allowed || (!axis.owner.empty() && !axis.legacy_owner)) {
-            throw std::runtime_error("Use tokenized RESET_HOST_FAULT operation");
-          }
           axis.bus->reset(axis.config.name, steady_seconds()); reset_targets(axis);
-          axis.owner.clear(); axis.legacy_owner = false;
           response->success = true; response->message = "Host stop latch reset; motor remains disabled.";
         } catch (const std::exception & error) {rejection(*response, error);}
       };
@@ -916,11 +948,14 @@ private:
               queue_publication(TaskPublication{publisher, std::move(event)});
             };
           const auto previous = std::atomic_exchange(
-            &axis.latest_target, api::msg::MotorSetpoint::ConstSharedPtr{});
-          if (previous && previous->request_id) {
-            target_reply(axis, *previous, false, "Manual target superseded by task start.");
+            &axis.latest_target, std::shared_ptr<const InputTarget>{});
+          if (previous && previous->message->request_id) {
+            target_reply(axis, *previous->message, false, "Manual target superseded by task start.");
           }
+          end_task(axis, false, "Superseded by a newer task");
           axis.task = goal; axis.task_start = steady_seconds();
+          axis.active_session = session_deadline(axis, request->token) > axis.task_start ? request->token : "";
+          axis.active_source = request->client_id;
           axis.streamed_target = false;
           axis.held_target = false;
           axis.task_start_position = joint_position(axis, axis.bus->snapshot(axis.config.name, axis.task_start));
@@ -937,11 +972,9 @@ private:
       [this, &axis](const Request::SharedPtr request, Reply::SharedPtr response) {
         std::lock_guard<std::mutex> guard(mutex_);
         try {
-          authorize(axis, request->token, steady_seconds());
-          if (!axis.task || axis.task->client_id != request->client_id ||
-            axis.task->task_id != request->task_id)
+          if (!axis.task || (request->task_id && axis.task->task_id != request->task_id))
           {
-            throw std::runtime_error("cancel requires the matching active task and owner");
+            throw std::runtime_error("cancel requires the matching active task ID, or zero for any active task");
           }
           axis.task->cancel_requested = true;
           response->success = true; response->message = "Task cancellation accepted; wait for disabled result.";
@@ -951,7 +984,7 @@ private:
       [this, &axis](const Request::SharedPtr request, Reply::SharedPtr response) {
         {
           std::lock_guard<std::mutex> guard(mutex_);
-          require_ready(axis); authorize(axis, request->token, steady_seconds());
+          require_ready(axis);
           if (axis.task) {throw std::runtime_error("stop the active task before changing control frequency");}
         }
         const auto result = set_parameters_atomically({rclcpp::Parameter("control_rate", request->value)});
@@ -1043,8 +1076,7 @@ private:
   void validate_task(const Axis & axis, const Task::Goal & goal) const
   {
     const double time = steady_seconds();
-    require_ready(axis); authorize(axis, goal.token, time);
-    if (axis.task) {throw std::runtime_error("a task is already active");}
+    require_ready(axis);
     const auto state = axis.bus->snapshot(axis.config.name, time);
     if (state.phase != Phase::Enabled || state.feedback_age < 0 ||
       state.feedback_age > axis.config.feedback_timeout)
@@ -1276,56 +1308,41 @@ private:
                 axis->lower = bounds.first;
                 axis->upper = bounds.second;
               }
-              if (!axis->owner.empty() && !has_lease(*axis, time)) {
-                stop_axis(*axis, "Driver control lease expired");
-                axis->owner.clear(); axis->token.clear(); axis->legacy_owner = false;
+              if (!axis->active_session.empty() && session_deadline(*axis, axis->active_session) <= time) {
+                stop_axis(*axis, "Active source keepalive lease expired");
+              }
+              for (auto it = axis->keepalives.begin(); it != axis->keepalives.end();) {
+                if (it->second.deadline <= time) {it = axis->keepalives.erase(it);}
+                else {++it;}
               }
               if (period_ > axis->config.feedback_timeout &&
                 (state.phase == Phase::Enabled || state.phase == Phase::Enabling))
               {
                 axis->bus->fail(axis->config.name, "control loop stalled beyond feedback timeout");
               }
-              auto incoming = std::atomic_exchange(
-                &axis->latest_target, api::msg::MotorSetpoint::ConstSharedPtr{});
-              if (incoming) {
-                if (axis->task) {
-                  ++axis->rejected;
-                  target_reply(*axis, *incoming, false, "Active task owns output; manual target superseded.");
-                  incoming.reset();
-                }
-              }
-              if (incoming) {
+              const auto input = std::atomic_exchange(
+                &axis->latest_target, std::shared_ptr<const InputTarget>{});
+              if (input) {
+                const auto & incoming = input->message;
                 try {
-                  authorize(*axis, incoming->token, time);
-                } catch (const std::exception & error) {
-                  ++axis->rejected;
-                  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                    "Unauthorized topic target: %s", error.what());
-                  target_reply(*axis, *incoming, false, error.what());
-                  incoming.reset();
+                  accept_target(*axis, *incoming, input->source, incoming->hold_until_lease_expiry, time);
+                  target_reply(*axis, *incoming, true, "Target accepted at the control-cycle boundary.");
                 }
-                if (incoming) {
-                  try {
-                    accept_target(*axis, *incoming, incoming->hold_until_lease_expiry, time);
-                    target_reply(*axis, *incoming, true, "Target accepted at the control-cycle boundary.");
-                  }
-                  catch (const std::exception & error) {
-                    ++axis->rejected;
-                    const auto phase = axis->bus->snapshot(axis->config.name, time).phase;
-                    if (!incoming->hold_until_lease_expiry &&
-                      (phase == Phase::Enabled || phase == Phase::Enabling))
-                    {axis->bus->fail(axis->config.name, error.what());}
-                    target_reply(*axis, *incoming, false, error.what());
-                    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
-                      "Topic target rejected: %s", error.what());
-                  }
+                catch (const std::exception & error) {
+                  ++axis->rejected;
+                  const auto phase = axis->bus->snapshot(axis->config.name, time).phase;
+                  if (!incoming->hold_until_lease_expiry &&
+                    (phase == Phase::Enabled || phase == Phase::Enabling))
+                  {axis->bus->fail(axis->config.name, error.what());}
+                  target_reply(*axis, *incoming, false, error.what());
+                  RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+                    "Topic target rejected: %s", error.what());
                 }
               }
               if (axis->streamed_target && !axis->held_target && state.phase == Phase::Enabled &&
                 time > axis->target_deadline && !axis->task)
               {
-                axis->bus->fail(axis->config.name, axis->legacy_owner ?
-                  "command publisher timeout" : "command publisher timeout: setpoint validity expired");
+                axis->bus->fail(axis->config.name, "command publisher timeout: setpoint validity expired");
                 axis->streamed_target = false;
               }
               if (axis->host_protection && state.phase == Phase::Enabled && state.feedback_age >= 0 &&
@@ -1346,7 +1363,7 @@ private:
               } else if (state.phase != Phase::Enabled) {axis->violations = 0;}
               task_tick(*axis, axis->bus->snapshot(axis->config.name, time), time);
               if (axis->held_target && axis->streamed_target && !axis->task &&
-                state.phase == Phase::Enabled && has_lease(*axis, time))
+                state.phase == Phase::Enabled && session_deadline(*axis, axis->active_session) > time)
               {
                 axis->bus->command(axis->config.name, native_target(*axis, axis->active), time);
               }
@@ -1481,7 +1498,9 @@ private:
       msg.period_ms = period_ * 1000; msg.max_period_ms = max_period_ * 1000; msg.deadline_misses = deadline_misses_;
       msg.control_rate = rate_; msg.actual_control_rate = measured_rate_;
       msg.control_cycle_count = control_cycle_count_;
-      msg.control_owner = axis->owner; msg.lease_remaining = std::max(0.0, axis->lease_deadline - time);
+      msg.control_owner = "";
+      msg.active_source = axis->active_source;
+      msg.lease_remaining = std::max(0.0, session_deadline(*axis, axis->active_session) - time);
       msg.task_active = axis->task != nullptr; msg.rejected_commands = axis->rejected;
       msg.requested_target = to_message(axis->requested); msg.active_target = to_message(axis->active);
       msg.target_active = state.phase == Phase::Enabled && (axis->streamed_target || axis->task);
@@ -1549,7 +1568,7 @@ private:
           {"period_p50_ms", std::to_string(percentiles_[0] * 1000)},
           {"period_p95_ms", std::to_string(percentiles_[1] * 1000)},
           {"period_p99_ms", std::to_string(percentiles_[2] * 1000)},
-          {"rejected_commands", std::to_string(axis->rejected)}, {"control_owner", axis->owner}})
+          {"rejected_commands", std::to_string(axis->rejected)}, {"active_source", axis->active_source}})
       {
         diagnostic_msgs::msg::KeyValue item;
         item.key = value.first; item.value = value.second; status.values.push_back(item);

@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dm_motor_lead_follow</name>
+  <version>0.1.0</version>
+  <description>Explicitly armed, leased leader/follower position control for independent Damiao motor nodes.</description>
+  <maintainer email="yizhongzhang1989@users.noreply.github.com">yizhongzhang1989</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>std_srvs</depend>
+  <depend>dm_motor_interfaces</depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>dm_motor_lead_follow_dashboard</exec_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>dm_motor_control</test_depend>
+  <test_depend>can_bus</test_depend>
+  <test_depend>dm_motor_dashboard</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

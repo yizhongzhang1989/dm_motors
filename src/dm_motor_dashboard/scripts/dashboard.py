@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Open-access HTTP client for the reusable ROS motor interfaces."""
+"""Open-access HTTP motor client with non-exclusive output keepalive."""
 
 import json
 import math
@@ -196,7 +196,7 @@ class Dashboard(Node):
                 self.owner.encode("ascii"), session.encode("utf-8"))
             return {"motor_id": self.motor_id, "connected": self.connected(),
                     "state": self.state, "state_time": self.received,
-                    "target": dict(self.target), "armed": self.armed,
+                    "target": dict(self.target), "armed": bool(self.state and self.state["phase"] == MotorState.ENABLED),
                     "has_control": owns, "control_busy": self.owner is not None,
                     "notice": self.notice, "client_timeout": self.client_timeout,
                     "capabilities": self.capabilities, "task": plain_message(self.task),
@@ -221,7 +221,8 @@ class Dashboard(Node):
                 if self.closing:
                     raise ApiError(503, "Web service is shutting down.")
                 if self.owner is not None:
-                    raise ApiError(409, "Another browser holds control. Read-only viewing and STOP remain available.")
+                    self.last_heartbeat = time.monotonic()
+                    return {"session": self.owner, "message": "Shared browser operation session; other clients remain free to command."}
                 if not self.connected() or not self.capabilities or not self.capabilities["ready"]:
                     raise ApiError(503, "Driver capabilities are not ready; wait for discovery.")
                 generation = self.generation
@@ -242,7 +243,7 @@ class Dashboard(Node):
                 self.last_renew = time.monotonic()
                 self.owner = secrets.token_urlsafe(24)
                 self.last_heartbeat = time.monotonic()
-                self.notice = "Control claimed. Motor remains disabled until explicitly enabled."
+                self.notice = "Operation session ready, not exclusive. Latest valid command wins; enable remains explicit."
                 return {"session": self.owner, "message": self.notice}
         finally:
             self.operation_lock.release()
@@ -369,7 +370,7 @@ class Dashboard(Node):
             if self.owner is not None and not expired and not disconnected and not self.closing:
                 self.renew_driver(now)
         if expired:
-            self.stop_async("Browser heartbeat expired; target cleared and disable requested.", release=True)
+            self.disarm("Browser heartbeat expired; this source keepalive released.", release=True)
         elif disconnected:
             self.stop_async("Motor state disconnected; target cleared and disable requested.", release=True)
         elif task_expired:
@@ -460,6 +461,11 @@ class Dashboard(Node):
                     generation != self.generation or sequence is None or sequence <= self.target_sequence):
                 raise ApiError(409, "Stale target: control generation changed or a newer target was accepted.")
             target = self.validate_target(body)
+            if self.task_busy():
+                self.generation += 1
+                self.task["state"] = "stopped"
+                self.task["message"] = "Superseded by a newer manual target."
+                self.task_handle = None
             control_generation = self.generation
             self.sequence += 1
             request = SetTarget.Request(
@@ -479,6 +485,7 @@ class Dashboard(Node):
             if sequence is not None and sequence <= self.target_sequence:
                 raise ApiError(409, "A newer target was accepted while waiting for the driver.")
             self.target = target
+            self.armed = True
             if sequence is not None:
                 self.target_sequence = sequence
             self.notice = ("Target published. WARNING: Kd quantizes to zero; position control may oscillate."
@@ -488,11 +495,9 @@ class Dashboard(Node):
                     "control_generation": self.generation, "target_sequence": self.target_sequence}
 
     def validate_target(self, body):
-        if (not self.armed or not self.connected() or not self.state["feedback_fresh"]
+        if (not self.connected() or not self.state["feedback_fresh"]
                 or self.state["phase"] != MotorState.ENABLED):
-            raise ApiError(409, "Apply requires this session to own a confirmed enable.")
-        if self.task_busy() or self.state.get("task_active", False):
-            raise ApiError(409, "Stop the active task before changing a manual target.")
+            raise ApiError(409, "Apply requires fresh confirmed enabled feedback.")
         mode = self.state["mode"]
         fields = MODE_FIELDS.get(mode)
         if fields is None or set(body) != set(fields):
@@ -585,8 +590,6 @@ class Dashboard(Node):
                 self.require_session(session)
                 if not self.connected() or self.state is None:
                     raise ApiError(409, "Task requires connected motor feedback.")
-                if self.task_busy() or self.state.get("task_active", False):
-                    raise ApiError(409, "A task is already active.")
                 if not self.task_client.is_ready():
                     raise ApiError(503, "Driver task command topics are unavailable.")
                 target = MotorTarget(**self.validate_target(body["target"]))
@@ -614,7 +617,7 @@ class Dashboard(Node):
                         try:
                             handle = response.result()
                             if generation != self.generation:
-                                if handle.accepted:
+                                if handle.accepted and not self.armed:
                                     self.stop_async("Late task acceptance after STOP; disable requested.")
                                 return
                             if not handle.accepted:
@@ -658,7 +661,8 @@ class Dashboard(Node):
         if release:
             with self.lock:
                 self.require_session(session)
-                self.disarm("Control released; target cleared and disable requested.", release=True)
+                self.disarm("Operation session released; monitoring may continue. Other input sources are unaffected.", release=True)
+            return {"message": self.notice}
         else:
             self.disarm("STOP requested; target cleared. Check state for disabled confirmation.")
         return self.call_command(self.enable_client, MotorOperation.Request(operation=MotorOperation.Request.DISABLE))
@@ -1001,11 +1005,10 @@ def main():
         if thread is not None:
             thread.join(timeout=1)
         if node is not None and had_control:
-            future = node.stop_async("Web dashboard shutting down; disable requested.", release=True)
-            if future is not None and rclpy.ok():
-                rclpy.spin_until_future_complete(node, future, timeout_sec=0.3)
-                if not future.done():
-                    node.get_logger().error("Shutdown disable unconfirmed; motor watchdog is required.")
+            node.disarm("Web dashboard shutting down; releasing its non-exclusive keepalive.", release=True)
+            deadline = time.monotonic() + 0.3
+            while rclpy.ok() and time.monotonic() < deadline:
+                rclpy.spin_once(node, timeout_sec=0.01)
         if node is not None:
             node.destroy_node()
         if rclpy.ok():

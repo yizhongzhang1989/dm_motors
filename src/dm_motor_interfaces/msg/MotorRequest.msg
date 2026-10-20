@@ -26,6 +26,8 @@ uint64 request_id
 float64 valid_for
 uint8 kind
 string token
+# LEASE is a non-exclusive keepalive for held output, not command authorization.
+# OPERATION, REGISTERS and TASK requests do not require a token.
 uint8 operation
 string owner
 float64 duration

@@ -1,0 +1,8 @@
+uint8 START=1
+uint8 STOP=2
+uint8 HEARTBEAT=3
+uint8 operation
+string session
+---
+bool success
+string message

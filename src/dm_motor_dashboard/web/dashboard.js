@@ -29,7 +29,9 @@ let feedbackRate = 0;
 let pollTimer = null;
 let connectionVersion = 0;
 let connectionAbort = new AbortController();
-let initialConnectPending = true;
+let connecting = false;
+let sessionPending = null;
+let stopEpoch = 0;
 let capabilitiesKey = "";
 let chartPaused = false;
 let positionFollowsCurrent = true;
@@ -100,6 +102,13 @@ function headers() {
 
 async function api(path, body) {
   const version = connectionVersion;
+  const epoch = stopEpoch;
+  if (body !== undefined && !["session", "heartbeat", "release", "stop"].includes(path)) {
+    if (!session) await ensureSession();
+    if (version !== connectionVersion || epoch !== stopEpoch || document.hidden) {
+      throw new ApiError(409, "已停止或连接状态已改变，未发送操作请求。");
+    }
+  }
   const requestHeaders = headers();
   let generation, sequence;
   if (path === "target") {
@@ -181,9 +190,9 @@ function syncPositionScroll() {
 
 function canEditPosition() {
   const value = Number($("target-position").value);
-  return connected && Boolean(session) && data?.has_control && data.connected
+  return connected && !document.hidden && data?.connected
     && data.state?.feedback_fresh && data.state.absolute_position_valid !== false
-    && !busy && !taskBusy() && activeFields().includes("position")
+    && !busy && activeFields().includes("position")
     && Number($("mode-select").value) === data.state.mode
     && $("target-position").value.trim() && Number.isFinite(value);
 }
@@ -191,16 +200,16 @@ function canEditPosition() {
 function canSendPosition() {
   const value = Number($("target-position").value);
   const {minimum, maximum} = positionBounds();
-  return canEditPosition() && data.armed && data.state.phase === 2 && data.state.ready
+  return canEditPosition() && data.state.phase === 2 && data.state.ready
     && value >= minimum && value <= maximum
     && $("live-targets").checked
     && !positionLiveBlocked && Number.isSafeInteger(data.control_generation);
 }
 
 function canSendTarget() {
-  return connected && session && data?.has_control && data.connected && data.armed
+  return connected && !document.hidden && data?.connected
     && data.state?.phase === 2 && data.state.ready && data.state.feedback_fresh
-    && data.state.absolute_position_valid !== false && !busy && !taskBusy()
+    && data.state.absolute_position_valid !== false && !busy
     && $("live-targets").checked && !positionLiveBlocked
     && Number($("mode-select").value) === data.state.mode
     && Number.isSafeInteger(data.control_generation);
@@ -227,8 +236,8 @@ function renderPositionScroll() {
   let message = "未使能：滚动只修改位置草稿，不发送目标。";
   if (!connected || !data?.connected || !data.state?.feedback_fresh) message = "等待新鲜位置反馈。";
   else if (data.state.absolute_position_valid === false) message = "连续位置无效，禁止滚动控制。";
-  else if (taskBusy()) message = "任务执行中，位置滚动控制已禁用。";
-  else if (!data.has_control) message = "只读监控；获取控制权后才能调整位置。";
+  else if (taskBusy()) message = "任务执行中；提交新的手动目标会替换任务。";
+  else if (document.hidden) message = "页面隐藏期间只监控，不提交目标。";
   else if (!Number.isFinite(value)) message = "位置草稿必须是有限数值。";
   else if (value < minimum || value > maximum) message = data.state.mode === 1
     ? "目标草稿超出 MIT 位置编码量程，滚轮停在边界，未发送；多圈位置控制请在失能后显式选择位置速度或力位模式。"
@@ -346,10 +355,9 @@ function resetInputs(followPosition = true) {
   renderDraft();
 }
 
-function relinquish() {
+function relinquish(keepMonitoring = false) {
+  stopEpoch += 1;
   positionLiveBlocked = true;
-  if (feedbackStream) { feedbackStream.close(); feedbackStream = null; }
-  $("plot-stats").textContent = "推流已断开 · 绘图暂停";
   if (session) {
     fetch("/api/release", {method: "POST", headers: headers(), body: "{}", keepalive: true})
       .then((response) => {
@@ -357,10 +365,19 @@ function relinquish() {
       })
       .catch((error) => console.warn("Release could not reach server; browser lease watchdog remains active.", error));
   }
+  session = "";
+  sessionPending = null;
+  if (data) {data.has_control = false; data.armed = false;}
   connectionVersion += 1;
   connectionAbort.abort();
   connectionAbort = new AbortController();
-  session = "";
+  if (keepMonitoring) {
+    resetInputs();
+    render();
+    return;
+  }
+  if (feedbackStream) { feedbackStream.close(); feedbackStream = null; }
+  $("plot-stats").textContent = "推流已断开 · 绘图暂停";
   connected = false;
   clearTimeout(pollTimer);
   resetInputs();
@@ -369,7 +386,13 @@ function relinquish() {
 
 function connectionLost(error) {
   relinquish();
-  notice(`连接中断：${error.message}。目标心跳已停止，不会自动恢复使能；请重新连接。`);
+  notice(`连接中断：${error.message}。正在自动重连监控，不会自动使能或恢复旧目标。`);
+  scheduleReconnect();
+}
+
+function scheduleReconnect() {
+  clearTimeout(pollTimer);
+  if (!document.hidden) pollTimer = setTimeout(connect, 1000);
 }
 
 function render() {
@@ -377,37 +400,32 @@ function render() {
   renderCapabilities();
   const pendingMode = Boolean(state && $("mode-select").value
     && Number($("mode-select").value) !== state.mode);
-  const owns = connected && Boolean(session) && data?.has_control;
+  const owns = connected && data?.connected && !document.hidden;
   const fresh = connected && data?.connected && state?.feedback_fresh;
   $("status-panel").classList.toggle("stale", !fresh);
   document.querySelector(".position-strip").classList.toggle("stale", !fresh);
-  $("connection").textContent = !connected ? "未连接" : owns ? "已连接 · 拥有控制权" : "已连接 · 只读";
+  $("connection").textContent = !connected ? "重连中" : data?.connected ? "在线" : "反馈离线";
   $("connection").className = `badge${connected ? " ok" : ""}`;
-  $("connect").disabled = connected || busy;
-  $("disconnect").disabled = !connected;
-  $("claim").disabled = !connected || owns || busy;
   $("enable").disabled = !owns || busy || !data.connected || !state?.feedback_fresh
     || !state.ready || state.absolute_position_valid === false
     || state.phase !== 0;
-  $("apply").disabled = !owns || busy || !fresh || !data.armed || state?.phase !== 2
+  $("apply").disabled = !owns || busy || !fresh || state?.phase !== 2
     || !state.ready || state.absolute_position_valid === false;
   if (pendingMode) $("apply").disabled = true;
-  if (taskBusy()) $("apply").disabled = true;
   $("zero").disabled = $("apply").disabled;
   $("stop").disabled = false;
-  $("quick-stop").disabled = false;
   $("reset").disabled = !owns || busy || !data.connected || !state?.feedback_fresh
     || state.absolute_position_valid === false || state.phase !== 4 || state.status !== 0;
-  const editable = owns && !busy && fresh && state.absolute_position_valid !== false && !taskBusy();
+  const editable = owns && !busy && fresh && state.absolute_position_valid !== false;
   $("fill-position").disabled = !editable || pendingMode || !activeFields().includes("position");
   $("restore-target").disabled = !editable || pendingMode;
-  $("live-targets").disabled = !owns || busy || taskBusy();
+  $("live-targets").disabled = !owns || busy;
   $("control-rate").disabled = !owns || busy || ratePending || !fresh || !state?.ready || taskBusy();
-  $("control-guidance").textContent = !connected ? "请在右上角“连接管理”中连接；不会自动使能或恢复旧目标。"
+  $("control-guidance").textContent = !connected ? "正在自动连接监控；不会自动使能或恢复旧目标。"
     : !fresh ? "反馈已过期，控制已禁用；请检查连接。"
-    : !owns ? "当前为只读监控，请获取控制权后操作。"
+    : !owns ? "页面隐藏期间只监控，不发送操作。"
     : busy ? "操作处理中；STOP / Esc 始终可用。"
-    : taskBusy() ? "任务正在执行，手动编辑已锁定；可查看任务或 STOP。"
+    : taskBusy() ? "任务正在执行；新的有效手动目标会替换任务，不会自动恢复旧目标。"
     : state.phase === 4 ? "驱动故障：先检查完整监控，再清除设备故障 / 复位主机故障。"
     : !state.ready || state.absolute_position_valid === false ? "驱动或连续位置未就绪，禁止使能。"
     : state.phase === 0 ? "已失能 · 可编辑草稿；点击使能从中性目标开始。"
@@ -527,7 +545,7 @@ function renderMonitoring(state, owns) {
   $("compact-position").textContent = numeric(state.native_position, 6);
   $("absolute-valid").textContent = state.absolute_position_valid ? "连续位置有效" : "连续位置无效";
   $("absolute-valid").className = `badge ${state.absolute_position_valid ? "ok" : "error"}`;
-  $("control-owner").textContent = `${owns ? "本页面持有控制权" : "只读监控"} · 租约 ${numeric(state.lease_remaining, 2)} s`;
+  $("control-owner").textContent = `${owns ? "非独占操作" : "只读监控"} · 当前输入 ${state.active_source || "无"} · 保活 ${numeric(state.lease_remaining, 2)} s`;
   $("state-age").textContent = `反馈年龄 ${numeric(state.feedback_age * 1000, 1)} ms · ${state.feedback_count} 帧`;
   const disconnected = !connected || !data.connected || !state.feedback_fresh;
   const problem = state.error || (state.phase === 4 ? "驱动处于锁定故障，请检查设备状态并执行相应恢复操作。" : "")
@@ -548,7 +566,7 @@ function renderMonitoring(state, owns) {
     ["设备 / 模式", `${state.simulated ? "SIM" : "HARDWARE"} / ${modeNames[state.mode] ?? state.mode}`],
     ["驱动阶段", phases[state.phase] ?? "未知"], ["设备状态", state.status_text ?? state.status],
     ["主机故障 / 设备故障", `${Boolean(state.host_fault)} / ${Boolean(state.device_fault)}`],
-    ["控制者", state.control_owner || "无"], ["任务 / 目标活动", `${Boolean(state.task_active)} / ${Boolean(state.target_active)}`],
+    ["当前输入（非独占）", state.active_source || "无"], ["任务 / 目标活动", `${Boolean(state.task_active)} / ${Boolean(state.target_active)}`],
     ["主机额外保护", state.host_protection_enabled ? "已开启" : "关闭，固件保护"],
     ["故障组", state.fault_group || "独立轴"],
     ["Kp / Kd 上限", `${state.kp_limit} / ${state.kd_limit}`],
@@ -595,7 +613,7 @@ function renderTask(owns) {
     for (const input of label.querySelectorAll("input, select, textarea")) input.disabled = label.hidden;
   }
   $("start-task").disabled = !owns || busy || !data?.armed || state?.phase !== 2
-    || !state.feedback_fresh || !state.ready || taskBusy() || !supported(kind);
+    || !state.feedback_fresh || !state.ready || !supported(kind);
   $("cancel-task").disabled = !taskBusy();
   $("prepare-task").disabled = !owns || busy || taskBusy() || !state?.feedback_fresh;
   const task = data?.task;
@@ -830,9 +848,10 @@ async function poll() {
   if (!connected || polling) return;
   polling = true;
   const version = connectionVersion;
+  const polledSession = session;
   try {
     const snapshot = await api("state");
-    if (version !== connectionVersion) return;
+    if (version !== connectionVersion || polledSession !== session) return;
     if (Number.isSafeInteger(data?.control_generation) && Number.isSafeInteger(snapshot.control_generation)) {
       if (snapshot.control_generation < data.control_generation) return;
       if (snapshot.control_generation === data.control_generation &&
@@ -854,7 +873,7 @@ async function poll() {
     if (previousMode !== undefined && previousMode !== data.state?.mode) $("mode-select").value = String(data.state.mode);
     if (session && !data.has_control) {
       session = "";
-      notice("控制会话已结束，目标已清空。需重新获取控制权并显式使能。");
+      notice("输出保活已结束；监控继续，旧目标不会恢复，下次显式操作会自动建立新会话。");
     }
     if (data.state) {
       const time = performance.now();
@@ -889,53 +908,49 @@ async function action(callback) {
   finally { busy = false; render(); }
 }
 
-async function claim() {
-  const result = await api("session", {});
-  session = result.session;
-  data.has_control = true;
-  data.armed = false;
-  positionLiveBlocked = true;
-  positionFollowsCurrent = true;
-  notice(result.message);
+async function ensureSession() {
+  if (session) return;
+  if (!connected || document.hidden) throw new ApiError(409, "当前不可操作；请等待监控在线并保持页面可见。");
+  if (!sessionPending) {
+    const version = connectionVersion;
+    const pending = api("session", {}).then(result => {
+      if (version !== connectionVersion || document.hidden) {
+        fetch("/api/release", {method: "POST", headers: {"Content-Type": "application/json", "X-Control-Session": result.session},
+          body: "{}", keepalive: true}).catch(error => console.warn("Late session release unconfirmed", error));
+        throw new ApiError(409, "页面或连接状态已变化，未发送操作。");
+      }
+      session = result.session;
+      data.has_control = true;
+    });
+    sessionPending = pending;
+    try {await pending;}
+    finally {if (sessionPending === pending) sessionPending = null;}
+  } else {await sessionPending;}
 }
 
 async function connect() {
-  initialConnectPending = false;
-  data = await api("state");
-  if (document.hidden) {
-    notice("页面已隐藏，未获取控制权；返回后请点击连接。");
-    return;
-  }
-  connected = true;
-  historyStart = 0;
-  historyCount = 0;
-  latestSample = null;
-  receivedSamples = 0;
-  renderedFrames = 0;
-  skippedSamples = 0;
-  statsStarted = performance.now();
-  lastFrame = null;
-  try { await claim(); }
-  catch (error) {
-    if (error.status !== 409) { connected = false; throw error; }
-    notice(error.message);
-  }
-  if (document.hidden) {
-    relinquish();
-    notice("页面已隐藏，控制权已释放；返回后请重新连接。");
-    return;
-  }
-  startStream();
-  await poll();
+  if (connecting || connected || document.hidden) return;
+  connecting = true;
+  clearTimeout(pollTimer);
+  const version = connectionVersion;
+  try {
+    const snapshot = await api("state");
+    if (version !== connectionVersion || document.hidden) return;
+    data = snapshot;
+    connected = true;
+    latestSample = null;
+    receivedSamples = 0; renderedFrames = 0; skippedSamples = 0;
+    statsStarted = performance.now(); lastFrame = null;
+    positionLiveBlocked = true;
+    resetInputs();
+    startStream();
+    notice("监控已自动连接；不会自动使能或恢复旧目标。");
+    await poll();
+  } catch (error) {
+    if (version === connectionVersion) connectionLost(error);
+  } finally {connecting = false; render();}
 }
 
-function initialConnect() {
-  if (initialConnectPending && !document.hidden) action(connect);
-}
-
-$("connect").addEventListener("click", () => action(connect));
-$("claim").addEventListener("click", () => action(claim));
-$("disconnect").addEventListener("click", () => { relinquish(); notice("已断开。失能请求已提交，最终结果以电机反馈为准。"); });
 $("enable").addEventListener("click", () => action(async () => {
   resetInputs();
   const epoch = positionUpdateEpoch;
@@ -945,6 +960,7 @@ $("enable").addEventListener("click", () => action(async () => {
   await confirmOperation(result.operation_id);
 }));
 $("stop").addEventListener("click", async () => {
+  stopEpoch += 1;
   positionLiveBlocked = true;
   resetInputs();
   try { notice((await api("stop", {})).message); }
@@ -1058,7 +1074,7 @@ function draftTarget() {
   return target;
 }
 
-$("task-kind").addEventListener("change", () => renderTask(connected && Boolean(session) && data?.has_control));
+$("task-kind").addEventListener("change", () => renderTask(connected && !document.hidden && data?.connected));
 $("prepare-task").addEventListener("click", () => {
   $("live-targets").checked = false;
   $("live-targets").dispatchEvent(new Event("change"));
@@ -1098,7 +1114,6 @@ $("task-form").addEventListener("submit", event => {
   });
 });
 $("cancel-task").addEventListener("click", () => $("stop").click());
-$("quick-stop").addEventListener("click", () => $("stop").click());
 document.addEventListener("keydown", event => {
   if (event.key === "Escape" && !event.repeat) { event.preventDefault(); $("stop").click(); }
 });
@@ -1329,10 +1344,10 @@ setInterval(async () => {
   finally { heartbeatPending = false; }
 }, 150);
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden && connected) { relinquish(); notice("页面已隐藏，控制权已释放；返回后需重新连接。"); }
-  else if (!document.hidden) initialConnect();
+  if (document.hidden && connected) { relinquish(true); notice("页面已隐藏，操作会话已结束；保留只读监控。"); }
+  else if (!document.hidden) {if (!connected) connect(); else render();}
 });
-window.addEventListener("pagehide", relinquish);
+window.addEventListener("pagehide", () => relinquish());
 window.addEventListener("resize", () => { updatePinnedLayout(); draw(); });
 $("endpoint").textContent = `服务地址：${location.origin} · 浏览器心跳 150 ms · 无登录鉴权，仅用于可信隔离网络`;
 render();
@@ -1343,4 +1358,4 @@ for (const element of [$("status-dock"), $("plot-panel"), document.querySelector
 updatePinnedLayout();
 draw();
 setInterval(() => animate(performance.now()), 20);
-initialConnect();
+connect();

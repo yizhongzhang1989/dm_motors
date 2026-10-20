@@ -13,9 +13,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from ament_index_python.packages import get_package_share_directory
+import pytest
 
 
-def available_port_block():
+def available_port_block(count=3):
     for _ in range(32):
         sockets = []
         try:
@@ -23,9 +24,9 @@ def available_port_block():
             sockets.append(first)
             first.bind(("0.0.0.0", 0))
             port = first.getsockname()[1]
-            if port > 65533:
+            if port > 65536 - count:
                 continue
-            for offset in (1, 2):
+            for offset in range(1, count):
                 extra = socket.socket()
                 sockets.append(extra)
                 extra.bind(("0.0.0.0", port + offset))
@@ -36,7 +37,7 @@ def available_port_block():
         finally:
             for item in sockets:
                 item.close()
-    raise RuntimeError("Could not allocate three consecutive test ports")
+    raise RuntimeError("Could not allocate consecutive test ports")
 
 
 def stop_process(process):
@@ -49,8 +50,14 @@ def stop_process(process):
             process.wait(timeout=3)
 
 
-def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors():
-    port = available_port_block()
+@pytest.mark.parametrize("entry,node_count", [
+    ("dual_motor.launch.py", 7),
+    ("lead_follow.launch.py", 9),
+    ("lead_follow_hardware.launch.py", 9),
+])
+def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors(entry, node_count):
+    follow = entry.startswith("lead_follow")
+    port = available_port_block(4 if follow else 3)
     namespace = f"bringup_test_{os.getpid()}_{time.monotonic_ns()}"
     environment = dict(os.environ, ROS_DOMAIN_ID=str(80 + os.getpid() % 40))
     # Explicit config prevents any hardware access even if the default regresses.
@@ -58,10 +65,12 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
     opener = build_opener(ProxyHandler({}))
     with tempfile.TemporaryFile(mode="w+") as log:
         command = [
-            "ros2", "launch", "dm_motor_bringup", "dual_motor.launch.py",
+            "ros2", "launch", "dm_motor_bringup", entry,
             f"config:={config}", f"namespace:={namespace}",
             f"can_dashboard_port:={port}", f"motor_dashboard_base_port:={port + 1}",
         ]
+        if follow:
+            command.append(f"follow_dashboard_port:={port + 3}")
         process = subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
         snapshots = {}
         last_error = ""
@@ -80,7 +89,9 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
                 can_ready = (snapshots.get(0, {}).get("connected") and
                              (snapshots.get(0, {}).get("status") or {}).get("ready"))
                 motors_ready = all(
-                    (snapshots.get(offset, {}).get("state") or {}).get("ready")
+                    snapshots.get(offset, {}).get("connected")
+                    and (snapshots.get(offset, {}).get("state") or {}).get("ready")
+                    and (snapshots.get(offset, {}).get("capabilities") or {}).get("ready")
                     for offset in (1, 2))
                 if can_ready and motors_ready:
                     break
@@ -125,8 +136,19 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
                 finally:
                     with opener.open(Request(origin + "/api/release", data=b"{}", headers=headers), timeout=2) as response:
                         assert response.status == 200
+            if follow:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    with opener.open(f"http://127.0.0.1:{port + 3}/api/state", timeout=2) as response:
+                        follow_state = json.load(response)
+                    if follow_state["connected"] and follow_state["state"]["stop_confirmed"]:
+                        break
+                    time.sleep(0.05)
+                assert follow_state["connected"] and follow_state["state"]["phase"] == 0
+                assert not follow_state["has_owner"]
+                assert follow_state["controller"] == f"/{namespace}/lead_follow"
             log.seek(0)
-            assert log.read().count("process started with pid") == 7
+            assert log.read().count("process started with pid") == node_count
             epoch = snapshots[0]["status"]["epoch"]
             for overrides in ([], ["dashboards:=false"]):
                 with tempfile.TemporaryFile(mode="w+") as duplicate_log:
@@ -139,7 +161,8 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
                         stop_process(duplicate)
                     duplicate_log.seek(0)
                     output = duplicate_log.read()
-                    assert "bringup already running" in output
+                    assert ("bringup already running" in output
+                            or (follow and "Lead Follow dashboard" in output and "unavailable" in output))
                     assert "process started with pid" not in output
                 with opener.open(f"http://127.0.0.1:{port}/api/state", timeout=2) as response:
                     assert json.load(response)["status"]["epoch"] == epoch

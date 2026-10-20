@@ -16,6 +16,8 @@
   <exec_depend>can_bus_dashboard</exec_depend>
   <exec_depend>dm_motor_control</exec_depend>
   <exec_depend>dm_motor_dashboard</exec_depend>
+  <exec_depend>dm_motor_lead_follow</exec_depend>
+  <exec_depend>dm_motor_lead_follow_dashboard</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_index_python</test_depend>

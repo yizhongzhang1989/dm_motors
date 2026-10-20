@@ -5,5 +5,6 @@ string token
 uint64 sequence
 float64 valid_for
 MotorTarget target
-# false: continually refreshed stream; true: hold only while the owning lease is live.
+# No exclusive lease/token required for streams; latest accepted source wins.
+# false: continually refreshed stream; true: hold while this non-exclusive keepalive session is live.
 bool hold_until_lease_expiry

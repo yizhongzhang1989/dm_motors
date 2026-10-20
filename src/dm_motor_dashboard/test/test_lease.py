@@ -138,8 +138,6 @@ class LeaseTimerTests(unittest.TestCase):
         self.assertEqual(node.task["state"], "submitting")
         node.tick()
         node.publisher.publish.assert_not_called()
-        with self.assertRaises(dashboard.ApiError):
-            node.apply("browser", self.task_body()["target"])
         result = Future()
         handle = SimpleNamespace(accepted=True, get_result_async=lambda: result)
         node.task_client.send_goal_async.return_value.set_result(handle)
@@ -160,6 +158,20 @@ class LeaseTimerTests(unittest.TestCase):
         node.start_task("browser", self.task_body())
         callback(SimpleNamespace(feedback=RunTask.Feedback(elapsed=0.9, progress=0.9)))
         self.assertIsNone(node.task["feedback"], "Late feedback from a prior task cannot overwrite a new task")
+
+    def test_manual_target_can_replace_a_running_task(self):
+        node = self.task_node()
+        node.start_task("browser", self.task_body())
+        result = Future()
+        handle = SimpleNamespace(accepted=True, get_result_async=lambda: result)
+        node.task_client.send_goal_async.return_value.set_result(handle)
+        self.assertEqual(node.task["state"], "running")
+        node.apply("browser", self.task_body()["target"])
+        self.assertEqual(node.task["state"], "stopped")
+        self.assertTrue(node.armed)
+        result.set_result(SimpleNamespace(result=RunTask.Result(
+            success=False, message="Superseded", final_position=0.0)))
+        self.assertTrue(node.armed, "Old task result must not clear a newer manual target")
 
     def test_stop_and_late_goal_acceptance_cannot_restore_task(self):
         node = self.task_node()
