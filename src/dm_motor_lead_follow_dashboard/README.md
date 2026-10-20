@@ -1,6 +1,8 @@
 # dm_motor_lead_follow_dashboard
 
-独立的 Lead Follow Web 控制面板，默认 <http://127.0.0.1:8083/>。
+独立的 Lead Follow Web 控制面板，默认监听 `0.0.0.0:8083`（所有本机 IPv4 接口）。
+本机访问 <http://127.0.0.1:8083/>；其它机器访问 `http://服务主机的局域网IP:8083/`，
+无需额外指定 host 参数。`0.0.0.0` 是监听地址，不是浏览器访问地址。
 原有 CAN Dashboard 和两个单电机 Dashboard 保持各自通用职责及端口，
 单机面板的操作/监控分离适用于所有电机场景，不包含主从专用功能。
 面板只调用主从控制器的配置/控制接口，**不直接获取电机租约或发布单机目标**。
@@ -10,25 +12,24 @@
 在工作空间构建并加载环境后：
 
 ```bash
-# 完整仿真系统：原有三个通用面板 + 独立主从面板
+# 完整真机系统：原有三个通用面板 + 独立主从面板，仍默认失能
 ros2 launch dm_motor_bringup lead_follow.launch.py
-
-# 完整真机系统：不启动模拟器，仍默认失能
-ros2 launch dm_motor_bringup lead_follow_hardware.launch.py
 
 # 主从控制器已经运行时，只添加这个面板，避免重复启动设备/控制器
 ros2 launch dm_motor_lead_follow_dashboard dashboard.launch.py
 ```
 
 如果启动主从控制器时就需要面板，`ros2 launch dm_motor_lead_follow lead_follow.launch.py`
-默认也会启动本包。不要再重复运行第三条命令。
+默认也会启动本包。不要重复启动独立面板。
+bringup 不再提供单独仿真入口或 `_hardware` 别名；无后缀的系统入口默认连接真机，
+与只附加控制器/面板的独立包入口不同。
 
 | launch 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `namespace` | 空 | 与主从控制器所在命名空间一致 |
 | `controller_namespace` | `lead_follow` | 相对部署 namespace 或绝对控制器路径 |
 | `follow_dashboard` | `true` | 是否启动专用面板 |
-| `follow_dashboard_host` | `127.0.0.1` | 默认只允许本机访问；可信局域网可显式改为 `0.0.0.0` |
+| `follow_dashboard_host` | `0.0.0.0` | 默认允许其它机器经局域网访问；显式设为 `127.0.0.1` 可限制仅本机 |
 | `follow_dashboard_port` | `8083` | 与三个通用面板独立的端口 |
 
 系统入口会在启动设备前检查专用端口占用及与通用面板计划端口的冲突。
@@ -37,7 +38,7 @@ ros2 launch dm_motor_lead_follow_dashboard dashboard.launch.py
 
 ### 启动提示端口占用
 
-`Lead Follow dashboard 127.0.0.1:8083 unavailable: ... Address already in use`
+`Lead Follow dashboard 0.0.0.0:8083 unavailable: ... Address already in use`
 表示已有进程占用专用面板端口，不是电机使能或串口通信失败。
 若已有主从系统正在运行，直接打开其面板，不要重复执行完整启动命令。
 

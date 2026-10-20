@@ -25,7 +25,7 @@ colcon build --packages-up-to dm_motor_bringup --symlink-install \
   --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
 
-# 一条仿真 CAN、两台电机、三个通用 dashboard、独立主从面板和控制器；不自动使能
+# 真实 CAN、两台电机、三个通用 dashboard、独立主从面板和控制器；不自动使能
 ros2 launch dm_motor_bringup lead_follow.launch.py
 # 只关闭通用面板：dashboards:=false；完全无网页：再加 follow_dashboard:=false
 ```
@@ -47,16 +47,18 @@ ros2 launch dm_motor_lead_follow lead_follow.launch.py namespace:=robot \
 真机应先依照工作空间主 README 完成供电、安装、物理停止和单机保护检查，再启动：
 
 ```bash
-ros2 launch dm_motor_bringup lead_follow_hardware.launch.py
+ros2 launch dm_motor_bringup lead_follow.launch.py
 # 完全无网页模式：
-# ros2 launch dm_motor_bringup lead_follow_hardware.launch.py dashboards:=false follow_dashboard:=false
+# ros2 launch dm_motor_bringup lead_follow.launch.py dashboards:=false follow_dashboard:=false
 ```
 
 该入口默认读取 `dm_motor_control/config/dual_serial.yaml`，一次启动真实 CAN 服务、
 两台电机、原有三个通用 dashboard、独立主从面板和控制器，不启动协议模拟器。
 连接前核对该配置中的串口路径、电机 ID 和通信参数；
 自定义总线配置可通过 `config:=/绝对路径/配置.yaml` 指定。
-支持与仿真入口相同的 `namespace`、`leader`、`follower`、`follow_config` 和 dashboard 参数。
+支持 `namespace`、`leader`、`follower`、`follow_config` 和 dashboard 参数。
+bringup 只保留无 `_hardware` 后缀的真机入口，不再提供单独的仿真 launch。
+离线回归继续通过显式模拟配置运行，不代表默认启动会使用模拟器。
 如果真机电机系统已运行，仍只启动上面的独立控制器入口，不要重复启动总线。
 
 这些命令不使能。开始跟随前确保两台处于 MIT 模式、静止、有新鲜失能反馈、无故障、
@@ -89,6 +91,8 @@ ros2 service call /lead_follow/stop std_srvs/srv/Trigger '{}'
 其他控制者使一台失能后，跟随控制器将停止另一台。
 独立 [Lead Follow Dashboard](../dm_motor_lead_follow_dashboard/README.md) 默认位于
 <http://127.0.0.1:8083/>，支持统一开始/停止、主从交换、方向、增益与运动限制配置。
+所有 Dashboard 默认监听 `0.0.0.0`，其它机器可将上述地址替换为服务主机的局域网 IP，
+不需要额外指定 host。网络和防火墙仍须允许访问，仅用于可信内网。
 它不改变三个通用面板。通过该面板开始时，关闭/隐藏控制页面或面板进程失联会触发操作心跳停止。
 通过上述 CLI Trigger 开始的跟随不要求网页心跳，关闭原有通用网页**不会**停止，必须显式调用 stop。
 正常 SIGINT/SIGTERM 退出尽力请求失能并等待最多 3 秒。进程崩溃/SIGKILL 时，电机驱动的
@@ -135,7 +139,7 @@ ros2 param set /lead_follow kp 4.0
 ```
 
 范围非法、非有限参数或运行中修改会明确拒绝。角色、频率、超时修改需停止后重启控制器。
-既有电机 `direction` 不会被修改；默认仿真中 motor_2 的 direction=-1，
+既有电机 `direction` 不会被修改；离线测试用的模拟配置中 motor_2 的 direction=-1，
 所以逻辑同向不一定等于原始轴坐标同向。
 
 ## 验证
@@ -152,7 +156,7 @@ colcon test-result --verbose
 
 以下为取消独占控制权之前的历史记录；其中租约冲突拒绝行为已由非独占多源输入取代。
 
-使用 `lead_follow_hardware.launch.py`、现场 USB2CAN、ID 1/2，实际反馈均为
+使用真机组合入口（现为 `lead_follow.launch.py`）、现场 USB2CAN、ID 1/2，实际反馈均为
 `simulated=false`。因未取得本次现场运动安全确认，全程不使能、不发送运动目标。
 
 - 两轴 MIT 模式、TIMEOUT=4000（200 ms）回读通过；PMAX=12.5、VMAX=50、TMAX=10。

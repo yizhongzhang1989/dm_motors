@@ -5,15 +5,13 @@ from pathlib import Path
 
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch.substitutions import PathJoinSubstitution
-from launch_ros.substitutions import FindPackageShare
 import yaml
 
 
 def dashboard_arguments():
     return [
         DeclareLaunchArgument("follow_dashboard", default_value="true"),
-        DeclareLaunchArgument("follow_dashboard_host", default_value="127.0.0.1"),
+        DeclareLaunchArgument("follow_dashboard_host", default_value="0.0.0.0"),
         DeclareLaunchArgument("follow_dashboard_port", default_value="8083"),
     ]
 
@@ -46,8 +44,7 @@ def check_dashboard_endpoint(context):
 def check_system_dashboard_endpoint(context):
     if (LaunchConfiguration("follow_dashboard").perform(context).lower() == "true"
             and LaunchConfiguration("dashboards", default="true").perform(context).lower() == "true"):
-        default_config = PathJoinSubstitution([FindPackageShare("dm_motor_control"), "config", "sim_bus.yaml"])
-        path = Path(LaunchConfiguration("config", default=default_config).perform(context)).expanduser()
+        path = Path(LaunchConfiguration("config").perform(context)).expanduser()
         with path.open(encoding="utf-8") as stream:
             document = yaml.safe_load(stream)
         if not isinstance(document, dict) or not isinstance(document.get("/**"), dict):

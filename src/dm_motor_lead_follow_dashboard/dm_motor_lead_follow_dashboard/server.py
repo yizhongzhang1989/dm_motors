@@ -81,7 +81,7 @@ def parameter_value(value):
 class Dashboard(Node):
     def __init__(self, **kwargs):
         super().__init__("lead_follow_dashboard", start_parameter_services=False, **kwargs)
-        self.host = self.declare_parameter("host", "127.0.0.1").value
+        self.host = self.declare_parameter("host", "0.0.0.0").value
         self.port = self.declare_parameter("port", 8083).value
         controller = self.declare_parameter("controller_namespace", "lead_follow").value
         if not isinstance(controller, str) or not controller or controller.endswith("/"):

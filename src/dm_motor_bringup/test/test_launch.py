@@ -33,10 +33,10 @@ def configured_launch(module=bringup, **overrides):
     return context, include, forwarded
 
 
-def test_default_configuration_enables_all_dashboards_and_simulation():
+def test_default_configuration_uses_real_motors_and_all_dashboards():
     _, _, forwarded = configured_launch()
     assert forwarded == {
-        "config": str(Path(get_package_share_directory("dm_motor_control")) / "config/sim_bus.yaml"),
+        "config": str(Path(get_package_share_directory("dm_motor_control")) / "config/dual_serial.yaml"),
         "namespace": "",
         "control_rate": "",
         "dashboard_host": "0.0.0.0",
@@ -106,18 +106,9 @@ def test_occupied_dashboard_port_aborts_before_starting_any_nodes():
 
 
 def test_hardware_entry_selects_serial_and_never_adds_simulator(monkeypatch):
-    path = Path(__file__).resolve().parents[1] / "launch/dual_motor_hardware.launch.py"
-    hardware_spec = importlib.util.spec_from_file_location("dual_motor_hardware", path)
-    hardware = importlib.util.module_from_spec(hardware_spec)
-    hardware_spec.loader.exec_module(hardware)
-    context, outer, forwarded = configured_launch(module=hardware, namespace="hardware_test")
+    context, inner, forwarded = configured_launch(namespace="hardware_test")
     expected = str(Path(get_package_share_directory("dm_motor_control")) / "config/dual_serial.yaml")
-    assert forwarded == {"config": expected}
-    child = outer.launch_description_source.get_launch_description(context)
-    for entity in child.entities:
-        if isinstance(entity, DeclareLaunchArgument):
-            entity.execute(context)
-    inner = next(entity for entity in child.entities if isinstance(entity, IncludeLaunchDescription))
+    assert forwarded["config"] == expected
     for name, value in inner.launch_arguments:
         context.launch_configurations[name] = perform_substitutions(
             context, normalize_to_list_of_substitutions(value))
@@ -152,33 +143,23 @@ def test_included_port_collision_guard_is_preserved(monkeypatch):
         compose.execute(context)
 
 
-@pytest.mark.parametrize("entry,config_name,backend", [
-    ("lead_follow.launch.py", "sim_bus.yaml", "sim"),
-    ("lead_follow_hardware.launch.py", "dual_serial.yaml", "serial"),
+@pytest.mark.parametrize("override,config_name,backend", [
+    (False, "dual_serial.yaml", "serial"),
+    (True, "sim_bus.yaml", "sim"),
 ])
 def test_lead_follow_composes_existing_system_and_namespaced_controller(
-        monkeypatch, entry, config_name, backend):
-    path = Path(__file__).resolve().parents[1] / "launch" / entry
+        monkeypatch, override, config_name, backend):
+    path = Path(__file__).resolve().parents[1] / "launch/lead_follow.launch.py"
     follow_spec = importlib.util.spec_from_file_location("lead_follow_bringup", path)
     module = importlib.util.module_from_spec(follow_spec)
     follow_spec.loader.exec_module(module)
     context = LaunchContext()
     context.launch_configurations.update(
         namespace="bench", leader="motor_2", follower="motor_1", dashboards="false")
+    if override:
+        context.launch_configurations["config"] = str(
+            Path(get_package_share_directory("dm_motor_control")) / "config" / config_name)
     description = module.generate_launch_description()
-    if backend == "serial":
-        for entity in description.entities:
-            if isinstance(entity, DeclareLaunchArgument):
-                entity.execute(context)
-        wrapper = next(entity for entity in description.entities
-                       if isinstance(entity, IncludeLaunchDescription))
-        forwarded = {
-            name: perform_substitutions(context, normalize_to_list_of_substitutions(value))
-            for name, value in wrapper.launch_arguments
-        }
-        assert forwarded == {"config": str(
-            Path(get_package_share_directory("dm_motor_control")) / "config" / config_name)}
-        description = wrapper.launch_description_source.get_launch_description(context)
     for entity in description.entities:
         if isinstance(entity, DeclareLaunchArgument):
             entity.execute(context)
@@ -225,13 +206,22 @@ def test_lead_follow_composes_existing_system_and_namespaced_controller(
     web_node = next(entity for entity in web.entities if isinstance(entity, dict))
     assert web_node["package"] == "dm_motor_lead_follow_dashboard"
     assert web_node["parameters"][0]["port"].evaluate(context) == 8083
+    assert web_node["parameters"][0]["host"].evaluate(context) == "0.0.0.0"
     assert web_node["namespace"].perform(context) == "bench"
 
 
-def test_lead_follow_hardware_preserves_explicit_config_override():
-    path = Path(__file__).resolve().parents[1] / "launch/lead_follow_hardware.launch.py"
-    spec = importlib.util.spec_from_file_location("lead_follow_hardware_override", path)
+def test_lead_follow_preserves_explicit_config_override():
+    path = Path(__file__).resolve().parents[1] / "launch/lead_follow.launch.py"
+    spec = importlib.util.spec_from_file_location("lead_follow_override", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     _, _, forwarded = configured_launch(module=module, config="/tmp/custom-follow-bus.yaml")
     assert forwarded == {"config": "/tmp/custom-follow-bus.yaml"}
+
+
+def test_only_two_hardware_bringup_entries_are_shipped():
+    expected = {"dual_motor.launch.py", "lead_follow.launch.py"}
+    for directory in (
+            Path(__file__).resolve().parents[1] / "launch",
+            Path(get_package_share_directory("dm_motor_bringup")) / "launch"):
+        assert {path.name for path in directory.glob("*.launch.py")} == expected

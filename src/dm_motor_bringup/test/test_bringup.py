@@ -53,7 +53,6 @@ def stop_process(process):
 @pytest.mark.parametrize("entry,node_count", [
     ("dual_motor.launch.py", 7),
     ("lead_follow.launch.py", 9),
-    ("lead_follow_hardware.launch.py", 9),
 ])
 def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors(entry, node_count):
     follow = entry.startswith("lead_follow")
@@ -139,7 +138,7 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
             if follow:
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
-                    with opener.open(f"http://127.0.0.1:{port + 3}/api/state", timeout=2) as response:
+                    with opener.open(f"http://127.0.0.2:{port + 3}/api/state", timeout=2) as response:
                         follow_state = json.load(response)
                     if follow_state["connected"] and follow_state["state"]["stop_confirmed"]:
                         break

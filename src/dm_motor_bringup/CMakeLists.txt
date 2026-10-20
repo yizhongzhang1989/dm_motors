@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.8)
 project(dm_motor_bringup)
 
 find_package(ament_cmake REQUIRED)
+install(CODE "file(REMOVE
+  \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/launch/dual_motor_hardware.launch.py\"
+  \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/launch/lead_follow_hardware.launch.py\")")
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)

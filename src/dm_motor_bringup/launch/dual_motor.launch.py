@@ -1,4 +1,4 @@
-"""Bring up one CAN bus, two motors and their dashboards; simulation by default."""
+"""Bring up the real dual-motor system; configure MIT mode while disabled, never enable."""
 
 import atexit
 from contextlib import ExitStack
@@ -72,7 +72,7 @@ def check_bringup_ownership(context):
 def generate_launch_description():
     control_share = FindPackageShare("dm_motor_control")
     defaults = {
-        "config": PathJoinSubstitution([control_share, "config", "sim_bus.yaml"]),
+        "config": PathJoinSubstitution([control_share, "config", "dual_serial.yaml"]),
         "namespace": "",
         "control_rate": "",
         "dashboards": "true",

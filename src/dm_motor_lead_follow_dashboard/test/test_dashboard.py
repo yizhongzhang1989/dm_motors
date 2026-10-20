@@ -12,12 +12,15 @@ import pytest
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
 from dm_motor_interfaces.msg import LeadFollowState, MotorState
 from dm_motor_interfaces.srv import LeadFollowControl
 from launch import LaunchContext
 
-from dm_motor_lead_follow_dashboard.launch_utils import check_system_dashboard_endpoint, check_dashboard_endpoint
+from dm_motor_lead_follow_dashboard.launch_utils import (
+    check_system_dashboard_endpoint, check_dashboard_endpoint, dashboard_arguments,
+)
 from dm_motor_lead_follow_dashboard.server import Dashboard, DashboardServer, ApiError, validate_settings
 
 
@@ -169,6 +172,7 @@ def test_invalid_settings_are_rejected(change):
 
 
 def test_no_automatic_control_and_static_assets(harness):
+    assert harness.dashboard.host == "0.0.0.0"
     snapshot = harness.request("/api/state")
     assert snapshot["connected"] and not snapshot["has_owner"]
     assert snapshot["state"]["stop_confirmed"]
@@ -185,6 +189,22 @@ def test_no_automatic_control_and_static_assets(harness):
     assert "showModal" not in javascript and "window.confirm" not in javascript
     assert b"/api/release" in harness.request("/dashboard.js")
     assert b"@media" in harness.request("/dashboard.css")
+
+
+def test_local_only_listening_remains_an_explicit_override(harness):
+    node = Dashboard(namespace=harness.dashboard.get_namespace() + "/local_only",
+                     parameter_overrides=[Parameter("host", value="127.0.0.1")])
+    try:
+        assert node.host == "127.0.0.1"
+    finally:
+        node.destroy_node()
+    for override in (None, "127.0.0.1"):
+        context = LaunchContext()
+        if override is not None:
+            context.launch_configurations["follow_dashboard_host"] = override
+        for argument in dashboard_arguments():
+            argument.execute(context)
+        assert context.launch_configurations["follow_dashboard_host"] == (override or "0.0.0.0")
 
 
 def test_sessions_configuration_start_and_stop(harness):
