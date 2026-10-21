@@ -34,6 +34,7 @@ packages:
         motor_id: 1
         master_id: 0
         can_bus_namespace: /can/main
+        require_virtual_bus: false
         can_fd: false
         control_rate: 200.0
         state_rate: 0.0
@@ -68,19 +69,85 @@ packages:
         port: 8081
         client_timeout: 0.75
         command_timeout: 0.25
+        simulation: false
+        shaft_stiffness: 1.0
+        shaft_damping: 0.05
+      sim_motor_node:
+        motor_name: motor_1
+        motor_id: 1
+        master_id: 0
+        mode: 1
+        can_bus_namespace: /can/virtual
+        physics_rate: 1000.0
+        state_rate: 50.0
+        integration_step: 0.0005
+        mapping_position: 12.5
+        mapping_velocity: 50.0
+        mapping_torque: 10.0
+        # Illustrative output-shaft/load parameters, not factory calibration.
+        inertia: 0.01
+        viscous_friction: 0.02
+        coulomb_friction: 0.03
+        static_friction: 0.05
+        gravity_torque: 0.0
+        gravity_offset: 0.0
+        max_torque: 10.0
+        no_load_speed: 50.0
+        torque_time_constant: 0.002
+        lower_limit: -1000000.0
+        upper_limit: 1000000.0
+        contact_stiffness: 200.0
+        contact_damping: 2.0
+        ambient_temperature: 25.0
+        heat_capacity: 100.0
+        thermal_resistance: 1.0
+        winding_resistance: 0.8
+        torque_constant: 1.0
+        initial_position: 0.0
+        initial_velocity: 0.0
+        bus_voltage: 48.0
+        velocity_kp: 1.0
+        velocity_ki: 0.0
+        position_kp: 8.0
+        position_ki: 0.0
+        anchor_stiffness: 0.5
+        persistence_file: ''
     launches:
       motor.launch.py:
         parameters:
           namespace: ''
           start_can_bus: true
           can_bus_namespace: ''
+          backend: serial
+          port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
           dashboard_host: 0.0.0.0
           dashboard_port: 8081
+        variants:
+          simulation:
+            parameters:
+              backend: virtual
+              port: ''
+            nodes:
+              dm_motor_control:
+                motor_node:
+                  host_protection_enabled: false
+                  position_limit: 0.0
+                  velocity_limit: 0.0
+                  torque_limit: 0.0
+                  position_min: -1.7976931348623157e+308
+                  position_max: 1.7976931348623157e+308
+                  measured_velocity_limit: 0.0
+                  measured_torque_limit: 0.0
+                  estimated_torque_limit: 0.0
+                  mos_temperature_stop: 0.0
+                  rotor_temperature_stop: 0.0
       dashboard.launch.py:
         parameters:
           namespace: ''
           dashboard_host: 0.0.0.0
           dashboard_port: 8081
+        variants:
+          simulation: {}
       bus.launch.py:
         parameters:
           namespace: ''
@@ -110,6 +177,26 @@ packages:
               bus: main
               motor_id: 2
               configure_mode_on_startup: true
+        variants:
+          simulation:
+            system:
+              buses:
+                main: {backend: virtual, port: '', can_fd: false}
+            devices: {}
+            nodes:
+              dm_motor_control:
+                motor_node:
+                  host_protection_enabled: false
+                  position_limit: 0.0
+                  velocity_limit: 0.0
+                  torque_limit: 0.0
+                  position_min: -1.7976931348623157e+308
+                  position_max: 1.7976931348623157e+308
+                  measured_velocity_limit: 0.0
+                  measured_torque_limit: 0.0
+                  estimated_torque_limit: 0.0
+                  mos_temperature_stop: 0.0
+                  rotor_temperature_stop: 0.0
   dm_motor_lead_follow:
     nodes:
       lead_follow_node:
@@ -176,6 +263,26 @@ packages:
               bus: main
               motor_id: 2
               configure_mode_on_startup: true
+        variants:
+          simulation:
+            system:
+              buses:
+                main: {backend: virtual, port: '', can_fd: false}
+            devices: {}
+            nodes:
+              dm_motor_control:
+                motor_node:
+                  host_protection_enabled: false
+                  position_limit: 0.0
+                  velocity_limit: 0.0
+                  torque_limit: 0.0
+                  position_min: -1.7976931348623157e+308
+                  position_max: 1.7976931348623157e+308
+                  measured_velocity_limit: 0.0
+                  measured_torque_limit: 0.0
+                  estimated_torque_limit: 0.0
+                  mos_temperature_stop: 0.0
+                  rotor_temperature_stop: 0.0
       lead_follow.launch.py:
         parameters:
           namespace: ''
@@ -210,3 +317,28 @@ packages:
           dm_motor_lead_follow:
             lead_follow_node:
               rate: 100.0
+        variants:
+          simulation:
+            system:
+              buses:
+                main: {backend: virtual, port: '', can_fd: false}
+            devices: {}
+            nodes:
+              dm_motor_control:
+                motor_node:
+                  host_protection_enabled: false
+                  position_limit: 0.0
+                  velocity_limit: 0.0
+                  torque_limit: 0.0
+                  position_min: -1.7976931348623157e+308
+                  position_max: 1.7976931348623157e+308
+                  measured_velocity_limit: 0.0
+                  measured_torque_limit: 0.0
+                  estimated_torque_limit: 0.0
+                  mos_temperature_stop: 0.0
+                  rotor_temperature_stop: 0.0
+              dm_motor_lead_follow:
+                lead_follow_node:
+                  kp: 4.0
+                  kd: 0.5
+                  motion_limits_enabled: false

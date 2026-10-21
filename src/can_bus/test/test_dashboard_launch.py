@@ -55,3 +55,18 @@ def test_port_bounds_and_busy_endpoint():
     with pytest.raises(ValueError, match="unique"):
         check_endpoints("127.0.0.1", [8080, 8080])
     assert check_endpoints("", []) is None
+
+
+def test_virtual_bus_cannot_be_given_a_physical_device(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "virtual_bus_launch", Path(__file__).resolve().parents[1] / "launch/can_bus.launch.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
+    context = LaunchContext()
+    context.launch_configurations.update(backend="virtual", port="/dev/ttyACM0")
+    for action in module.generate_launch_description().entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    with pytest.raises(ValueError, match="empty hardware port"):
+        module.start_bus(context)

@@ -26,7 +26,8 @@ class ConfigValue(Substitution):
 
     def perform(self, context):
         profile = profile_for_context(context, self.package, self.filename)
-        value = config_for_context(context).launch_value(*profile, self.key, node=self.node)
+        value = config_for_context(context).launch_value(
+            *profile, self.key, node=self.node, variant=variant_for_context(context))
         if isinstance(value, bool):
             return str(value).lower()
         if type(value) not in (str, int, float):
@@ -51,3 +52,7 @@ def profile_for_context(context, package, filename):
         LaunchConfiguration("config_package", default=package).perform(context),
         LaunchConfiguration("config_launch", default=filename).perform(context),
     )
+
+
+def variant_for_context(context):
+    return LaunchConfiguration("config_variant", default="").perform(context) or None

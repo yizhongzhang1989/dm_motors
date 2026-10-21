@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
   <title>达妙电机 · 监控与控制</title>
   <link rel="stylesheet" href="/dashboard.css">
+  <script src="/shaft.js" defer></script>
   <script src="/dashboard.js" defer></script>
 </head>
 <body>
@@ -97,11 +98,8 @@
       <form id="target-form">
         <div class="fields">
           <div class="wide-field position-field">
-            <div class="position-input"><label for="target-position">位置 <small>rad</small></label>
-            <input id="target-position" name="position" type="number" step="any" value="0" aria-describedby="range-position applied-position" required disabled>
-            <small id="range-position">等待范围</small><small id="applied-position" class="applied">服务目标：--</small>
-            <p class="subtle">顺时针 ＋ / 逆时针 −<br>松手保持，不回零</p></div>
             <div class="position-dial">
+            <div class="dial-title">目标位置 / 指令</div>
             <div id="position-scroll" class="position-wheel" role="spinbutton" tabindex="-1"
               aria-label="连续旋转目标位置滚轮" aria-controls="target-position"
               aria-describedby="position-wheel-help position-scroll-status"
@@ -112,6 +110,36 @@
             </div>
             <div class="position-scroll-scale" aria-hidden="true"><span id="position-scroll-min">--</span><span id="position-scroll-max">--</span></div>
             </div>
+            <div class="shaft-dial">
+              <div class="shaft-title">电机轴 / 实测反馈</div>
+              <svg id="shaft-disc" viewBox="0 0 280 280" role="img" aria-label="电机轴转角，等待反馈" aria-disabled="true" tabindex="-1">
+                <defs><marker id="shaft-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#ff8070"/></marker></defs>
+                <circle cx="140" cy="140" r="100" fill="#0b1423" stroke="#54799c" stroke-width="3"/>
+                <path d="M140 31V45 M235 140H249 M140 235V249 M31 140H45" stroke="#a7b8cd" stroke-width="2"/>
+                <text x="140" y="23" fill="#a7b8cd" text-anchor="middle">0°</text>
+                <g id="shaft-rotor" aria-hidden="true">
+                  <path d="M140 140V49 M140 140L185 169 M140 140L95 169" stroke="#63b8ff" stroke-width="5" stroke-linecap="round"/>
+                  <circle cx="140" cy="49" r="8" fill="#63b8ff"/>
+                </g>
+                <circle cx="140" cy="140" r="12" fill="#cad9e9"/>
+                <g id="shaft-anchor" display="none" aria-hidden="true">
+                  <line id="shaft-anchor-spring" stroke="#b59bff" stroke-width="3" stroke-dasharray="5 4"/>
+                  <circle id="shaft-anchor-contact" r="5" fill="#b59bff"/>
+                  <circle id="shaft-anchor-point" r="10" fill="#564282" stroke="#d9ccff" stroke-width="3"/>
+                </g>
+                <g id="shaft-hand" display="none" pointer-events="none" aria-hidden="true">
+                  <circle id="shaft-goal" r="8" fill="none" stroke="#80e5f0" stroke-width="3"/>
+                  <circle id="shaft-contact" r="6" fill="#ff8070"/>
+                  <line id="shaft-force" stroke="#ff8070" stroke-width="4" marker-end="url(#shaft-arrow)"/>
+                </g>
+              </svg>
+              <output id="shaft-position">-- rad</output>
+              <small id="shaft-status" role="status">等待轴反馈</small>
+            </div>
+            <div class="position-input"><label for="target-position">目标位置 <small>rad</small></label>
+            <input id="target-position" name="position" type="number" step="any" value="0" aria-describedby="range-position applied-position" required disabled>
+            <small id="range-position">等待范围</small><small id="applied-position" class="applied">服务目标：--</small>
+            <p class="subtle">目标滚轮：顺时针 ＋ / 逆时针 −，松手保留目标。轴圆盘：仿真拖动施力，松手撤销手力；双击添加持久锚点，双击紫点取消。</p></div>
             <details class="wheel-help"><summary>滚轮操作说明</summary><small id="position-wheel-help">沿外圈顺时针 ＋ / 逆时针 − 拖动，也可滚动鼠标滚轮或用方向键微调；到达当前模式/行程限位后停止旋转，反向即可离开边界。</small></details>
             <small id="position-scroll-status" role="status">等待当前位置；未使能时只修改草稿。</small>
           </div>

@@ -8,8 +8,11 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from common.dashboard import check_endpoints
-from common.launch import config_argument, ConfigValue, config_for_context, profile_arguments
-from dm_motor_control.launch_utils import load_parameters, dashboard_ports, node_parameters
+from common.launch import config_argument, ConfigValue, config_for_context, profile_arguments, variant_for_context
+from dm_motor_control.launch_utils import (
+    load_parameters, dashboard_ports, node_parameters, simulation_arguments, simulation_enabled,
+    simulation_device_parameters, selected_profile,
+)
 
 PACKAGE, LAUNCH = "dm_motor_control", "bus.launch.py"
 
@@ -17,6 +20,7 @@ PACKAGE, LAUNCH = "dm_motor_control", "bus.launch.py"
 def compose(context):
     config = config_for_context(context)
     parameters = load_parameters(context)
+    simulated = simulation_enabled(context)
     names = parameters.get("motor_names", [])
     buses = parameters.get("bus_names", [])
     if (not isinstance(names, list) or not isinstance(buses, list) or not names or not buses
@@ -24,6 +28,10 @@ def compose(context):
                    for name in names + buses)
             or len(set(names)) != len(names) or len(set(buses)) != len(buses)):
         raise ValueError("motor_names and bus_names must be nonempty unique lists")
+    if simulated:
+        devices = config.launch(*selected_profile(context), variant=variant_for_context(context)).get("devices", {})
+        if not isinstance(devices, dict) or set(devices) - set(names):
+            raise ValueError("Simulation devices must name configured motors")
     root = LaunchConfiguration("namespace").perform(context).strip("/")
     motor_config = parameters.get("motors", {})
     bus_config = parameters.get("buses", {})
@@ -79,9 +87,13 @@ def compose(context):
                 raise ValueError("can_bitrate must be a whole number of bits per second")
             options["can_bitrate"] = int(bitrate)
         backend = options.get("backend", "sim")
-        if backend not in ("sim", "serial", "socketcan"):
+        if simulated and (backend != "virtual" or options.get("port")):
+            raise ValueError("Simulation permits only virtual CAN with empty hardware ports")
+        if backend not in ("sim", "virtual", "serial", "socketcan"):
             raise ValueError(f"Unsupported CAN backend: {backend}")
-        if backend != "sim":
+        if backend == "virtual" and options.get("port"):
+            raise ValueError("virtual CAN requires an empty hardware port")
+        if backend not in ("sim", "virtual"):
             port = options.get("port", "")
             if not port or port in hardware_paths:
                 raise ValueError("Hardware devices/interfaces must be explicit and have one owner")
@@ -120,6 +132,7 @@ def compose(context):
         bus_namespace = "/" + "/".join(part for part in (root, "can", bus_name) if part)
         values = {**values, "motor_name": name, "can_bus_namespace": bus_namespace,
                   "can_fd": bus_config[bus_name]["can_fd"],
+                  "require_virtual_bus": bus_config[bus_name]["backend"] == "virtual" or values.get("require_virtual_bus", False),
                   "config_file": str(config.path)}
         if rate is not None:
             values["control_rate"] = rate
@@ -129,11 +142,17 @@ def compose(context):
         nodes.append(Node(
             package="dm_motor_control", executable="motor_node", name="motor_controller",
             namespace=namespace, parameters=[values], output="screen"))
+        if simulated:
+            nodes.append(Node(
+                package=PACKAGE, executable="sim_motor_node", name="simulated_device",
+                namespace=namespace, output="screen",
+                parameters=[simulation_device_parameters(context, name, values, bus_namespace)]))
         if name in motor_ports:
             nodes.append(Node(
                 package="dm_motor_control", executable="dashboard.py", name="dashboard",
                 namespace=namespace,
                 parameters=[{**node_parameters(context, PACKAGE, "dashboard"),
+                             "simulation": simulated,
                              "motor_id": values.get("motor_id", 1), "host": host,
                              "port": motor_ports[name],
                              "command_timeout": values["command_timeout"], "config_file": str(config.path)}],
@@ -145,6 +164,7 @@ def generate_launch_description():
     return LaunchDescription([
         config_argument(),
         *profile_arguments(PACKAGE, LAUNCH),
+        *simulation_arguments(),
         DeclareLaunchArgument("config", default_value="",
                               description="Optional ROS topology override; empty uses common system configuration."),
         DeclareLaunchArgument("namespace", default_value=ConfigValue("namespace", PACKAGE, LAUNCH)),

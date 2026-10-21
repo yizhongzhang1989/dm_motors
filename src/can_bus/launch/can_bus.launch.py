@@ -12,6 +12,8 @@ PACKAGE, LAUNCH = "can_bus", "can_bus.launch.py"
 
 def start_bus(context):
     value = lambda name: LaunchConfiguration(name).perform(context)
+    if value("backend") == "virtual" and value("port"):
+        raise ValueError("virtual CAN requires an empty hardware port")
     fd = value("can_fd").lower()
     if fd not in ("true", "false"):
         raise ValueError("can_fd must be true or false")

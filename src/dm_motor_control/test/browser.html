@@ -40,7 +40,7 @@
           document.head.append(script);
           script.remove();
         }
-        const motor = await runDashboardTests(...await sources("../web/"));
+        const motor = await runDashboardTests(...await sources("../web/", ["index.html", "dashboard.js", "dashboard.css", "shaft.js"]));
         output.textContent = `电机：${motor.checks} 项断言通过。\n正在验证 CAN 界面…`;
         const can = await runCanDashboardTests(...await sources("../../can_bus/web/"));
         output.dataset.status = "passed";

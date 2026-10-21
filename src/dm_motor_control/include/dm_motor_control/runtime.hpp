@@ -24,6 +24,7 @@ struct RegisterInfo
 };
 const std::vector<RegisterInfo> & register_catalog();
 bool raw_register_write_allowed(uint8_t rid);
+void validate_register_value(uint8_t rid, uint32_t raw);
 struct MotorConfig
 {
   std::string name;

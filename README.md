@@ -2,7 +2,10 @@
 
 ## Quickstart
 
-**默认连接真机，默认失能。** 启动前确认电源、接线、固定方式和物理停止措施，
+**新功能优先使用物理仿真，所有入口默认失能。**
+电机与 bringup 入口统一支持真机/仿真，**默认真机，只有 `simulation:=true` 才启动物理仿真**。
+仿真仅连接 Topic 虚拟总线，使用与真机相同的生产驱动。
+真机启动前确认电源、接线、固定方式和物理停止措施，
 并检查唯一运行配置 [config/dm_motors.yaml](config/dm_motors.yaml) 的
 所选入口（`packages.dm_motor_bringup.launches` 下完整 launch 文件名）的
 `system.buses` / `system.motors` 中的串口路径及电机 ID。
@@ -26,22 +29,38 @@ source install/setup.bash
 
 ### 2. 选择一个启动入口
 
-**主从跟随并开启四个面板**：显式指定所需面板端口。
+**推荐先用物理仿真开发 / 自动化测试**，不需要 USB2CAN 或电机：
+
+```bash
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
+  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+```
+
+启动虚拟 CAN、两台按时间积分的关节模型、生产电机驱动、主从控制器及四个面板。
+单机面板在目标位置滚轮旁增加实测电机轴圆盘：仿真时可拖动施加外力，松手撤销手力；
+双击圆盘可创建持久弹簧锚点，双击紫色锚点取消，松手后仍有恢复力。
+真机时只显示轴转角，不响应施力操作。没有额外的仿真页签或第二套面板。
+普通电机 Topic、CLI 和主从逻辑无需修改，`simulated=true` 仍明确标记数据来源。
+默认惯量/摩擦/负载参数不是工厂标定值；模型与实物的定量一致性需要现场辨识，
+不能以软件测试代替真实硬件安全或负载验收。
+
+**真机主从跟随并开启四个面板**：显式指定所需面板端口。
 
 ```bash
 ros2 launch dm_motor_bringup lead_follow.launch.py \
   can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
 ```
 
-**独立控制两台电机并开启三个通用面板**：改用下面的入口。
+**真机独立控制两台电机并开启三个通用面板**：改用下面的入口。
 
 ```bash
 ros2 launch dm_motor_bringup dual_motor.launch.py \
   can_dashboard_ports:=config motor_dashboard_ports:=config
 ```
 
-**两条命令二选一，不要同时运行。** 两者均默认加载真实串口配置，不启动模拟器，
-也不会自动使能。bringup 不再提供 `_hardware` 别名或独立仿真入口。
+**以上场景选一个运行，不要占用相同命名空间和端口。** 两个 `dm_motor_bringup` 入口
+默认加载真实串口配置，不启动模拟器，也不会自动使能。
+bringup 不提供 `_hardware` 或独立仿真入口；同一个 launch 通过 `simulation` 参数选择模式。
 
 **不提供面板端口时，默认只启动控制节点，不启动任何 Dashboard。**
 `config` 表示读取所选 package/launch 的端口配置（默认 CAN 8080、电机 8081/8082、主从 8083）。
@@ -106,8 +125,9 @@ Lead Follow dashboard ─ lead_follow 节点 ─ motor_1 / motor_2 的现有 Top
 ```
 
 **bringup 默认连接真机、默认失能，启动和打开网页均不自动使能或运动。**
-系统级只提供不带 `_hardware` 后缀的真机入口，不再单独创建仿真启动文件；
-底层模拟后端和测试配置仅用于显式指定的离线测试。
+bringup 只提供不带 `_hardware` 后缀的统一入口；
+物理仿真集成在 `dm_motor_control` 内，自动化开发对同一入口显式传入 `simulation:=true`。
+旧 `backend=sim` 和简单协议模拟器保留用于协议单元回归，不作为关节动力学模型。
 `can_bus` 是物理设备的唯一所有者，不解释达妙协议；每台电机由独立进程控制。
 以下操作方法对应当前 `src/` 布局，不需要参考旧单电机阶段的启动方式。
 
@@ -144,10 +164,10 @@ dm_motors/
 ├── src/
 │   ├── common/      # Python/C++ 集中配置读取与共享 launch 辅助
 │   ├── can_bus/              # CAN 服务、路由、内置总线面板与原始帧调试
-│   ├── dm_motor_interfaces/  # 电机 Topic 消息、异步命令和任务事件
+│   ├── dm_motor_interfaces/  # 电机 Topic、任务事件及仿真外力接口
 │   ├── dm_motor_bringup/     # 系统级启动入口，后续场景 launch 统一放在这里
 │   ├── dm_motor_lead_follow/ # 主从控制器及内置主从面板，显式开始/停止
-│   └── dm_motor_control/     # 独立电机节点、CLI、内置单机面板、协议模拟器和组合 launch
+│   └── dm_motor_control/     # 生产驱动、独立物理仿真节点、CLI、统一面板与双模式 launch
 ├── build/                   # 自动生成，不提交 Git
 ├── install/                 # 自动生成，不提交 Git
 ├── log/                     # 自动生成，不提交 Git
@@ -259,7 +279,7 @@ ros2 run dm_motor_control motor_client.py --namespace /motor_2 state
 ros2 launch dm_motor_bringup dual_motor.launch.py
 ```
 
-`dm_motor_bringup` 是系统级启动包，只提供两个默认真机入口：
+`dm_motor_bringup` 是系统级启动包，提供两个统一入口，均默认真机：
 
 - `dual_motor.launch.py`：读取同名 launch 配置中的 `system` 拓扑，连接真实适配器，不启动模拟器。
 - `lead_follow.launch.py`：在真实双电机系统上添加主从位置跟随控制器，仍不自动使能。
@@ -275,15 +295,16 @@ ros2 launch dm_motor_bringup dual_motor.launch.py
 
 复用 `dm_motor_control/bus.launch.py`，默认启动一条 CAN 总线及两台独立电机，不启动 Dashboard。
 默认不启动协议模拟器，始终不自动使能或运动。
-后续场景继续采用无后缀真机入口，不再按仿真/真机创建两份 launch，
-不重复实现总线/电机节点的组合逻辑。离线自动化测试显式覆盖 `config` 为模拟配置，
-而不是增加或依赖默认仿真入口。
+后续场景继续使用同一 launch，不按仿真/真机创建两份入口。
+`simulation:=true` 选择配置中的仿真变体，启动独立虚拟设备进程，生产驱动不变；
+省略时仍使用硬件配置。旧协议测试仍可显式覆盖 `config`，但公开仿真模式统一使用物理模型。
 
 bringup launch 参数：
 
 | 参数 | 默认值 | 用途 |
 | --- | --- | --- |
 | `config_file` | `COMMON_CONFIG` 或 `common` 安装的 `config/runtime.yaml` | 所有组件共享的运行配置，源文件仍为根目录 `config/dm_motors.yaml` |
+| `simulation` | `false` | `true` 选择物理仿真、虚拟 CAN 和可拖拽轴圆盘；仅启动时选择，不是 ROS 时钟开关 |
 | `config` | 空 | 可选的旧 ROS 拓扑覆盖文件，主要用于显式离线测试；空则使用当前 launch 的 `system` |
 | `namespace` | 空 | 部署前缀，例如 `robot` |
 | `control_rate` | 空（使用 YAML，当前 200 Hz） | 覆盖所有电机控制频率，20–1000 Hz；低于配置状态频率时同步降低状态频率 |
@@ -301,7 +322,7 @@ bringup launch 参数：
 底层 `dm_motor_control bus.launch.py` 同样按 `can_dashboard_ports` / `motor_dashboard_ports` 显式选择面板，
 单独启动时读取 `packages.dm_motor_control.launches["bus.launch.py"]`；
 被 bringup 包含时沿用顶层入口的 profile，避免串用子 launch 默认值。
-离线运行必须显式选择模拟配置，不要依赖旧版默认仿真行为。
+离线开发必须显式传入 `simulation:=true`；不要依赖旧版单电机入口默认使用协议模拟器的行为。
 
 **本机同一 ROS_DOMAIN_ID 和命名空间只运行一套 bringup。** 已启动时直接使用现有网页，
 不要再次执行同一启动命令。bringup 在创建任何节点前取得进程级独占锁并检查面板端口，
@@ -414,7 +435,8 @@ MIT 目标仍受映射范围限制，不能把紧凑反馈回绕当成目标位�
 
 | 后端 | 配置 | 边界 |
 | --- | --- | --- |
-| `sim` | 无物理设备 | 需要设备模拟器；通用 CAN 服务本身不模拟电机 |
+| `virtual` | `port` 必须为空 | 仅通过 `wire_tx/wire_rx` Topic 转发，绝不创建物理 transport；新物理仿真使用此后端 |
+| `sim` | 无物理设备 | 旧协议测试后端；通用 CAN 服务本身不模拟电机 |
 | `serial` | 稳定串口路径 | 旧 USB2CAN，921600/8N1；标准经典 CAN、通道 0，4 字节兼容填充到 8 字节 |
 | `socketcan` | 如 `port: can0` | 接口须由系统预先配置；支持相应经典 CAN/FD 能力 |
 
@@ -708,7 +730,7 @@ ros2 launch dm_motor_bringup lead_follow.launch.py \
 ```
 
 `dual_motor.launch.py` 和 `lead_follow.launch.py` 均默认连接真机；
-离线测试须显式传入模拟 `config`，不能把无后缀名称理解为仿真入口。
+离线开发请给同一入口增加 `simulation:=true`，不能把无后缀名称理解为默认仿真。
 启动后，在服务主机使用 `ip -br -4 addr` 查找与客户端网络相通的网卡 IP，
 例如 `192.168.1.10`，再从其他电脑打开：
 
@@ -767,7 +789,12 @@ ros2 run dm_motor_control motor_client.py --namespace /motor_1 export > motor_1_
 
 ### 5.2 任务示例：先用仿真
 
-以下有运动输出。离线学习须先显式加载模拟配置；无后缀的 bringup 入口默认是真机，不是仿真：
+以下有运动输出。先在一个终端启动纯虚拟场景，另一个终端加载环境后运行任务；
+无后缀的 bringup 入口默认是真机，不是仿真：
+
+```bash
+ros2 launch dm_motor_control bus.launch.py simulation:=true
+```
 
 ```bash
 # MIT 小幅定位，绝对位置以当前坐标为准
@@ -934,6 +961,7 @@ packages:
 | `position_min/position_max` | 可选非对称关节边界；无显式设置时按映射/偏置解析 |
 | `fault_group` | 空；独立轴，不因另一台设备保护错误联动 |
 | `legacy_control` | 兼容参数；`command` 现在始终接受无 token 的新鲜 MIT 目标，但不自动使能 |
+| `require_virtual_bus` | 默认 false；仿真入口强制 true，发现非 virtual 后端时拒绝注册和命令，防止误接物理总线 |
 
 配置是启动配置；模式、零点、参数和任务通过专门接口修改。
 本机实测 MIT 的 Kd 大于 1 容易振荡，因此发送命令及配置均拒绝超出 1 的 Kd。
@@ -947,8 +975,8 @@ packages:
 ### 7.1 只启动 CAN 服务
 
 ```bash
-# 无硬件的通用模拟线缆；不会自动生成设备反馈
-ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=sim
+# 无硬件的 Topic 虚拟总线；不会自动生成设备反馈
+ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=virtual
 
 # 或：独立打开真实适配器；不能与组合 launch 重复占用
 ros2 launch can_bus can_bus.launch.py namespace:=can/main \
@@ -983,10 +1011,10 @@ ros2 run dm_motor_control motor_node --ros-args \
   -p master_id:=0 -p can_bus_namespace:=/can/main
 ```
 
-需要完整单电机仿真时：
+需要完整单电机物理仿真时：
 
 ```bash
-ros2 launch dm_motor_control motor.launch.py motor_id:=1 backend:=sim
+ros2 launch dm_motor_control motor.launch.py simulation:=true motor_id:=1 dashboard_port:=config
 ```
 
 其默认 CAN 命名空间是 `/motor_1/can`，**不是**组合启动的 `/can/main`。
@@ -1014,6 +1042,8 @@ ros2 launch dm_motor_lead_follow dashboard.launch.py dashboard_port:=config
 单独改变 `motor_id` 不计算新端口，第二个实例需显式传入不同端口，或使用组合入口的命名映射。
 省略端口时连独立面板 launch 也不创建网页进程。显式指定的端口不会被自动改号。
 以上默认允许局域网访问，不会限制为仅本机；不要与组合启动重复启动同端口面板。
+为已经运行的物理仿真附加电机面板时，另传 `simulation:=true` 才启用轴圆盘交互；
+该独立面板入口不会创建驱动、总线或虚拟设备。未选择仿真时，轴圆盘始终只读。
 
 ### 7.4 在已有双电机系统上附加主从
 
@@ -1027,6 +1057,41 @@ ros2 launch dm_motor_lead_follow lead_follow.launch.py dashboard_port:=config
 需要部署前缀时传入与电机系统一致的
 `namespace`，或通过 `leader`、`follower` 指定绝对电机命名空间。
 已经运行完整主从 bringup 时，不要再执行本节命令。
+
+### 7.5 仿真外力与自动化开发
+
+新仿真使用与真机相同的 `motor_node`，提供相同的电机 Topic、模式、寄存器事务、
+零点、清错、保活和七类有界任务。虚拟固件独立执行 watchdog，不依赖主机驱动仍存活。
+物理模型包含惯量、粘性/库仑/静摩擦、重力、关节弹簧阻尼限位、力矩带宽与饱和、发热散热；
+即使没有 CAN 帧，或电机已失能，关节仍按时间在外力作用下运动。
+
+统一电机面板将目标滚轮和实测轴圆盘放大并排显示，目标位置输入框在两个圆盘下方；
+窄屏自动纵向排列圆盘，避免挤压。真机轴圆盘只读；仿真可连续跨圈拖动，不限制累计圈数或外力幅值。
+拖动通过有时效的弹性手柄施加外力，不改控制目标、不自动使能，
+也不瞬移轴位置。受力点、拖动点和箭头参考 ref 的交互设计；松手、取消、Esc 或离开页面会撤销临时手力。
+外力弹簧在每个物理子步计算，不由浏览器刷新频率决定；丢失刷新后最多 300 ms 到期。
+双击轴圆盘可添加零预载弹簧锚点：记录创建时的物理轴位置，偏离后持续产生恢复力，
+与临时手力相加。紫点和虚线显示固定点及转子接触点，双击紫点（或圆盘聚焦后按回车）取消。
+锚点属于虚拟环境，不受鼠标松开、停止驱动或网页刷新/关闭影响；重启仿真进程会清空。
+它不是锁轴或电机位置指令，不会自动使能。
+直接施力和弹性手柄都不再裁剪力矩，但仍拒绝 NaN/Infinity、过期和乱序输入；
+电机自身的电磁力矩上限和协议范围不因此放宽。
+仿真入口默认关闭可选软件运动保护和额外软限位；主从的 `motion_limits_enabled=false`，
+因此跟随误差、行程、速度、力矩、温度阈值与目标限速均不参与仿真停机。
+误差仍可观测，通信/数值错误、设备故障和协议编码检查仍生效；真机配置不变。
+程序可通过 `/motor_1/simulation/external_torque` 发布有时效外力矩，或通过
+`simulation/control` 注入故障、暂停反馈、设置供电电压及执行虚拟电源循环。
+普通电机消费者不需要调用这些额外接口。
+
+未来功能建议按以下顺序验证：
+
+1. 单元测试协议和控制算法；用解析解、步长及能量检查验证涉及的物理模型。
+2. 显式使用 `simulation:=true` 及隔离 ROS domain 运行 Topic/CLI/HTTP/主从端到端测试，
+   通过外力扰动、失联、故障和进程退出验证行为。
+3. 全工作空间回归通过后，再在现场批准的真机工况中校准参数并验收。仿真通过不代表任意真实负载通过。
+
+启动、物理参数含义、程序施力示例和覆盖矩阵见
+[物理仿真说明](src/dm_motor_control/SIMULATION.md)。
 
 ## 8. ROS 接口与控制模式
 
@@ -1234,6 +1299,9 @@ DDS 配置回归同时验证安装路径、保留用户配置、其他 RMW 不�
 以及真实 Fast DDS 参与者不再建立共享内存映射。
 当前还覆盖无 token 多发布者、各发布者序号、非活跃会话释放不影响其它输出、
 手动目标替换任务、主从与单机面板并存、主从网页心跳和面板崩溃停机。
+物理仿真回归另覆盖四模式、全部七类任务、49 项寄存器、读写/保存/掉电恢复、
+设备/软件零点、多圈反馈、外力时效和主从正反跟随、驱动进程死亡后的独立 watchdog、
+FD 虚拟帧、已有 CLI、外力 HTTP 以及误接物理后端时拒绝注册。
 bringup 测试显式覆盖模拟 `config`，同时静态检查默认入口为真机且仅安装两个无后缀 launch。
 
 查看模拟链路延迟与 500/1000 Hz 实测控制频率（不验证真实 USB/CAN 或电机）：
@@ -1281,6 +1349,9 @@ python3 -m http.server 18991 --bind 127.0.0.1 --directory src
 夹具不连接 CAN 或真实电机，其“真机”标签只用于覆盖请求分支，不代表真实运动验收。
 
 仿真集成用例验证实际 ROS / HTTP / SSE 链路，浏览器回归验证真实 DOM 与交互。
+物理仿真另提供[实际虚拟设备上的 Chromium 回归](src/dm_motor_control/SIMULATION.md#可选的真实浏览器回归)，
+自动创建和清理隔离场景，验证圆盘拖拽/撤力、真机只读、迟到请求、页面退出、通用控制及主从物理响应；
+可同时运行上面的静态回归并保存 JSON 结果和截图，不需要手动启动面板。
 二者都不认证真实负载、电气保护、固件停止效果或硬件急停；真机验收仍需遵循现场安全流程。
 
 ### 运行观测

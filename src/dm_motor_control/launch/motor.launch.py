@@ -4,7 +4,10 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import math
 from common.dashboard import dashboard_arguments, optional_port, check_endpoints
-from common.launch import config_argument, ConfigValue, config_for_context, profile_arguments, profile_for_context
+from common.launch import config_argument, ConfigValue, config_for_context, profile_arguments, profile_for_context, variant_for_context
+from dm_motor_control.launch_utils import (
+    node_parameters, simulation_arguments, simulation_enabled, simulation_device_parameters,
+)
 
 PACKAGE, LAUNCH = "dm_motor_control", "motor.launch.py"
 
@@ -24,8 +27,16 @@ def launch_motor(context):
     if not bus_namespace.startswith("/"):
         raise ValueError("can_bus_namespace must be absolute")
     config = config_for_context(context)
+    simulated = simulation_enabled(context)
+    if simulated and (value("backend") != "virtual" or value("port")):
+        raise ValueError("Simulation permits only virtual CAN with an empty hardware port")
+    if value("backend") == "virtual" and value("port"):
+        raise ValueError("virtual CAN requires an empty hardware port")
+    if value("backend") in ("serial", "socketcan") and not value("port"):
+        raise ValueError("Hardware mode requires an explicit CAN port/interface")
     profile = profile_for_context(context, PACKAGE, LAUNCH)
-    dashboard_port = optional_port(value("dashboard_port"), configured=config.launch_value(*profile, "dashboard_port"))
+    dashboard_port = optional_port(value("dashboard_port"), configured=config.launch_value(
+        *profile, "dashboard_port", variant=variant_for_context(context)))
     check_endpoints(value("dashboard_host"), [] if dashboard_port is None else [dashboard_port])
     nodes = []
     if boolean("start_can_bus"):
@@ -35,7 +46,7 @@ def launch_motor(context):
         nodes.append(Node(
             package="can_bus", executable="can_bus_node", name="can_bus",
             namespace=bus_namespace, output="screen",
-            parameters=[{**config.node_parameters("can_bus", "can_bus_node", profile),
+            parameters=[{**node_parameters(context, "can_bus", "can_bus_node"),
                          "backend": value("backend"), "port": value("port"),
                          "can_fd": boolean("can_fd"), "can_bitrate": int(bitrate), "config_file": str(config.path)}],
         ))
@@ -68,6 +79,7 @@ def launch_motor(context):
             "legacy_control": boolean("legacy_control"),
             "host_protection_enabled": boolean("host_protection_enabled"),
             "can_fd": boolean("can_fd"),
+            "require_virtual_bus": value("backend") == "virtual" or boolean("require_virtual_bus"),
             **{name: float(value(name)) for name in (
                 "control_rate", "state_rate", "command_timeout", "feedback_timeout",
                 "position_limit", "velocity_limit", "torque_limit", "kp_limit", "kd_limit",
@@ -77,12 +89,19 @@ def launch_motor(context):
                 "mos_temperature_stop", "rotor_temperature_stop", "max_task_duration")},
         }],
     ))
+    if simulated:
+        motor = {key: int(value(key)) for key in ("motor_id", "master_id", "mode")}
+        nodes.append(Node(
+            package=PACKAGE, executable="sim_motor_node", name="simulated_device",
+            namespace=namespace, output="screen",
+            parameters=[simulation_device_parameters(context, f"motor_{motor_id}", motor, bus_namespace)]))
     if dashboard_port is not None:
         nodes.append(Node(
             package="dm_motor_control", executable="dashboard.py", name="dashboard",
             namespace=namespace, output="screen",
-            parameters=[{**config.node_parameters(PACKAGE, "dashboard", profile),
+            parameters=[{**node_parameters(context, PACKAGE, "dashboard"),
                          "motor_id": motor_id, "host": value("dashboard_host"),
+                         "simulation": simulated,
                          "port": dashboard_port, "command_timeout": float(value("command_timeout")),
                          "config_file": str(config.path)}]))
     return nodes
@@ -92,7 +111,7 @@ def generate_launch_description():
     defaults = {name: ConfigValue(name, PACKAGE, LAUNCH, (PACKAGE, "motor_node")) for name in (
         "motor_id", "master_id", "control_rate", "state_rate", "command_timeout", "feedback_timeout",
         "position_limit", "velocity_limit", "torque_limit", "kp_limit", "kd_limit", "mode",
-        "configure_mode_on_startup", "profile", "legacy_control", "watchdog_timeout", "can_fd",
+        "configure_mode_on_startup", "profile", "legacy_control", "watchdog_timeout", "can_fd", "require_virtual_bus",
         "direction", "software_offset", "fault_group", "protection_samples", "host_protection_enabled",
         "position_min", "position_max", "measured_velocity_limit", "measured_torque_limit",
         "estimated_torque_limit", "mos_temperature_stop", "rotor_temperature_stop", "max_task_duration")}
@@ -105,6 +124,7 @@ def generate_launch_description():
     return LaunchDescription([
         config_argument(),
         *profile_arguments(PACKAGE, LAUNCH),
+        *simulation_arguments(),
         *[DeclareLaunchArgument(name, default_value=value) for name, value in defaults.items()],
         *dashboard_arguments(PACKAGE, LAUNCH),
         OpaqueFunction(function=launch_motor),

@@ -11,6 +11,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_launch test/test_launch.py TIMEOUT 30)
   ament_add_pytest_test(test_bringup test/test_bringup.py TIMEOUT 90)
+  ament_add_pytest_test(test_physical_simulation test/test_physical_simulation.py TIMEOUT 240)
 endif()
 
 ament_package()

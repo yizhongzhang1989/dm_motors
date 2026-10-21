@@ -120,6 +120,8 @@ textarea { resize: vertical; font: 13px ui-monospace, monospace; }
 .fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .fields > div { min-width: 0; }
 .fields > .inactive-field { opacity: .65; }
+.fields > .position-field.inactive-field { opacity: 1; }
+.position-field.inactive-field > :not(.shaft-dial) { opacity: .65; }
 #target-form[data-mode="3"] .fields > div:has(#target-velocity) { grid-column: 1 / -1; }
 .wide-field { grid-column: 1 / -1; }
 .fields label { display: block; min-height: 30px; font-size: 11px; line-height: 1.5; }
@@ -127,22 +129,37 @@ textarea { resize: vertical; font: 13px ui-monospace, monospace; }
 .fields input[type="range"] { margin: 2px 0 5px; }
 .fields small { font-size: 10px; display: block; }
 .fields label small { display: inline; }
-.position-field { display: grid; grid-template-columns: minmax(0, 1fr) 168px; gap: 5px 14px; border: 1px solid #304761; padding: 12px; border-radius: 8px; background: #101d2d; }
-.position-input { align-self: center; min-width: 0; }
+.position-field { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 20px; border: 1px solid #304761; padding: 16px; border-radius: 8px; background: #101d2d; }
+.position-input { grid-column: 1 / -1; min-width: 0; }
 .position-input label { min-height: 0; }
 .position-input input { font-size: 19px; padding: 10px; }
 .position-input p { margin: 9px 0 0; font-size: 10px; }
-.position-dial { min-width: 0; }
-.position-wheel { position: relative; width: min(158px, 100%); aspect-ratio: 1; margin: 0 auto; border: 2px solid #465f7f; border-radius: 50%; background: #0b1423; box-shadow: 0 6px 20px #0005, inset 0 0 0 6px #101c2c; cursor: grab; touch-action: none; user-select: none; overflow: hidden; }
+.position-dial { min-width: 0; align-self: center; text-align: center; }
+.control-panel { container-type: inline-size; }
+@container (max-width: 440px) {
+  .position-field { grid-template-columns: minmax(0, 1fr); }
+}
+.shaft-dial { min-width: 0; align-self: center; text-align: center; }
+.shaft-title, .dial-title { color: #b8d9ff; font-size: 12px; margin-bottom: 8px; }
+#shaft-disc { display: block; width: min(300px, 100%); margin: 0 auto; aspect-ratio: 1; user-select: none; }
+#shaft-disc text { font: 16px system-ui; }
+#shaft-disc[aria-disabled="false"] { cursor: grab; touch-action: none; }
+#shaft-disc.dragging { cursor: grabbing; }
+#shaft-disc[aria-disabled="false"] #shaft-anchor-point { cursor: pointer; }
+#shaft-disc.stale { opacity: .45; }
+#shaft-position { display: block; font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+#shaft-status { color: var(--muted); line-height: 1.5; margin-top: 5px; }
+#shaft-status.error { color: #ffb4bb; }
+.position-wheel { position: relative; width: min(240px, 100%); aspect-ratio: 1; margin: 0 auto; border: 2px solid #465f7f; border-radius: 50%; background: #0b1423; box-shadow: 0 6px 20px #0005, inset 0 0 0 6px #101c2c; cursor: grab; touch-action: none; user-select: none; overflow: hidden; }
 .position-wheel-rotor { position: absolute; inset: 7px; border-radius: 50%; pointer-events: none; background: repeating-conic-gradient(#a5cef0 0deg 1.4deg, transparent 1.4deg 7.5deg), radial-gradient(circle at 35% 25%, #385570, #142136 75%); border: 1px solid #54799c; box-shadow: inset 0 0 18px #0008; will-change: transform; }
 .position-wheel-rotor::after { content: ""; position: absolute; top: 0; left: calc(50% - 2px); width: 4px; height: 18px; background: #63b8ff; border-radius: 3px; }
 .position-wheel-hub { position: absolute; inset: 19%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; border: 1px solid #4b6688; border-radius: 50%; background: radial-gradient(circle at 35% 25%, #263f59, #0d192a 85%); box-shadow: 0 3px 18px #0009; pointer-events: none; padding: 5px; text-align: center; }
-.position-wheel-hub span { color: var(--muted); font-size: 9px; }
+.position-wheel-hub span { color: var(--muted); font-size: 11px; }
 .position-wheel-marker { position: absolute; top: 0; left: calc(50% - 4px); width: 8px; height: 15px; background: #ffcf70; border-radius: 0 0 4px 4px; pointer-events: none; }
 .position-wheel.dragging { cursor: grabbing; border-color: var(--accent); box-shadow: 0 0 0 3px #63b8ff26; }
 .position-wheel[aria-disabled="true"] { opacity: .4; pointer-events: none; }
 .position-scroll-scale { display: flex; justify-content: space-between; gap: 6px; margin-top: 7px; color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-#position-scroll-value { color: #c0e0ff; font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; max-width: 100%; }
+#position-scroll-value { color: #c0e0ff; font-size: 18px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; max-width: 100%; }
 .wheel-help, #position-scroll-status { grid-column: 1 / -1; margin: 0; }
 .wheel-help summary { font-size: 10px; }
 #position-scroll-status { line-height: 1.6; }
@@ -206,7 +223,6 @@ footer { color: var(--muted); font-size: 11px; line-height: 1.8; padding: 4px 2p
   .control-panel { grid-row: 1; }
   .workspace .plot-panel { position: static; }
   .fields { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .position-field { grid-template-columns: minmax(0, 1fr) 180px; }
   .task-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .task-preparation { align-items: start; flex-direction: column; gap: 12px; }
   #chart { height: 360px; }
@@ -228,8 +244,7 @@ footer { color: var(--muted); font-size: 11px; line-height: 1.8; padding: 4px 2p
   .section-nav { width: 100%; margin: 12px 0; }
   .section-nav button { padding: 7px 10px; font-size: 11px; }
   .fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .position-field { grid-template-columns: minmax(0, 1fr) 140px; gap: 5px 8px; padding: 10px; }
-  .position-wheel { width: 136px; }
+  .position-field { gap: 16px 12px; padding: 10px; }
   .position-input input { font-size: 16px; }
   .mode-row { gap: 10px; }
   .motor-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }

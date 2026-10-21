@@ -17,6 +17,23 @@ and `can_bitrate` (positive integer, default `1000000`). Select an explicit
 device/interface for hardware backends. The launch file changes no physical
 interface settings.
 
+`backend:=virtual` selects a topic-only CAN bus. It never constructs a serial
+or SocketCAN transport, and a nonempty hardware `port` is rejected. Generic
+routing, ownership, heartbeats, STOP frames, maintenance, RX and observation
+interfaces are unchanged. Device emulators subscribe to `wire_tx` and publish
+`wire_rx`; `endpoint_ready` remains false until a bidirectional endpoint exists.
+Virtual RX preserves nonzero monotonic acquisition timestamps, so topic queue
+delay is not hidden from motor feedback age. `sim` remains a legacy test alias
+with its existing timestamp behavior.
+
+```bash
+ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=virtual dashboard_port:=config
+```
+
+One ROS domain/namespace admits only one CAN owner, even when a virtual and
+physical backend are accidentally mixed. Physical motor models are provided by
+[dm_motor_control in simulation mode](../dm_motor_control/SIMULATION.md), not by the CAN broker.
+
 The optional web dashboard is included in this package and runs as a separate
 process. Add `dashboard_port:=config` to the bus launch to use the centralized
 port (8080 by default), or specify an integer override; omit the

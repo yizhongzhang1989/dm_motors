@@ -85,13 +85,25 @@ class ConfigManager:
     def section(self, key):
         return self.get(key, dict)
 
-    def launch(self, package, filename):
-        return self.section(("packages", package, "launches", filename))
+    def launch(self, package, filename, variant=None):
+        profile = self.section(("packages", package, "launches", filename))
+        if variant is not None:
+            variants = profile.get("variants", {})
+            if not isinstance(variants, dict) or not isinstance(variants.get(variant), dict):
+                raise ConfigError(f"{self.path}: missing or invalid launch variant {package}/{filename}/{variant}")
+            def merge(base, overrides):
+                for key, value in overrides.items():
+                    if isinstance(value, dict) and isinstance(base.get(key), dict):
+                        merge(base[key], value)
+                    else:
+                        base[key] = deepcopy(value)
+            merge(profile, variants[variant])
+        return profile
 
-    def node_parameters(self, package, node, profile=None):
+    def node_parameters(self, package, node, profile=None, variant=None):
         parameters = self.section(("packages", package, "nodes", node))
         if profile is not None:
-            overrides = self.launch(*profile).get("nodes", {})
+            overrides = self.launch(*profile, variant=variant).get("nodes", {})
             if not isinstance(overrides, dict) or not isinstance(overrides.get(package, {}), dict):
                 raise ConfigError(f"{self.path}: launch nodes must be package/node mappings")
             values = overrides.get(package, {}).get(node, {})
@@ -100,14 +112,14 @@ class ConfigManager:
             parameters.update(deepcopy(values))
         return parameters
 
-    def launch_value(self, package, filename, key, node=None):
-        parameters = self.launch(package, filename).get("parameters", {})
+    def launch_value(self, package, filename, key, node=None, variant=None):
+        parameters = self.launch(package, filename, variant=variant).get("parameters", {})
         if not isinstance(parameters, dict):
             raise ConfigError(f"{self.path}: {package}/{filename} parameters must be a mapping")
         if key in parameters:
             return deepcopy(parameters[key])
         if node is not None:
-            defaults = self.node_parameters(*node, profile=(package, filename))
+            defaults = self.node_parameters(*node, profile=(package, filename), variant=variant)
             if key in defaults:
                 return defaults[key]
         raise ConfigError(f"{self.path}: missing launch parameter {package}/{filename}: {key}")

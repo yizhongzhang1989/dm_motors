@@ -11,7 +11,7 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
 from common.dashboard import check_endpoints
 from common.launch import config_argument, ConfigValue, profile_arguments
-from dm_motor_control.launch_utils import load_parameters, dashboard_ports
+from dm_motor_control.launch_utils import load_parameters, dashboard_ports, simulation_arguments
 
 PACKAGE, LAUNCH = "dm_motor_bringup", "dual_motor.launch.py"
 
@@ -56,11 +56,12 @@ def generate_launch_description():
     return LaunchDescription([
         config_argument(),
         *profile_arguments(PACKAGE, LAUNCH),
+        *simulation_arguments(),
         *(DeclareLaunchArgument(name, default_value=value) for name, value in defaults.items()),
         OpaqueFunction(function=check_bringup_ownership),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([control_share, "launch", "bus.launch.py"])),
             launch_arguments={name: LaunchConfiguration(name) for name in (
-                *defaults, "config_file", "config_package", "config_launch")}.items()),
+                *defaults, "simulation", "config_file", "config_package", "config_launch")}.items()),
     ])

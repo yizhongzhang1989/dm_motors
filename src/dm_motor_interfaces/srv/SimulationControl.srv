@@ -1,0 +1,17 @@
+uint8 INJECT_FAULT=1
+uint8 PAUSE_FEEDBACK=2
+uint8 POWER_CYCLE=3
+uint8 SET_VOLTAGE=4
+uint8 CLEAR_EXTERNAL_TORQUE=5
+uint8 SET_ANCHOR=6
+uint8 CLEAR_ANCHOR=7
+uint8 operation
+uint8 fault_status
+bool data
+float64 value
+# Optional compare-and-set for anchor operations. SET_ANCHOR uses value as native bearing.
+bool check_anchor_revision
+uint64 anchor_revision
+---
+bool success
+string message

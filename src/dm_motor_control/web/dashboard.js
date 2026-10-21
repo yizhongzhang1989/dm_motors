@@ -402,6 +402,7 @@ function render() {
     && Number($("mode-select").value) !== state.mode);
   const owns = connected && data?.connected && !document.hidden;
   const fresh = connected && data?.connected && state?.feedback_fresh;
+  window.motorShaft.update(data, Boolean(fresh));
   $("status-panel").classList.toggle("stale", !fresh);
   document.querySelector(".position-strip").classList.toggle("stale", !fresh);
   $("connection").textContent = !connected ? "重连中" : data?.connected ? "在线" : "反馈离线";
@@ -687,6 +688,7 @@ async function confirmOperation(id, output = "operation-status") {
 }
 
 function updateReadings(sample) {
+  window.motorShaft.sample(sample);
   for (const field of ["position", "velocity", "torque"]) {
     const value = sample[field].toFixed(4);
     if ($(field).textContent !== value) {

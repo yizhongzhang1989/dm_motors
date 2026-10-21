@@ -28,15 +28,17 @@ spec.loader.exec_module(dashboard)
 
 
 class Integration(unittest.TestCase):
+    backend = "sim"
+
     @classmethod
     def setUpClass(cls):
         rclpy.init()
-        cls.bus = f"/can_dashboard_test_{os.getpid()}"
+        cls.bus = f"/can_dashboard_test_{os.getpid()}_{cls.backend}"
         cls.log_path = Path(__file__).parent / f"broker_{os.getpid()}.log"
         cls.log = cls.log_path.open("w+")
         cls.process = subprocess.Popen([
             str(Path(get_package_prefix("can_bus")) / "lib/can_bus/can_bus_node"),
-            "--ros-args", "-r", f"__ns:={cls.bus}", "-p", "backend:=sim", "-p", "can_fd:=true",
+            "--ros-args", "-r", f"__ns:={cls.bus}", "-p", f"backend:={cls.backend}", "-p", "can_fd:=true",
         ], stdout=cls.log, stderr=subprocess.STDOUT)
         cls.probe = Node("dummy_loopback")
         cls.wire_rx = cls.probe.create_publisher(Frame, cls.bus + "/wire_rx", 64)
@@ -135,7 +137,7 @@ class Integration(unittest.TestCase):
 
     def test_01_monitor_validation_and_conflict(self):
         state = self.api("/api/state")
-        self.assertEqual(state["status"]["backend"], "sim")
+        self.assertEqual(state["status"]["backend"], self.backend)
         self.assertEqual(state["status"]["epoch"], str(self.node.status["epoch"]))
         self.assertIsInstance(self.node.status["epoch"], int)
         self.assertTrue(state["capabilities"]["can_fd"])
@@ -238,6 +240,10 @@ class Integration(unittest.TestCase):
         host = f"untrusted.invalid:{self.server.server_address[1]}"
         result = self.api("/api/state", status=403, headers={"Host": host, "Origin": f"http://{host}"})
         self.assertIn(host, result["error"])
+
+
+class VirtualIntegration(Integration):
+    backend = "virtual"
 
 
 if __name__ == "__main__":

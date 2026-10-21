@@ -68,7 +68,7 @@ def validate_frame(body, backend, can_fd):
         raise ApiError(400, "classical CAN requires 0..8 bytes and no BRS")
     if backend == "serial" and (extended or result["rtr"] or result["fd"] or size not in (4, 8)):
         raise ApiError(400, "legacy serial requires standard channel 0, 4/8 bytes; 4 zero-pads to 8")
-    if backend not in ("sim", "serial", "socketcan"):
+    if backend not in ("sim", "virtual", "serial", "socketcan"):
         raise ApiError(503, "unknown backend capabilities")
     return result
 

@@ -8,7 +8,7 @@ class CanTransport final : public Transport
 public:
   CanTransport(rclcpp::Node & node, const std::string & bus_namespace,
     const std::string & client_name, uint8_t motor_id, uint16_t master_id,
-    bool fd, double rate, double timeout, const std::string & fault_group);
+    bool fd, double rate, double timeout, const std::string & fault_group, bool require_virtual = false);
   ~CanTransport() override;
   void send(const Frame &) override;
   std::vector<Frame> receive() override;

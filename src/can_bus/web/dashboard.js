@@ -247,8 +247,8 @@ function renderState() {
   el("bus-namespace").textContent = state?.bus_namespace || "等待连接";
   el("bus-namespace").title = el("bus-namespace").textContent;
   document.title = `CAN 总线 · ${state?.bus_namespace || "等待连接"}`;
-  el("backend-label").textContent = status ? (status.backend === "sim" ? "仿真" : "硬件") : "待发现";
-  el("backend-label").title = status ? `${status.backend === "sim" ? "SIMULATION" : "HARDWARE"} · ${status.backend}` : "等待后端能力";
+  el("backend-label").textContent = status ? (["sim", "virtual"].includes(status.backend) ? "仿真" : "硬件") : "待发现";
+  el("backend-label").title = status ? `${["sim", "virtual"].includes(status.backend) ? "SIMULATION" : "HARDWARE"} · ${status.backend}` : "等待后端能力";
   for (const [id, value] of [["rx-count", status?.rx_count], ["tx-count", status?.tx_count],
     ["rejected-count", status?.rejected], ["clients-count", status?.clients]]) {
     el(id).textContent = count(value);
@@ -272,7 +272,7 @@ function renderState() {
     : !ready() ? "总线 / 端点尚未就绪，不能申请路由或发送。"
     : status.observer_dropped ? `观察链路已丢弃 ${count(status.observer_dropped)} 帧，列表不是完整总线记录；总量以总线计数为准。`
     : !state.tx_observed_available ? "尚无驱动写出观察源；提交帧不能作为已写出的证明。"
-    : `${status.backend === "sim" ? "仿真总线" : "真实总线"} · 连接就绪。监控不发送帧；驱动写出不等于 CAN ACK 或设备执行。`;
+    : `${["sim", "virtual"].includes(status.backend) ? "仿真总线" : "真实总线"} · 连接就绪。监控不发送帧；驱动写出不等于 CAN ACK 或设备执行。`;
   el("notice").textContent = state?.notice || "";
   el("notice").hidden = !state?.notice;
   el("session").textContent = state?.debug

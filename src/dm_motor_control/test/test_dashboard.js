@@ -1,7 +1,7 @@
 "use strict";
 
 // Run in a browser with dashboard HTML, JS and CSS; all API traffic is mocked.
-async function runDashboardTests(html, source, css) {
+async function runDashboardTests(html, source, css, shaftSource) {
   if (!css) throw new Error("CSS is required to validate rotary wheel geometry.");
   const iframe = document.createElement("iframe");
   iframe.srcdoc = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
@@ -225,6 +225,7 @@ async function runDashboardTests(html, source, css) {
   const targetCount = () => requests.filter((request) => request.path === "target").length;
   try {
     failState = true;
+    win.eval(shaftSource);
     win.eval(source);
     await settle();
     assert(el("connection").textContent === "重连中" && !el("stop").disabled && el("enable").disabled,

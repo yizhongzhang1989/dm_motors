@@ -1,5 +1,6 @@
 #include "can_bus/router.hpp"
 #include "common/config.hpp"
+#include "common/process_lock.hpp"
 #include "can_bus/msg/frame.hpp"
 #include "can_bus/msg/status.hpp"
 #include "can_bus/msg/tx_frame.hpp"
@@ -9,6 +10,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <random>
 #include <atomic>
 #include <condition_variable>
@@ -57,6 +59,7 @@ uint64_t epoch()
 }
 class BusNode final : public rclcpp::Node
 {
+  common::ProcessLock graph_owner_;
   can_bus::Router router_;
   std::unique_ptr<can_bus::Transport> transport_;
   std::string backend_, error_;
@@ -122,7 +125,7 @@ class BusNode final : public rclcpp::Node
   }
   bool endpoint_ready() const
   {
-    return ready_ && (backend_ != "sim" ||
+    return ready_ && ((backend_ != "sim" && backend_ != "virtual") ||
       (wire_tx_->get_subscription_count() > 0 && wire_rx_->get_publisher_count() > 0));
   }
   void publish_status()
@@ -165,7 +168,7 @@ class BusNode final : public rclcpp::Node
   void dispatch(can_bus::Frame f)
   {
     can_bus::validate_frame(f, router_.allow_fd);
-    if (!transport_ || !f.received_steady) {
+    if (backend_ == "sim" || !f.received_steady) {
       f.received_steady = static_cast<uint64_t>(can_bus::steady_seconds() * 1e9);
     }
     auto m = encode(f); m.header.stamp = now(); ++rx_;
@@ -227,6 +230,8 @@ class BusNode final : public rclcpp::Node
 public:
   BusNode() : Node("can_bus"), router_(epoch())
   {
+    const char * domain = std::getenv("ROS_DOMAIN_ID");
+    graph_owner_.acquire("can_bus:" + std::string(domain ? domain : "0") + ":" + get_namespace());
     rcl_interfaces::msg::ParameterDescriptor startup;
     startup.read_only = true;
     const common::Config config(
@@ -250,7 +255,7 @@ public:
     tx_observed_ = create_publisher<Wire>("tx_observed", qos);
     wire_tx_ = create_publisher<Wire>("wire_tx", qos);
     status_ = create_publisher<can_bus::msg::Status>("status", rclcpp::QoS(1).reliable().transient_local());
-    if (backend_ == "sim") {
+    if (backend_ == "sim" || backend_ == "virtual") {
       wire_rx_ = create_subscription<Wire>("wire_rx", qos, [this](Wire::ConstSharedPtr m) {
         if (!ready_) {return;}
         try {dispatch(decode(*m));} catch (...) {++router_.rejected;}
@@ -361,6 +366,8 @@ public:
         transport_ = can_bus::make_serial_transport(port);
       } else if (backend_ == "socketcan") {
         transport_ = can_bus::make_socketcan_transport(port, router_.allow_fd);
+      } else if (backend_ == "virtual") {
+        if (!port.empty()) {throw std::invalid_argument("virtual CAN requires an empty hardware port");}
       } else if (backend_ != "sim") {throw std::invalid_argument("unknown CAN backend");}
       ready_ = true;
     } catch (const std::exception & e) {error_ = e.what();}

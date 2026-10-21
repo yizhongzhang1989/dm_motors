@@ -99,6 +99,7 @@ struct CanTransport::Impl
   bool broker_rx_ready{false};
   bool heartbeat_confirmed{false};
   bool receive_verified{false};
+  bool require_virtual{false};
   double last_probe{0};
   bool activity_requires_stop{false}, stop_published{false};
   bool maintenance_pending{false}, maintenance_owned{false}, service_pending{false};
@@ -128,9 +129,9 @@ struct CanTransport::Impl
   }
   Impl(rclcpp::Node & parent, const std::string & bus_namespace,
     const std::string & client_name, uint8_t motor, uint16_t master_id,
-    bool fd, double rate, double receive_timeout, const std::string & fault_group)
+    bool fd, double rate, double receive_timeout, const std::string & fault_group, bool virtual_only)
   : executor(executor_options(parent)),
-    group(fault_group), id(motor), master(master_id), timeout(receive_timeout),
+    group(fault_group), id(motor), master(master_id), require_virtual(virtual_only), timeout(receive_timeout),
     started(can_bus::steady_seconds())
   {
     if (bus_namespace.empty() || bus_namespace.front() != '/' || motor == 0 || motor > 15 ||
@@ -176,6 +177,11 @@ struct CanTransport::Impl
         std::lock_guard<std::mutex> lock(mutex);
         last_status = can_bus::steady_seconds(); seen_epoch = s->epoch;
         physical_backend = s->backend; status_ready = s->ready; owner = s->maintenance_owner;
+        if (require_virtual && (s->backend != "virtual" || !s->port.empty())) {
+          fail("Virtual-only motor refuses a non-virtual CAN backend; no registration or device commands sent");
+          status_ready = false;
+          return;
+        }
         endpoint_ready = s->endpoint_ready;
         if (endpoint_seen && !endpoint_ready && s->ready) {
           fail("CAN virtual endpoint disconnected; relaunch required");
@@ -399,9 +405,9 @@ struct CanTransport::Impl
 };
 CanTransport::CanTransport(rclcpp::Node & node, const std::string & bus_namespace,
   const std::string & client_name, uint8_t motor_id, uint16_t master_id, bool fd,
-  double rate, double timeout, const std::string & fault_group)
+  double rate, double timeout, const std::string & fault_group, bool require_virtual)
 : impl_(std::make_unique<Impl>(node, bus_namespace, client_name, motor_id, master_id,
-    fd, rate, timeout, fault_group)) {}
+    fd, rate, timeout, fault_group, require_virtual)) {}
 CanTransport::~CanTransport() = default;
 void CanTransport::send(const Frame & f)
 {
@@ -469,7 +475,7 @@ std::string CanTransport::error() const
 {std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->failure;}
 std::string CanTransport::backend() const
 {std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->physical_backend;}
-bool CanTransport::simulated() const {return backend() == "sim";}
+bool CanTransport::simulated() const {const auto name = backend(); return name == "sim" || name == "virtual";}
 bool CanTransport::maintenance_available() const
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);

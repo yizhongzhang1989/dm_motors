@@ -65,6 +65,16 @@ packages:
 `system` 等业务数据可放在对应 launch 下，但 `common` 不解释它们。
 本工作空间由 `dm_motor_control.launch_utils` 解析 `system` 拓扑，而不是由公共包解析。
 
+### 可选的启动变体
+
+同一 launch 可在 `variants.<名称>` 下定义 `parameters`、`nodes` 或 `system` 的覆盖。
+`launch(..., variant="recorded")`、`launch_value(..., variant=...)` 和
+`node_parameters(..., variant=...)` 返回递归合并后的副本，不修改基础配置；
+不存在的变体明确报错。列表和标量整体替换，映射递归合并。
+启动层的 `config_variant` 上下文选择由 `ConfigValue` 继承，业务包负责选择它。
+例如电机入口将 `simulation:=true` 映射到 `variants.simulation`，默认使用基础真机配置；
+`common` 本身不解释仿真、硬件或其它业务模式。
+
 ## 每个 Dashboard 明确指定端口
 
 组合入口的示例配置：

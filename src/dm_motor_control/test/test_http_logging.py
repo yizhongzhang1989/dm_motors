@@ -2,8 +2,6 @@
 
 from http.client import HTTPConnection
 from http import HTTPStatus
-import importlib.util
-from pathlib import Path
 import socket
 import threading
 from types import SimpleNamespace
@@ -11,10 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-spec = importlib.util.spec_from_file_location(
-    "dashboard_http_test", Path(__file__).resolve().parents[1] / "scripts/dashboard.py")
-dashboard = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(dashboard)
+from dm_motor_control import dashboard
 
 
 class HttpLoggingTests(unittest.TestCase):

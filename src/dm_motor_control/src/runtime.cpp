@@ -151,6 +151,8 @@ const std::vector<RegisterInfo> & register_catalog()
   return catalog;
 }
 
+void validate_register_value(uint8_t rid, uint32_t raw) {validate_raw(rid, raw);}
+
 bool raw_register_write_allowed(uint8_t rid)
 {
   return info(rid).writable && ((rid >= 24 && rid <= 28) || (rid >= 31 && rid <= 34));

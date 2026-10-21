@@ -77,6 +77,26 @@ def test_explicit_path_overrides_environment_and_launch_values_are_scoped(tmp_pa
     assert "dm_motor_bringup" in config_for_context(context).section("packages")
 
 
+def test_launch_variants_merge_without_mutating_base_or_other_profiles(tmp_path):
+    document = generic_config()
+    document["packages"]["camera_driver"]["launches"]["preview.launch.py"]["variants"] = {
+        "recorded": {
+            "parameters": {"dashboard_port": 9200},
+            "nodes": {"camera_driver": {"camera": {"device": "recording", "enabled": True}}},
+        }}
+    manager = ConfigManager(write_config(tmp_path, document))
+    profile = ("camera_driver", "preview.launch.py")
+    settings = manager.node_parameters("camera_driver", "camera", profile, variant="recorded")
+    assert settings == {"fps": 10, "device": "recording", "enabled": True}
+    assert manager.launch_value(*profile, "dashboard_port", variant="recorded") == 9200
+    assert manager.node_parameters("camera_driver", "camera", profile)["device"] == "/dev/video0"
+    context = LaunchContext()
+    context.launch_configurations.update(config_file=str(manager.path), config_variant="recorded")
+    assert ConfigValue("enabled", *profile, ("camera_driver", "camera")).perform(context) == "true"
+    with pytest.raises(ConfigError, match="variant"):
+        manager.launch(*profile, variant="missing")
+
+
 def test_port_selection_is_not_part_of_the_generic_config_schema(tmp_path):
     config = ConfigManager(write_config(tmp_path, generic_config()))
     port = config.launch_value("camera_driver", "preview.launch.py", "dashboard_port")

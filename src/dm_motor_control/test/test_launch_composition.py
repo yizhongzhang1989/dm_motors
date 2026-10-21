@@ -178,8 +178,10 @@ def test_motor_component_launch_dashboard_is_opt_in(monkeypatch, port, expected)
         assert dashboard["package"] == "dm_motor_control"
         assert dashboard["namespace"] == "robot/axis"
         assert dashboard["parameters"][0] == {
+            **ConfigManager().node_parameters("dm_motor_control", "dashboard"),
             "motor_id": 2, "host": "0.0.0.0", "port": 9200, "command_timeout": 0.15,
             "client_timeout": 0.75, "config_file": str(ConfigManager().path)}
+        assert dashboard["parameters"][0]["simulation"] is False
 
 
 def test_instance_ports_do_not_depend_on_motor_order(monkeypatch):

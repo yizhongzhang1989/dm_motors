@@ -19,6 +19,8 @@ from can_bus.srv import RegisterClient
 
 
 class BrokerFixture(unittest.TestCase):
+    backend = "sim"
+
     def setUp(self):
         os.environ["ROS_DOMAIN_ID"] = str(30 + os.getpid() % 40)
         rclpy.init()
@@ -27,7 +29,7 @@ class BrokerFixture(unittest.TestCase):
         self.log = tempfile.TemporaryFile(mode="w+")
         self.process = subprocess.Popen([
             str(Path(get_package_prefix("can_bus")) / "lib/can_bus/can_bus_node"),
-            "--ros-args", "-r", f"__ns:={self.namespace}", "-p", "backend:=sim",
+            "--ros-args", "-r", f"__ns:={self.namespace}", "-p", f"backend:={self.backend}",
             "-p", "io_rate:=20.0",
         ], stdout=self.log, stderr=subprocess.STDOUT)
         self.addCleanup(self.cleanup)
@@ -180,6 +182,23 @@ class BrokerObservation(BrokerFixture):
             with self.subTest(clients=clients):
                 self.assertEqual([list(frame.data) for frame in received[before:]],
                                  [[clients] * 8])
+
+
+class VirtualBrokerFixture(BrokerFixture):
+    backend = "virtual"
+
+    def test_virtual_rx_preserves_device_acquisition_timestamp(self):
+        frames = []
+        subscription = self.node.create_subscription(Frame, "rx", frames.append, 64)
+        self.wait(lambda: self.virtual_rx.get_subscription_count() > 0)
+        timestamp = time.monotonic_ns() - 20_000_000
+        self.virtual_rx.publish(Frame(can_id=0x444, length=1, data=[7], received_steady=timestamp))
+        self.wait(lambda: any(frame.can_id == 0x444 for frame in frames))
+        frame = next(frame for frame in frames if frame.can_id == 0x444)
+        self.assertEqual(frame.received_steady, timestamp)
+        self.assertEqual(self.state.backend, "virtual")
+        self.assertEqual(self.state.port, "")
+        self.node.destroy_subscription(subscription)
 
 
 if __name__ == "__main__":

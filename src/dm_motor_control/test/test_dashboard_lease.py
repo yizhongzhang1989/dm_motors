@@ -1,8 +1,6 @@
 """Driver lease timer regressions; no ROS node, controller or hardware is started."""
 
 from concurrent.futures import Future
-import importlib.util
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 import threading
 import time
@@ -14,10 +12,7 @@ from dm_motor_control.topic_client import ControlLease, SetTarget, RunTask
 from rclpy.time import Time
 
 
-spec = importlib.util.spec_from_file_location(
-    "dashboard_lease_test", Path(__file__).resolve().parents[1] / "scripts/dashboard.py")
-dashboard = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(dashboard)
+from dm_motor_control import dashboard
 
 
 class LeaseClient:

@@ -6,7 +6,7 @@ import socket
 
 from ament_index_python.packages import get_package_share_directory, get_package_prefix, get_packages_with_prefixes
 from launch import LaunchContext
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetLaunchConfiguration
 from launch.utilities import normalize_to_list_of_substitutions, perform_substitutions
 import launch_ros.actions
 import pytest
@@ -26,7 +26,7 @@ def configured_launch(module=bringup, **overrides):
     context.launch_configurations.update(overrides)
     description = module.generate_launch_description()
     for entity in description.entities:
-        if isinstance(entity, DeclareLaunchArgument):
+        if isinstance(entity, (DeclareLaunchArgument, SetLaunchConfiguration)):
             entity.execute(context)
     include = next(entity for entity in description.entities if isinstance(entity, IncludeLaunchDescription))
     forwarded = {
@@ -48,7 +48,82 @@ def test_default_configuration_uses_real_motors_without_dashboards():
         "dashboard_host": "0.0.0.0",
         "can_dashboard_ports": "",
         "motor_dashboard_ports": "",
+        "simulation": "false",
     }
+
+
+SIMULATION_PROFILES = [
+    ("dm_motor_control", "motor.launch.py"),
+    ("dm_motor_control", "bus.launch.py"),
+    ("dm_motor_bringup", "dual_motor.launch.py"),
+    ("dm_motor_bringup", "lead_follow.launch.py"),
+]
+
+SOFT_MOTOR_LIMITS = (
+    "position_limit", "velocity_limit", "torque_limit", "measured_velocity_limit",
+    "measured_torque_limit", "estimated_torque_limit", "mos_temperature_stop", "rotor_temperature_stop",
+)
+
+
+def test_simulation_motion_defaults_disabled():
+    config = ConfigManager()
+    for profile in SIMULATION_PROFILES:
+        motor = config.node_parameters("dm_motor_control", "motor_node", profile, variant="simulation")
+        assert motor["host_protection_enabled"] is False
+        assert all(motor[field] == 0 for field in SOFT_MOTOR_LIMITS)
+    follow = config.node_parameters("dm_motor_lead_follow", "lead_follow_node",
+        ("dm_motor_bringup", "lead_follow.launch.py"), variant="simulation")
+    assert follow["motion_limits_enabled"] is False
+
+
+@pytest.mark.parametrize("profile", SIMULATION_PROFILES)
+def test_simulation_does_not_inherit_base_hardware_soft_limits(tmp_path, profile):
+    document = yaml.safe_load(ConfigManager().path.read_text())
+    defaults = document["packages"]["dm_motor_control"]["nodes"]["motor_node"]
+    defaults.update({field: 0.1 for field in SOFT_MOTOR_LIMITS})
+    defaults.update(host_protection_enabled=True, position_min=-0.1, position_max=0.1)
+    path = tmp_path / "hardware-limits.yaml"
+    path.write_text(yaml.safe_dump(document))
+    config = ConfigManager(path)
+    hardware = config.node_parameters("dm_motor_control", "motor_node", profile)
+    simulation = config.node_parameters("dm_motor_control", "motor_node", profile, variant="simulation")
+    assert hardware["host_protection_enabled"] is True
+    assert hardware["position_min"] == -0.1 and hardware["position_max"] == 0.1
+    assert all(hardware[field] == 0.1 for field in SOFT_MOTOR_LIMITS)
+    assert simulation["host_protection_enabled"] is False
+    assert simulation["position_min"] < -1e100 and simulation["position_max"] > 1e100
+    assert all(simulation[field] == 0 for field in SOFT_MOTOR_LIMITS)
+
+
+@pytest.mark.parametrize("profile", SIMULATION_PROFILES[1:])
+@pytest.mark.parametrize("explicit_test_limits", [False, True])
+def test_simulation_discards_only_inherited_topology_limits(tmp_path, profile, explicit_test_limits):
+    document = yaml.safe_load(ConfigManager().path.read_text())
+    launch = document["packages"][profile[0]]["launches"][profile[1]]
+    launch["system"].update(host_protection_enabled=True, velocity_limit=0.1)
+    launch["system"]["motors"]["motor_1"].update(
+        host_protection_enabled=True, position_min=-0.1, position_max=0.1, torque_limit=0.1)
+    if explicit_test_limits:
+        launch["variants"]["simulation"]["system"]["motors"] = {
+            "motor_1": {"host_protection_enabled": True, "estimated_torque_limit": 5.0},
+        }
+    path = tmp_path / "axis-limits.yaml"
+    path.write_text(yaml.safe_dump(document))
+    context = LaunchContext()
+    context.launch_configurations.update(config_file=str(path), config_package=profile[0], config_launch=profile[1],
+                                         simulation="true", config_variant="simulation")
+    parameters = load_parameters(context)
+    motor = parameters["motors"]["motor_1"]
+    assert parameters["velocity_limit"] == 0
+    assert motor["position_min"] < -1e100 and motor["position_max"] > 1e100
+    assert motor["torque_limit"] == 0
+    assert motor["host_protection_enabled"] is explicit_test_limits
+    assert motor["estimated_torque_limit"] == (5.0 if explicit_test_limits else 0.0)
+    context.launch_configurations.update(simulation="false", config_variant="")
+    hardware = load_parameters(context)
+    assert hardware["velocity_limit"] == 0.1
+    assert hardware["motors"]["motor_1"]["host_protection_enabled"] is True
+    assert hardware["motors"]["motor_1"]["torque_limit"] == 0.1
 
 
 @pytest.mark.parametrize("filename,node_count,backend", [
@@ -67,7 +142,7 @@ def test_included_launch_builds_exact_device_and_dashboard_graph(
     monkeypatch.setattr(launch_ros.actions, "Node", lambda **kwargs: kwargs)
     child = include.launch_description_source.get_launch_description(context)
     for entity in child.entities:
-        if isinstance(entity, DeclareLaunchArgument):
+        if isinstance(entity, (DeclareLaunchArgument, SetLaunchConfiguration)):
             entity.execute(context)
     compose = next(entity for entity in child.entities if isinstance(entity, OpaqueFunction))
     nodes = compose.execute(context)
@@ -95,6 +170,7 @@ def test_configuration_namespace_and_port_overrides_are_forwarded():
         "control_rate": "100",
         "dashboard_host": "10.20.30.40", "can_dashboard_ports": "{main: 9080}",
         "motor_dashboard_ports": "{motor_1: 9081, motor_2: 9282}",
+        "simulation": "false",
     }
 
 
@@ -124,7 +200,7 @@ def test_hardware_entry_selects_serial_and_never_adds_simulator(monkeypatch):
     monkeypatch.setattr(launch_ros.actions, "Node", lambda **kwargs: kwargs)
     bus = inner.launch_description_source.get_launch_description(context)
     for entity in bus.entities:
-        if isinstance(entity, DeclareLaunchArgument):
+        if isinstance(entity, (DeclareLaunchArgument, SetLaunchConfiguration)):
             entity.execute(context)
     compose = next(entity for entity in bus.entities if isinstance(entity, OpaqueFunction))
     nodes = compose.execute(context)
@@ -151,31 +227,32 @@ def test_included_port_collision_guard_is_preserved(monkeypatch):
 
 
 @pytest.mark.parametrize("dashboard_port", ["", "8083"])
-@pytest.mark.parametrize("override,config_name,backend", [
-    (False, "dual_serial.yaml", "serial"),
-    (True, "sim_bus.yaml", "sim"),
+@pytest.mark.parametrize("override,config_name,backend,simulation", [
+    (False, "dual_serial.yaml", "serial", "false"),
+    (True, "sim_bus.yaml", "sim", "false"),
+    (False, "dual_serial.yaml", "virtual", "true"),
 ])
 def test_lead_follow_composes_existing_system_and_namespaced_controller(
-        monkeypatch, override, config_name, backend, dashboard_port):
+        monkeypatch, override, config_name, backend, simulation, dashboard_port):
     path = Path(__file__).resolve().parents[1] / "launch/lead_follow.launch.py"
     follow_spec = importlib.util.spec_from_file_location("lead_follow_bringup", path)
     module = importlib.util.module_from_spec(follow_spec)
     follow_spec.loader.exec_module(module)
     context = LaunchContext()
     context.launch_configurations.update(
-        namespace="bench", leader="motor_2", follower="motor_1", dashboard_port=dashboard_port)
+        namespace="bench", leader="motor_2", follower="motor_1", dashboard_port=dashboard_port, simulation=simulation)
     if override:
         context.launch_configurations["config"] = str(
             Path(get_package_share_directory("dm_motor_control")) / "test/config" / config_name)
     description = module.generate_launch_description()
     for entity in description.entities:
-        if isinstance(entity, DeclareLaunchArgument):
+        if isinstance(entity, (DeclareLaunchArgument, SetLaunchConfiguration)):
             entity.execute(context)
     includes = [entity for entity in description.entities if isinstance(entity, IncludeLaunchDescription)]
     assert len(includes) == 2
     system = includes[0].launch_description_source.get_launch_description(context)
     for entity in system.entities:
-        if isinstance(entity, DeclareLaunchArgument):
+        if isinstance(entity, (DeclareLaunchArgument, SetLaunchConfiguration)):
             entity.execute(context)
     if override:
         assert context.launch_configurations["config"].endswith("/test/config/" + config_name)
@@ -187,13 +264,14 @@ def test_lead_follow_composes_existing_system_and_namespaced_controller(
     bus_include = next(entity for entity in system.entities if isinstance(entity, IncludeLaunchDescription))
     bus = bus_include.launch_description_source.get_launch_description(context)
     for entity in bus.entities:
-        if isinstance(entity, DeclareLaunchArgument):
+        if isinstance(entity, (DeclareLaunchArgument, SetLaunchConfiguration)):
             entity.execute(context)
     compose = next(entity for entity in bus.entities if isinstance(entity, OpaqueFunction))
     nodes = compose.execute(context)
-    assert len(nodes) == (4 if backend == "sim" else 3)
+    assert len(nodes) == {"sim": 4, "serial": 3, "virtual": 5}[backend]
     assert next(node for node in nodes if node["package"] == "can_bus")["parameters"][0]["backend"] == backend
     assert sum(node["executable"] == "can_motor_simulator" for node in nodes) == (backend == "sim")
+    assert sum(node["executable"] == "sim_motor_node" for node in nodes) == (2 if simulation == "true" else 0)
     if backend == "serial":
         motors = [node["parameters"][0] for node in nodes if node["executable"] == "motor_node"]
         assert len(motors) == 2
@@ -211,7 +289,9 @@ def test_lead_follow_composes_existing_system_and_namespaced_controller(
     settings = node["parameters"][0]
     assert settings["config_file"] == str(ConfigManager().path)
     assert (settings["leader"], settings["follower"]) == ("motor_2", "motor_1")
-    assert settings["kp"] == ConfigManager().node_parameters("dm_motor_lead_follow", "lead_follow_node")["kp"]
+    assert settings["kp"] == ConfigManager().node_parameters(
+        "dm_motor_lead_follow", "lead_follow_node", ("dm_motor_bringup", "lead_follow.launch.py"),
+        variant="simulation" if simulation == "true" else None)["kp"]
     assert len(follow_nodes) == (2 if dashboard_port else 1)
     if dashboard_port:
         web_node = follow_nodes[1]
@@ -228,7 +308,8 @@ def test_lead_follow_preserves_explicit_config_override():
     spec.loader.exec_module(module)
     _, _, forwarded = configured_launch(module=module, config="/tmp/custom-follow-bus.yaml")
     assert forwarded == {"config": "/tmp/custom-follow-bus.yaml", "config_file": default_config_path(),
-                         "config_package": "dm_motor_bringup", "config_launch": "lead_follow.launch.py"}
+                         "config_package": "dm_motor_bringup", "config_launch": "lead_follow.launch.py",
+                         "simulation": "false"}
 
 
 def test_only_two_hardware_bringup_entries_are_shipped():
@@ -241,7 +322,7 @@ def test_only_two_hardware_bringup_entries_are_shipped():
 
 def test_dashboard_executables_and_assets_are_installed_in_component_packages():
     workspace = Path(__file__).resolve().parents[2]
-    retired = ("can_bus_dashboard", "dm_motor_dashboard", "dm_motor_lead_follow_dashboard")
+    retired = ("can_bus_dashboard", "dm_motor_dashboard", "dm_motor_lead_follow_dashboard", "dm_motor_simulation")
     assert all(not (workspace / package / "package.xml").exists() for package in retired)
     packages = get_packages_with_prefixes()
     local_install = workspace.parent / "install"

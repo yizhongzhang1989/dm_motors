@@ -1,6 +1,5 @@
 """End-to-end ROS tests. The subprocess is always backend=sim; no hardware is opened."""
 
-import importlib.util
 import json
 import math
 import os
@@ -176,10 +175,7 @@ class RosIntegration(unittest.TestCase):
 
     @contextmanager
     def web_dashboard(self):
-        script = Path(__file__).resolve().parents[1] / "scripts/dashboard.py"
-        spec = importlib.util.spec_from_file_location("dm_dashboard", script)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        from dm_motor_control import dashboard as module
         web_node = module.Dashboard(parameter_overrides=[Parameter("client_timeout", value=0.4)])
         executor = SingleThreadedExecutor()
         executor.add_node(web_node)

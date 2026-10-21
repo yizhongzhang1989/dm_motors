@@ -453,9 +453,10 @@ private:
       throw std::invalid_argument("can_bus_namespace must be an absolute ROS namespace");
     }
     const bool fd = parameter<bool>("", "can_fd");
+    const bool require_virtual = parameter<bool>("", "require_virtual_bus");
     const auto client_name = std::string(get_fully_qualified_name());
     auto remote = std::make_unique<CanTransport>(*this, bus_namespace, client_name,
-      config.id, config.master, fd, rate_, config.feedback_timeout, axis->fault_group);
+      config.id, config.master, fd, rate_, config.feedback_timeout, axis->fault_group, require_virtual);
     axis->transport = remote.get();
     auto bus = std::make_unique<Bus>(std::move(remote), std::vector<MotorConfig>{config}, false);
     axis->bus = bus.get(); axis->backend = "can_bus";

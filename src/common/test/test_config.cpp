@@ -1,10 +1,23 @@
 #include "common/config.hpp"
+#include "common/process_lock.hpp"
 
 #include <gtest/gtest.h>
 #include <fstream>
 #include <unistd.h>
 
 using common::Config;
+
+TEST(ProcessLock, RefusesDuplicateOwnerAndReleasesOnDestruction)
+{
+  const auto resource = "common_test_" + std::to_string(getpid());
+  {
+    common::ProcessLock owner, duplicate;
+    owner.acquire(resource);
+    EXPECT_THROW(duplicate.acquire(resource), std::runtime_error);
+  }
+  common::ProcessLock new_owner;
+  EXPECT_NO_THROW(new_owner.acquire(resource));
+}
 
 TEST(Config, ReadsInstalledNodeDefaultsWithoutMutatingTree)
 {
