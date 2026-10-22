@@ -10,19 +10,21 @@
 先加载 ROS 和工作空间环境。先用物理仿真，不与相同 namespace 的其它 bringup 同时启动：
 
 ```bash
-ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true \
-  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true
 ```
 
 双边面板默认 <http://127.0.0.1:8084/>，两台电机面板为 8081/8082，CAN 为 8080。
-面板默认监听 `0.0.0.0`，仅用于可信内网；省略端口参数不开相应网页。
+面板默认监听 `0.0.0.0`，仅用于可信内网；省略端口参数自动使用所选配置。
+每个 launch 均可传 `config_file:=/绝对路径/site.yaml`，不传则读取默认配置。
+如需无网页，显式传 `can_dashboard_ports:='{}' motor_dashboard_ports:='{}' dashboard_port:="''"`，
+或在配置中将端口映射设为 `{}`、单端口设为 `''`。
 明确点击右上「开始」才使能，点击「停止」后等待两台新鲜反馈确认失能。
 用电机面板的外力圆盘或锚点施加扰动，观察双向力矩与位移。
 
-已有两台电机时，只附加控制器与可选面板：
+已有两台电机时，只附加控制器与配置的面板：
 
 ```bash
-ros2 launch dm_motor_bilateral_control bilateral_control.launch.py dashboard_port:=config
+ros2 launch dm_motor_bilateral_control bilateral_control.launch.py
 ```
 
 该入口不选择电机后端。只有面板时使用包内 `dashboard.launch.py`。

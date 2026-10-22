@@ -53,6 +53,7 @@ class RosIntegration(unittest.TestCase):
         cls.process = subprocess.Popen([
             "ros2", "launch", "dm_motor_control", "motor.launch.py",
             f"namespace:={cls.namespace}", "motor_id:=7", "master_id:=42", "backend:=sim",
+            "dashboard_port:=''",
             "legacy_control:=true",
             "state_rate:=200",
         ], stdout=cls.log, stderr=subprocess.STDOUT)

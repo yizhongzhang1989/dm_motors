@@ -1,4 +1,4 @@
-"""Simulation launch contracts, including physical-backend refusal and opt-in UI."""
+"""Simulation launch contracts, including physical-backend refusal and configured UI."""
 
 import importlib.util
 from pathlib import Path
@@ -24,9 +24,10 @@ def load(filename, **overrides):
     return module, result
 
 
-@pytest.mark.parametrize("port,count", [("", 3), ("18994", 4), ("config", 4)])
+@pytest.mark.parametrize("port,count", [(None, 4), ("", 3), ("18994", 4), ("config", 4)])
 def test_single_motor_has_production_driver_and_optional_dashboard(monkeypatch, port, count):
-    composition, context = load("motor.launch.py", simulation="true", dashboard_port=port, namespace="bench/axis")
+    overrides = {} if port is None else {"dashboard_port": port}
+    composition, context = load("motor.launch.py", simulation="true", namespace="bench/axis", **overrides)
     monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
     nodes = composition.launch_motor(context)
     assert len(nodes) == count
@@ -38,14 +39,14 @@ def test_single_motor_has_production_driver_and_optional_dashboard(monkeypatch, 
     assert nodes[1]["parameters"][0]["require_virtual_bus"] is True
     assert nodes[2]["executable"] == "sim_motor_node"
     assert nodes[2]["namespace"] == "bench/axis"
-    if port:
+    if port != "":
         assert nodes[-1]["executable"] == "dashboard.py"
         assert nodes[-1]["package"] == "dm_motor_control"
         assert nodes[-1]["parameters"][0]["simulation"] is True
 
 
 def test_single_motor_defaults_to_hardware_without_a_virtual_device(monkeypatch):
-    module, context = load("motor.launch.py", dashboard_port="config")
+    module, context = load("motor.launch.py")
     monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
     nodes = module.launch_motor(context)
     assert nodes[0]["parameters"][0]["backend"] == "serial"
@@ -63,7 +64,7 @@ def test_simulation_variant_selects_its_own_dashboard_port(tmp_path, monkeypatch
     variant.setdefault("parameters", {})["dashboard_port"] = 18997
     path = tmp_path / "ports.yaml"
     path.write_text(yaml.safe_dump(data))
-    module, context = load(filename, config_file=str(path), simulation="true", dashboard_port="config")
+    module, context = load(filename, config_file=str(path), simulation="true")
     monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
     monkeypatch.setattr(module, "check_endpoints", lambda *args: None)
     nodes = getattr(module, entry)(context)
@@ -121,22 +122,28 @@ def test_simulation_scene_rejects_every_physical_transport(tmp_path, backend, po
         composition.compose(context)
 
 
-def test_system_ports_are_opt_in_and_conflicts_abort(monkeypatch):
+def test_system_ports_use_config_allow_headless_and_reject_conflicts(monkeypatch):
     composition, context = load("bus.launch.py", simulation="true")
     monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
     nodes = composition.compose(context)
     devices = [node for node in nodes if node["executable"] == "sim_motor_node"]
     assert len(devices) == 2
-    assert not any(node["executable"] == "dashboard.py" for node in nodes)
+    assert [node["parameters"][0]["port"] for node in nodes
+            if node["executable"] == "dashboard.py"] == [8080, 8081, 8082]
+    composition, context = load("bus.launch.py", simulation="true",
+                                can_dashboard_ports="", motor_dashboard_ports="")
+    monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
+    assert not any(node["executable"] == "dashboard.py" for node in composition.compose(context))
     composition, context = load("bus.launch.py", simulation="true",
                                 can_dashboard_ports="{main: 8082}", motor_dashboard_ports="config")
     with pytest.raises(ValueError, match="unique"):
         composition.compose(context)
 
 
-@pytest.mark.parametrize("port,count", [("", 0), ("config", 1)])
+@pytest.mark.parametrize("port,count", [(None, 1), ("", 0), ("config", 1)])
 def test_standalone_simulation_dashboard_does_not_start_devices(monkeypatch, port, count):
-    module, context = load("dashboard.launch.py", simulation="true", dashboard_port=port)
+    overrides = {} if port is None else {"dashboard_port": port}
+    module, context = load("dashboard.launch.py", simulation="true", **overrides)
     monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
     nodes = module.launch_dashboard(context)
     assert len(nodes) == count

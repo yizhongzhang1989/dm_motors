@@ -32,8 +32,7 @@ source install/setup.bash
 **推荐先用物理仿真开发 / 自动化测试**，不需要 USB2CAN 或电机：
 
 ```bash
-ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
-  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true
 ```
 
 启动虚拟 CAN、两台按时间积分的关节模型、生产电机驱动、主从控制器及四个面板。
@@ -48,53 +47,52 @@ ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
 不是简易版的绝对位置互换。专用面板使用 8084：
 
 ```bash
-ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true \
-  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true
 ```
 
 与主从场景择一运行；不要同时开始两个控制器。算法、接口和硬件门禁见
 [标准双边力控](src/dm_motor_bilateral_control/README.md)。
 
-**真机主从跟随并开启四个面板**：显式指定所需面板端口。
+**真机主从跟随并开启四个面板**：直接使用默认配置。
 
 ```bash
-ros2 launch dm_motor_bringup lead_follow.launch.py \
-  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+ros2 launch dm_motor_bringup lead_follow.launch.py
 ```
 
 **真机独立控制两台电机并开启三个通用面板**：改用下面的入口。
 
 ```bash
-ros2 launch dm_motor_bringup dual_motor.launch.py \
-  can_dashboard_ports:=config motor_dashboard_ports:=config
+ros2 launch dm_motor_bringup dual_motor.launch.py
 ```
 
 **以上场景选一个运行，不要占用相同命名空间和端口。** 三个 `dm_motor_bringup` 入口
 默认加载真实串口配置，不启动模拟器，也不会自动使能。
 bringup 不提供 `_hardware` 或独立仿真入口；同一个 launch 通过 `simulation` 参数选择模式。
 
-**不提供面板端口时，默认只启动控制节点，不启动任何 Dashboard。**
-`config` 表示读取所选 package/launch 的端口配置（默认 CAN 8080、电机 8081/8082、主从 8083、双边 8084）。
+**所有 launch 默认读取配置文件中的参数，包括面板端口，无需再传 `:=config`。**
+所选 package/launch 的默认端口为 CAN 8080、电机 8081/8082、主从 8083、双边 8084。
 每个面板端口都明确列出，不使用 base_port 或顺序递增。单面板可以传数字覆盖，
-多面板使用 `{实例名: 端口}` 映射覆盖。只需主从面板时传 `dashboard_port:=config`，
-不会连带启动单机/CAN 面板。
+多面板使用 `{实例名: 端口}` 映射覆盖。显式空值关闭对应面板；
+例如只需主从面板时传 `can_dashboard_ports:='{}' motor_dashboard_ports:='{}'`。
+也可在 YAML 中将单端口设为 `''`、端口映射设为 `{}`，使该入口默认无对应面板。
 Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow` 和 `dm_motor_bilateral_control`，
 不再有独立的 Dashboard package，但 HTTP 服务仍是独立进程，不进入实时控制循环。
 所有功能包共享 `common` 配置模块，Python 和 C++ 节点从同一文件获取默认值。
 `common` 不含电机业务结构，未来其它 package 也可使用；同一包不同 launch 的参数相互独立。
-自定义配置可传 `config_file:=/绝对路径/配置.yaml` 或设置 `COMMON_CONFIG`；
+每个 launch 均可通过 `config_file:=/绝对路径/配置.yaml` 指定自定义配置，也支持相对路径；
+不传时读取 `COMMON_CONFIG`，未设置该变量时读取安装的默认配置，对应 [config/dm_motors.yaml](config/dm_motors.yaml)。
 显式 launch / ROS 参数可覆盖文件中的值，修改文件后需重新启动对应节点。
 
 ### 3. 打开面板
 
-指定端口开启的 Dashboard 默认监听 `0.0.0.0`，**无需指定 host**。
+按配置开启的 Dashboard 默认监听 `0.0.0.0`，**无需指定 host**。
 本机使用下表链接；其它机器把 `127.0.0.1` 换成服务主机的局域网 IP，
 例如 `http://192.168.1.10:8083/`。可在服务主机用 `ip -br -4 addr` 查看地址。
 
 | 面板 | 本机地址 | 操作 |
 | --- | --- | --- |
-| **主从跟随** | **<http://127.0.0.1:8083/>** | 按上述主从面板端口启动；编辑参数，点击右上角「开始」/「停止」 |
-| **标准双边力控** | **<http://127.0.0.1:8084/>** | 双边入口选择端口后开启；右上开始/停止，查看两侧力矩、共同增益及配对状态 |
+| **主从跟随** | **<http://127.0.0.1:8083/>** | 主从入口默认开启；编辑参数，点击右上角「开始」/「停止」 |
+| **标准双边力控** | **<http://127.0.0.1:8084/>** | 双边入口默认开启；右上开始/停止，查看两侧力矩、共同增益及配对状态 |
 | 电机 1 | <http://127.0.0.1:8081/> | 自动监控，右上角「使能」/「失能」 |
 | 电机 2 | <http://127.0.0.1:8082/> | 自动监控，右上角「使能」/「失能」 |
 | CAN 总线 | <http://127.0.0.1:8080/> | 总线状态、帧观察及独立调试 |
@@ -253,15 +251,14 @@ source install/setup.bash
 终端 1：
 
 ```bash
-ros2 launch dm_motor_bringup dual_motor.launch.py \
-  can_dashboard_ports:=config motor_dashboard_ports:=config
+ros2 launch dm_motor_bringup dual_motor.launch.py
 ```
 
 **这是默认真机入口，会打开配置的串口。启动前先按第 3 节核对供电、接线、串口及物理停止条件。
 启动不会使能电机；不要仅凭网页能打开就认为设备已就绪。**
 
 默认读取 [dm_motors.yaml](config/dm_motors.yaml) 中
-`packages.dm_motor_bringup.launches["dual_motor.launch.py"]`，以上显式端口选择命令启动：
+`packages.dm_motor_bringup.launches["dual_motor.launch.py"]`，以上命令按配置启动：
 
 | 组件 | 命名空间 / 地址 |
 | --- | --- |
@@ -289,7 +286,8 @@ ros2 run dm_motor_control motor_client.py --namespace /motor_2 state
 若不需要网页：
 
 ```bash
-ros2 launch dm_motor_bringup dual_motor.launch.py
+ros2 launch dm_motor_bringup dual_motor.launch.py \
+  can_dashboard_ports:='{}' motor_dashboard_ports:='{}'
 ```
 
 `dm_motor_bringup` 是系统级启动包，提供三个统一入口，均默认真机：
@@ -301,14 +299,14 @@ ros2 launch dm_motor_bringup dual_motor.launch.py
 - `bilateral_control.launch.py`：双侧相对坐标 MIT PD 耦合；专用面板默认 8084，
   或显式调用 `/bilateral_control/start`，不自动使能。
 
-主从入口传入 `dashboard_port:=config`（或具体端口）才会启动包内的 [Lead Follow Dashboard](src/dm_motor_lead_follow/DASHBOARD.md)
-（此时 <http://127.0.0.1:8083/>），可以在页面显式开始/停止、交换角色及配置跟随参数。
+主从入口按配置默认启动包内的 [Lead Follow Dashboard](src/dm_motor_lead_follow/DASHBOARD.md)
+（<http://127.0.0.1:8083/>），可以在页面显式开始/停止、交换角色及配置跟随参数。
 包括主从面板在内，所有 Dashboard 默认监听 `0.0.0.0`，无需额外指定 host。
 其它机器使用 `http://服务主机的局域网IP:端口/` 访问；防火墙须允许相应端口，勿暴露公网。
 原有 8080/8081/8082 三个通用面板不加入主从功能。
-省略对应端口即可不启动该类面板；不需要额外布尔开关。
+将对应端口参数显式设为空值即可关闭该类面板；不需要额外布尔开关。
 
-复用 `dm_motor_control/bus.launch.py`，默认启动一条 CAN 总线及两台独立电机，不启动 Dashboard。
+复用 `dm_motor_control/bus.launch.py`，默认启动一条 CAN 总线、两台独立电机及配置的 Dashboard。
 默认不启动协议模拟器，始终不自动使能或运动。
 后续场景继续使用同一 launch，不按仿真/真机创建两份入口。
 `simulation:=true` 选择配置中的仿真变体，启动独立虚拟设备进程，生产驱动不变；
@@ -324,18 +322,21 @@ bringup launch 参数：
 | `namespace` | 空 | 部署前缀，例如 `robot` |
 | `control_rate` | 空（使用 YAML，当前 200 Hz） | 覆盖所有电机控制频率，20–1000 Hz；低于配置状态频率时同步降低状态频率 |
 | `dashboard_host` | `0.0.0.0` | 所有已选择面板的 IPv4 监听地址；设为 `127.0.0.1` 可限制为仅本机访问 |
-| `dashboard_port` | 空 | 主从/双边专用面板 HTTP 端口；`config` 使用当前 launch 的 `parameters.dashboard_port`，数字直接覆盖；空则不启动 |
+| `dashboard_port` | `config`（读取 YAML） | 主从/双边专用面板 HTTP 端口；省略时使用当前 launch 的 `parameters.dashboard_port`，数字直接覆盖；显式空值关闭 |
 | `leader` / `follower` | `motor_1` / `motor_2` | 主从入口使用的电机命名空间；相对部署 namespace 或绝对路径 |
 | `motor_a` / `motor_b` | `motor_1` / `motor_2` | 双边入口使用的两个对等电机命名空间 |
-| `can_dashboard_ports` | 空 | `config` 使用当前 launch 的同名映射，或显式 `{main: 8080}`；空则不启动 |
-| `motor_dashboard_ports` | 空 | `config` 使用当前 launch 的同名映射，或显式 `{motor_1: 8081, motor_2: 8082}`；空则不启动 |
+| `can_dashboard_ports` | `config`（读取 YAML） | 省略时使用当前 launch 的同名映射，或显式 `{main: 8080}` 覆盖；显式空值或 `{}` 关闭 |
+| `motor_dashboard_ports` | `config`（读取 YAML） | 省略时使用当前 launch 的同名映射，或显式 `{motor_1: 8081, motor_2: 8082}` 覆盖；显式空值或 `{}` 关闭 |
 
 单面板参数接受 `config` 或 1–65535 的整数；组合面板参数接受 `config` 或命名映射。
 每个映射值必须是合法整数，不能使用 0、负数、auto 或布尔值。
-配置中写了端口并不自动启动面板，仍需显式选择。
+省略端口参数时自动使用配置，旧的 `:=config` 写法保持兼容，但无需重复指定。
+配置中的单端口可设为 `''`、端口映射可设为 `{}`，关闭对应面板。
 多总线/多电机按实例名匹配端口，不计算递增端口；重复、越界或未知实例名会在设备启动前报错。
-所有入口省略端口即完全无网页。应用专用面板端口也不能与通用面板重叠。
-底层 `dm_motor_control bus.launch.py` 同样按 `can_dashboard_ports` / `motor_dashboard_ports` 显式选择面板，
+主从/双边入口完全无网页时，显式传 `can_dashboard_ports:='{}' motor_dashboard_ports:='{}' dashboard_port:="''"`。
+ROS 2 CLI 不接受裸空值 `name:=`；单端口的空字符串需按上例保留引号，多端口可直接传空映射 `{}`。
+应用专用面板端口也不能与通用面板重叠。
+底层 `dm_motor_control bus.launch.py` 同样按配置中的 `can_dashboard_ports` / `motor_dashboard_ports` 选择面板，
 单独启动时读取 `packages.dm_motor_control.launches["bus.launch.py"]`；
 被 bringup 包含时沿用顶层入口的 profile，避免串用子 launch 默认值。
 离线开发必须显式传入 `simulation:=true`；不要依赖旧版单电机入口默认使用协议模拟器的行为。
@@ -656,7 +657,7 @@ watchdog 等受保护参数不能通过本面板绕过专用维护路径。
 
 ### 4.2 主从跟随面板
 
-开启主从面板的入口为 `ros2 launch dm_motor_bringup lead_follow.launch.py dashboard_port:=config`。
+开启主从面板的入口为 `ros2 launch dm_motor_bringup lead_follow.launch.py`。
 它与 CAN、两个单机面板分工独立，不在通用面板内嵌主从功能。
 
 1. 页面自动读取控制器和双轴状态；两台就绪且确认失能时可直接编辑参数。
@@ -741,8 +742,7 @@ C++ 控制器另有默认 1 秒的 `operator_timeout`，面板进程崩溃后也
 在**连接电机的服务主机**启动真机服务：
 
 ```bash
-ros2 launch dm_motor_bringup lead_follow.launch.py \
-  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+ros2 launch dm_motor_bringup lead_follow.launch.py
 ```
 
 `dual_motor.launch.py` 和 `lead_follow.launch.py` 均默认连接真机；
@@ -797,7 +797,7 @@ CAN dashboard 允许配置的绑定主机名、本机系统主机名 / 短主机
 
 ```bash
 # 两台电机已经运行时，仅附加控制器和专用面板
-ros2 launch dm_motor_bilateral_control bilateral_control.launch.py dashboard_port:=config
+ros2 launch dm_motor_bilateral_control bilateral_control.launch.py
 ```
 
 真机默认 PD 预算 0.5 Nm，仿真默认预算 8 Nm，预算用于共同增益缩放，不是反馈力矩停机阈值。
@@ -938,6 +938,19 @@ Flash 保存有寿命限制，不要周期执行，ACK 也不等于已经验证�
 在选中的文件之上，显式 launch / ROS 参数覆盖同名参数。配置只在启动时读取，不热切换控制。
 消息接口包没有运行参数，不依赖加载器；Fast DDS XML 仍只负责中间件传输策略。
 
+所有 launch 使用同一个可选路径参数，例如：
+
+```bash
+# 不指定 config_file：读取默认配置，包括该入口的面板端口
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true
+
+# 指定完整配置文件；只需传一次，所有被包含的组件沿用它
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
+  config_file:=/绝对路径/site.yaml
+```
+
+缺失文件、无效 YAML 或缺少必要配置会明确报错，不会悄悄回退到默认文件。
+
 例如给 `dual_motor.launch.py` 增加第三台电机并为三个面板分别指定端口
 （以下展示该入口结构，实际编辑时保留其它 package/launch 的配置）：
 
@@ -1020,7 +1033,7 @@ packages:
 
 ## 7. 单独启动各组件
 
-### 7.1 只启动 CAN 服务
+### 7.1 独立启动 CAN 服务
 
 ```bash
 # 无硬件的 Topic 虚拟总线；不会自动生成设备反馈
@@ -1028,13 +1041,13 @@ ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=virtual
 
 # 或：独立打开真实适配器；不能与组合 launch 重复占用
 ros2 launch can_bus can_bus.launch.py namespace:=can/main \
-  backend:=serial port:=/dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00 \
-  dashboard_port:=config
+  backend:=serial port:=/dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
 ```
 
 总线 launch 参数为 `namespace/backend/port/can_fd/can_bitrate` 以及
 `dashboard_port/dashboard_host`。`port` 是硬件设备路径，`dashboard_port` 是 HTTP 端口，二者不同；
-省略 `dashboard_port` 不启动网页。所有组件仍保留独立的 `dashboard.launch.py` 便于只附加面板。
+省略 `dashboard_port` 使用配置端口，传 `dashboard_port:="''"` 才关闭网页。
+所有组件仍保留独立的 `dashboard.launch.py` 便于只附加面板。
 仅启动模拟 CAN 服务时还需要独立设备模拟器；实际部署优先使用 Quickstart 的真机组合入口。
 
 ### 7.2 电机节点连接已有总线
@@ -1043,14 +1056,15 @@ ros2 launch can_bus can_bus.launch.py namespace:=can/main \
 
 ```bash
 ros2 launch dm_motor_control motor.launch.py motor_id:=1 master_id:=0 \
-  start_can_bus:=false can_bus_namespace:=/can/main dashboard_port:=config
+  start_can_bus:=false can_bus_namespace:=/can/main
 
 ros2 launch dm_motor_control motor.launch.py motor_id:=2 master_id:=0 \
-  start_can_bus:=false can_bus_namespace:=/can/main dashboard_port:=config
+  start_can_bus:=false can_bus_namespace:=/can/main dashboard_port:=8082
 ```
 
 **必须设置 `start_can_bus:=false`**，否则单电机 launch 默认还会启动自己的总线服务。
-`dashboard_port` 仅为该电机开启面板，不会自动开启 CAN 面板；省略则只启动电机。
+配置端口仅为该电机开启面板，不会自动开启 CAN 面板；传 `dashboard_port:="''"` 则只启动电机。
+单电机入口默认端口为 8081，不按电机 ID 递增，因此第二台在示例中显式覆盖为 8082。
 直接运行 `motor_node` 也只连接已有 CAN 服务，不创建适配器：
 
 ```bash
@@ -1062,7 +1076,7 @@ ros2 run dm_motor_control motor_node --ros-args \
 需要完整单电机物理仿真时：
 
 ```bash
-ros2 launch dm_motor_control motor.launch.py simulation:=true motor_id:=1 dashboard_port:=config
+ros2 launch dm_motor_control motor.launch.py simulation:=true motor_id:=1
 ```
 
 其默认 CAN 命名空间是 `/motor_1/can`，**不是**组合启动的 `/can/main`。
@@ -1073,22 +1087,23 @@ ros2 launch dm_motor_control motor.launch.py simulation:=true motor_id:=1 dashbo
 
 ```bash
 ros2 launch can_bus dashboard.launch.py \
-  bus_namespace:=/can/main dashboard_port:=config
+  bus_namespace:=/can/main
 
 ros2 launch dm_motor_control dashboard.launch.py \
-  motor_id:=1 namespace:=/motor_1 dashboard_port:=config
+  motor_id:=1 namespace:=/motor_1
 
 ros2 launch dm_motor_control dashboard.launch.py \
   motor_id:=2 namespace:=/motor_2 dashboard_port:=8082
 
 # 主从控制器已存在时，仅附加专用面板
-ros2 launch dm_motor_lead_follow dashboard.launch.py dashboard_port:=config
+ros2 launch dm_motor_lead_follow dashboard.launch.py
 ```
 
 电机面板的 `command_timeout` 必须与对应驱动一致。**单独的电机面板 launch**
 所有独立面板 launch 读取自己 profile 的 `dashboard_host/dashboard_port`；
 单独改变 `motor_id` 不计算新端口，第二个实例需显式传入不同端口，或使用组合入口的命名映射。
-省略端口时连独立面板 launch 也不创建网页进程。显式指定的端口不会被自动改号。
+独立面板 launch 同样默认使用配置端口；传 `dashboard_port:="''"` 才不创建网页进程。
+显式指定的端口不会被自动改号。
 以上默认允许局域网访问，不会限制为仅本机；不要与组合启动重复启动同端口面板。
 为已经运行的物理仿真附加电机面板时，另传 `simulation:=true` 才启用轴圆盘交互；
 该独立面板入口不会创建驱动、总线或虚拟设备。未选择仿真时，轴圆盘始终只读。
@@ -1098,10 +1113,11 @@ ros2 launch dm_motor_lead_follow dashboard.launch.py dashboard_port:=config
 若已经运行双电机入口，只附加控制器和主从面板，不再启动第二套 CAN 或电机节点：
 
 ```bash
-ros2 launch dm_motor_lead_follow lead_follow.launch.py dashboard_port:=config
+ros2 launch dm_motor_lead_follow lead_follow.launch.py
 ```
 
-该入口只附加主从控制器和显式选择的面板，不选择真机/仿真后端。省略端口则只附加控制器。
+该入口只附加主从控制器和配置的面板，不选择真机/仿真后端。
+传 `dashboard_port:="''"` 则只附加控制器。
 需要部署前缀时传入与电机系统一致的
 `namespace`，或通过 `leader`、`follower` 指定绝对电机命名空间。
 已经运行完整主从 bringup 时，不要再执行本节命令。

@@ -157,6 +157,7 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
             epoch = snapshots[0]["status"]["epoch"]
             headless_command = [argument for argument in command if not argument.startswith(
                 ("can_dashboard_ports:=", "motor_dashboard_ports:=", "dashboard_port:="))]
+            headless_command += ["can_dashboard_ports:={}", "motor_dashboard_ports:={}", "dashboard_port:=''"]
             for duplicate_command in (command, headless_command):
                 with tempfile.TemporaryFile(mode="w+") as duplicate_log:
                     duplicate = subprocess.Popen(
@@ -189,7 +190,7 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
     ("dual_motor.launch.py", 4),
     ("lead_follow.launch.py", 5),
 ])
-def test_omitting_ports_starts_devices_but_no_dashboard_process(entry, expected_nodes, monkeypatch):
+def test_empty_ports_start_devices_but_no_dashboard_process(entry, expected_nodes, monkeypatch):
     monkeypatch.setenv("ROS_DOMAIN_ID", str(120 + os.getpid() % 20))
     namespace = f"/headless_test_{os.getpid()}_{time.monotonic_ns()}"
     config = Path(get_package_share_directory("dm_motor_control")) / "test/config/sim_bus.yaml"
@@ -203,7 +204,8 @@ def test_omitting_ports_starts_devices_but_no_dashboard_process(entry, expected_
     subscriptions.append(node.create_subscription(LeadFollowState, "lead_follow/state", follow.append, 1))
     with tempfile.TemporaryFile(mode="w+") as log:
         process = subprocess.Popen(
-            ["ros2", "launch", "dm_motor_bringup", entry, f"config:={config}", f"namespace:={namespace}"],
+            ["ros2", "launch", "dm_motor_bringup", entry, f"config:={config}", f"namespace:={namespace}",
+             "can_dashboard_ports:={}", "motor_dashboard_ports:={}", "dashboard_port:=''"],
             stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 20
@@ -229,7 +231,8 @@ def test_omitting_ports_starts_devices_but_no_dashboard_process(entry, expected_
             rclpy.shutdown()
 
 
-def test_single_config_changes_ports_and_runtime_parameters_across_packages(tmp_path):
+@pytest.mark.parametrize("config_source", ["argument", "environment"])
+def test_single_config_changes_ports_and_runtime_parameters_without_port_arguments(tmp_path, config_source):
     port = available_port_block(4)
     config = ConfigManager()
     document = yaml.safe_load(config.path.read_text())
@@ -247,12 +250,17 @@ def test_single_config_changes_ports_and_runtime_parameters_across_packages(tmp_
     path.write_text(yaml.safe_dump(document))
     namespace = f"common_config_{os.getpid()}_{time.monotonic_ns()}"
     environment = dict(os.environ, ROS_DOMAIN_ID=str(80 + os.getpid() % 40))
+    config_arguments = []
+    if config_source == "argument":
+        config_arguments.append(f"config_file:={path}")
+        environment["COMMON_CONFIG"] = str(tmp_path / "unused.yaml")
+    else:
+        environment["COMMON_CONFIG"] = str(path)
     opener = build_opener(ProxyHandler({}))
     with tempfile.TemporaryFile(mode="w+") as log:
         process = subprocess.Popen([
             "ros2", "launch", "dm_motor_bringup", "lead_follow.launch.py",
-            f"config_file:={path}", f"namespace:={namespace}",
-            "can_dashboard_ports:=config", "motor_dashboard_ports:=config", "dashboard_port:=config",
+            f"namespace:={namespace}", *config_arguments,
         ], env=environment, stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 20

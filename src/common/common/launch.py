@@ -9,7 +9,7 @@ from .config import ConfigManager, default_config_path
 
 def config_argument():
     return DeclareLaunchArgument("config_file", default_value=default_config_path(),
-                                 description="Single package/launch runtime YAML configuration.")
+                                 description="Runtime YAML path; defaults to COMMON_CONFIG or the installed common config.")
 
 
 def config_for_context(context):

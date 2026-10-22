@@ -1,6 +1,6 @@
 # Common configuration schema v2. Package and full launch filename select a profile.
 # nodes: defaults for direct executables; launches: arguments and per-component overrides.
-# Ports are explicit per instance; omitted CLI port arguments still disable dashboards.
+# Omitted CLI arguments use this config; '' disables a dashboard and {} disables a port mapping.
 version: 2
 packages:
   can_bus:

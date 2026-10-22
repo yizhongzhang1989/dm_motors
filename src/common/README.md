@@ -19,6 +19,10 @@ Python 使用 `common.config.ConfigManager`，C++ 使用 `common/config.hpp`。
 2. 环境变量 `COMMON_CONFIG`。
 3. `common` 安装目录中的 `config/runtime.yaml`。
 
+所有 launch 都声明可选的 `config_file` 参数；不传路径即可读取默认文件，
+并使用所选 package/launch 的参数和面板端口，不必再逐项传 `:=config`。
+相对路径相对于启动命令的工作目录解析，组合入口会向所有子组件传递同一配置。
+
 旧 `dm_motor_common` 包、`DM_MOTORS_CONFIG` 环境变量及 version 1 配置结构已移除。
 配置按进程启动加载，不在控制周期读取磁盘，也不通过修改 `config_file` 参数热切换。
 缺失文件、重复 key、格式/类型错误或缺少所查询的参数均明确报错。
@@ -99,17 +103,30 @@ packages:
 组件/单独面板入口的 `dashboard_port` 是该入口自己的单个端口，改变 `motor_id` 不自动改端口；
 启动第二个单机面板时需另传端口，或使用已明确列出各实例的组合入口。
 
-原有可选启动规则不变：
+端口默认从所选配置读取，命令行参数可覆盖或关闭：
 
-- 省略端口参数：不开面板，即使配置中定义了端口。
-- `dashboard_port:=config`：使用当前入口配置中的单个端口。
+- 省略端口参数：使用当前入口配置中的单端口或命名映射，启动对应面板。
+- `dashboard_port:="''"`：显式关闭单个面板；配置中也可写 `dashboard_port: ''`。
 - `dashboard_port:=9183`：显式数字覆盖。
-- `can_dashboard_ports:=config motor_dashboard_ports:=config`：使用当前组合入口的命名映射。
+- `can_dashboard_ports:='{}' motor_dashboard_ports:='{}'`：关闭两类通用面板；
+  配置中的映射设为 `{}` 也表示不启动该类面板。
 - `motor_dashboard_ports:='{motor_1: 9181, motor_2: 9388}'`：逐实例覆盖，不做自动分配。
+- 旧的 `:=config` 写法保持兼容，但默认已经读取配置，不再需要显式传入。
+
+ROS 2 CLI 不接受裸空值 `name:=`。关闭单面板时需保留空字符串的引号（`"''"` 或 `'""'`）；
+多面板可传空映射 `{}`。launch 上下文或 YAML 中真正的空字符串仍表示关闭。
 
 ```bash
-ros2 launch dm_motor_bringup lead_follow.launch.py \
-  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+# 默认配置；仿真不会连接真实设备，也不自动使能
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true
+
+# 自定义完整配置，所有被包含的组件沿用同一文件
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
+  config_file:=/path/to/site.yaml
+
+# 显式关闭全部面板
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
+  can_dashboard_ports:='{}' motor_dashboard_ports:='{}' dashboard_port:="''"
 ```
 
 重复、超范围、未知实例、非整数端口会在创建设备节点前报错。HTTP 主机默认由所选入口的

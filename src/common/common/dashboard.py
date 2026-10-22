@@ -9,16 +9,18 @@ from .launch import ConfigValue
 
 def dashboard_arguments(package, filename):
     return [
-        DeclareLaunchArgument("dashboard_port", default_value="",
-                              description="HTTP port 1..65535 or config; omitted disables the dashboard."),
+        DeclareLaunchArgument("dashboard_port", default_value="config",
+                              description="HTTP port defaults to config; use dashboard_port:=\"''\" to disable."),
         DeclareLaunchArgument("dashboard_host", default_value=ConfigValue("dashboard_host", package, filename)),
     ]
 
 
 def optional_port(value, name="dashboard_port", configured=None):
-    if value == "":
+    if value in ("", "''", '""'):
         return None
     if value == "config":
+        if configured == "":
+            return None
         if type(configured) is not int or not 1 <= configured <= 65535:
             raise ValueError(f"{name}: no valid port in the selected common configuration")
         return configured

@@ -32,8 +32,8 @@ def generate_launch_description():
         DeclareLaunchArgument("config", default_value="",
                               description="Optional topology override; empty uses the common system configuration."),
         *dashboard_arguments(PACKAGE, LAUNCH),
-        DeclareLaunchArgument("can_dashboard_ports", default_value=""),
-        DeclareLaunchArgument("motor_dashboard_ports", default_value=""),
+        DeclareLaunchArgument("can_dashboard_ports", default_value="config"),
+        DeclareLaunchArgument("motor_dashboard_ports", default_value="config"),
         OpaqueFunction(function=check_system_dashboard_endpoint),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([

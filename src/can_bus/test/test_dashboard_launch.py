@@ -13,8 +13,8 @@ from common.config import ConfigManager
 
 
 @pytest.mark.parametrize("filename", ["can_bus.launch.py", "dashboard.launch.py"])
-@pytest.mark.parametrize("port", ["", "18994", "config"])
-def test_dashboard_is_opt_in_and_belongs_to_can_bus(monkeypatch, filename, port):
+@pytest.mark.parametrize("port", [None, "", "18994", "config"])
+def test_dashboard_uses_config_unless_overridden_and_belongs_to_can_bus(monkeypatch, filename, port):
     spec = importlib.util.spec_from_file_location(
         "can_dashboard_launch", Path(__file__).resolve().parents[1] / "launch" / filename)
     module = importlib.util.module_from_spec(spec)
@@ -22,20 +22,22 @@ def test_dashboard_is_opt_in_and_belongs_to_can_bus(monkeypatch, filename, port)
     monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
     context = LaunchContext()
     context.launch_configurations.update(
-        namespace="robot/can/main", bus_namespace="/robot/can/main", dashboard_port=port)
+        namespace="robot/can/main", bus_namespace="/robot/can/main")
+    if port is not None:
+        context.launch_configurations["dashboard_port"] = port
     description = module.generate_launch_description()
     for action in description.entities:
         if isinstance(action, DeclareLaunchArgument):
             action.execute(context)
     nodes = next(action for action in description.entities if isinstance(action, OpaqueFunction)).execute(context)
     dashboards = [node for node in nodes if node["executable"] == "dashboard.py"]
-    assert len(dashboards) == bool(port)
-    assert len(nodes) == (filename == "can_bus.launch.py") + bool(port)
-    if port:
+    assert len(dashboards) == (port != "")
+    assert len(nodes) == (filename == "can_bus.launch.py") + (port != "")
+    if port != "":
         assert dashboards[0]["package"] == "can_bus"
         assert dashboards[0]["parameters"][0] == {
             "bus_namespace": "/robot/can/main", "host": "0.0.0.0",
-            "port": 8080 if port == "config" else 18994, "config_file": str(ConfigManager().path)}
+            "port": 8080 if port in (None, "config") else 18994, "config_file": str(ConfigManager().path)}
 
 
 @pytest.mark.parametrize("port", ["0", "-1", "65536", "1.5", "true", "auto", " ", "１２３"])

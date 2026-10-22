@@ -28,8 +28,8 @@ def generate_launch_description():
         config_argument(), *profile_arguments(PACKAGE, LAUNCH), *simulation_arguments(),
         DeclareLaunchArgument("config", default_value=""),
         *dashboard_arguments(PACKAGE, LAUNCH),
-        DeclareLaunchArgument("can_dashboard_ports", default_value=""),
-        DeclareLaunchArgument("motor_dashboard_ports", default_value=""),
+        DeclareLaunchArgument("can_dashboard_ports", default_value="config"),
+        DeclareLaunchArgument("motor_dashboard_ports", default_value="config"),
         OpaqueFunction(function=check_system_endpoints),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([

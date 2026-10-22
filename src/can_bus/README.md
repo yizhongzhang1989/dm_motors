@@ -4,7 +4,7 @@
 dependency. Run it in a bus namespace, for example `/can/main`; all endpoint
 names below are relative to that namespace.
 
-Launch only the generic owner, without any motor or simulated device nodes:
+Launch the generic owner and its configured dashboard, without any motor or simulated device nodes:
 
 ```bash
 ros2 launch can_bus can_bus.launch.py \
@@ -27,7 +27,7 @@ delay is not hidden from motor feedback age. `sim` remains a legacy test alias
 with its existing timestamp behavior.
 
 ```bash
-ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=virtual dashboard_port:=config
+ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=virtual
 ```
 
 One ROS domain/namespace admits only one CAN owner, even when a virtual and
@@ -35,23 +35,25 @@ physical backend are accidentally mixed. Physical motor models are provided by
 [dm_motor_control in simulation mode](../dm_motor_control/SIMULATION.md), not by the CAN broker.
 
 The optional web dashboard is included in this package and runs as a separate
-process. Add `dashboard_port:=config` to the bus launch to use the centralized
-port (8080 by default), or specify an integer override; omit the
-argument for no dashboard. `dashboard_host` defaults to `0.0.0.0` (trusted LAN
+process. Both launches read the configured port automatically (8080 by default).
+Specify an integer override, or use `dashboard_port:="''"` for no dashboard.
+An empty `dashboard_port` in the YAML also disables it. `dashboard_host` defaults to `0.0.0.0` (trusted LAN
 access). The hardware `port` argument is unrelated to the HTTP `dashboard_port`.
 To attach only a dashboard to an already running bus:
 
 ```bash
-ros2 launch can_bus dashboard.launch.py bus_namespace:=/can/main dashboard_port:=config
+ros2 launch can_bus dashboard.launch.py bus_namespace:=/can/main
 ```
 
-Both launch files require an explicit HTTP port to start a dashboard. Invalid
-or occupied ports abort before starting nodes. See [Dashboard](DASHBOARD.md).
+No `:=config` marker is needed. Invalid or occupied ports abort before starting
+nodes. See [Dashboard](DASHBOARD.md).
 
 All runtime defaults come from [config/dm_motors.yaml](../../config/dm_motors.yaml)
 through `common`, including direct C++ node and Python dashboard launches.
 Use `config_file:=/path/to/site.yaml` (launch), `-p config_file:=...` (ROS node),
 or `COMMON_CONFIG` to select a different complete configuration.
+When no path is supplied, both launches use `COMMON_CONFIG` or the installed
+default file; relative paths are resolved from the launch working directory.
 Explicit launch/ROS parameters override file defaults. Changes take effect at
 process startup, not in the control loop. Missing/invalid files fail explicitly.
 Profiles are keyed by package and full launch filename, for example

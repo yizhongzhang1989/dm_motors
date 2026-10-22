@@ -50,8 +50,8 @@ def generate_launch_description():
         "namespace": ConfigValue("namespace", PACKAGE, LAUNCH),
         "control_rate": ConfigValue("control_rate", PACKAGE, LAUNCH),
         "dashboard_host": ConfigValue("dashboard_host", PACKAGE, LAUNCH),
-        "can_dashboard_ports": "",
-        "motor_dashboard_ports": "",
+        "can_dashboard_ports": "config",
+        "motor_dashboard_ports": "config",
     }
     return LaunchDescription([
         config_argument(),

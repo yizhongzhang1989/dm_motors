@@ -1,8 +1,8 @@
 # Lead Follow Dashboard（内置于 dm_motor_lead_follow）
 
 面板源码、网页及测试已并入主从包，不再作为独立 ROS package。
-传入 `dashboard_port:=config` 后读取公共配置，默认监听 `0.0.0.0:8083`（所有本机 IPv4 接口）；
-也可指定数字覆盖，省略端口则不启动面板。默认值统一来自
+launch 自动读取公共配置，默认监听 `0.0.0.0:8083`（所有本机 IPv4 接口）；
+也可指定数字覆盖，或传 `dashboard_port:="''"` 关闭面板。默认值统一来自
 [config/dm_motors.yaml](../../config/dm_motors.yaml)，不在面板代码中另设一份端口。
 此时本机访问 <http://127.0.0.1:8083/>；其它机器访问 `http://服务主机的局域网IP:8083/`，
 无需额外指定 host 参数。`0.0.0.0` 是监听地址，不是浏览器访问地址。
@@ -15,16 +15,17 @@
 在工作空间构建并加载环境后：
 
 ```bash
-# 完整真机系统和主从面板，仍默认失能；其它面板不自动启动
-ros2 launch dm_motor_bringup lead_follow.launch.py dashboard_port:=config
+# 完整真机系统及配置的四个面板，仍默认失能
+ros2 launch dm_motor_bringup lead_follow.launch.py
 
 # 主从控制器已经运行时，只添加这个面板，避免重复启动设备/控制器
-ros2 launch dm_motor_lead_follow dashboard.launch.py dashboard_port:=config
+ros2 launch dm_motor_lead_follow dashboard.launch.py
 ```
 
 如果启动主从控制器时需要面板，使用
-`ros2 launch dm_motor_lead_follow lead_follow.launch.py dashboard_port:=config`。
-所有 launch 均不在缺省端口时自动启动网页进程，不要重复启动同端口面板。
+`ros2 launch dm_motor_lead_follow lead_follow.launch.py`。
+每个 launch 都可选传 `config_file:=/绝对路径/site.yaml`；省略路径和端口参数即使用默认配置。
+不要重复启动同端口面板。
 bringup 不再提供单独仿真入口或 `_hardware` 别名；无后缀的系统入口默认连接真机，
 与只附加控制器/面板的独立包入口不同。
 
@@ -34,12 +35,13 @@ bringup 不再提供单独仿真入口或 `_hardware` 别名；无后缀的系�
 | `config_file` | 环境变量或公共包默认配置 | 整套参数来源，详见 common |
 | `controller_namespace` | `lead_follow` | 相对部署 namespace 或绝对控制器路径 |
 | `dashboard_host` | `0.0.0.0` | 默认允许其它机器经局域网访问；显式设为 `127.0.0.1` 可限制仅本机 |
-| `dashboard_port` | 空 | `config` 读取集中端口，或提供 1–65535 的整数覆盖；省略不启动 |
+| `dashboard_port` | `config`（读取 YAML） | 默认读取集中端口，或提供 1–65535 的整数覆盖；显式空值关闭 |
 
 系统入口会在启动设备前检查专用端口占用及与通用面板计划端口的冲突。
 配置按 `packages.<package>.launches.<完整launch文件名>` 读取；不同入口可使用不同参数。
 组合入口以 `can_dashboard_ports` / `motor_dashboard_ports` 的命名映射逐实例选择通用面板，
-以 `dashboard_port` 选择主从面板。所有端口均可省略，全部省略即完全无网页。
+以 `dashboard_port` 选择主从面板。省略参数时使用配置；
+完全无网页时显式传 `can_dashboard_ports:='{}' motor_dashboard_ports:='{}' dashboard_port:="''"`。
 每个实例独立声明端口，不使用 base_port 或自动递增。
 
 ### 启动提示端口占用

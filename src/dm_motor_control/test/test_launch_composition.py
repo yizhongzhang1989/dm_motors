@@ -82,8 +82,8 @@ def test_declared_dashboard_port_defaults():
         if isinstance(entity, DeclareLaunchArgument)
         and entity.name in ("dashboard_host", "can_dashboard_ports", "motor_dashboard_ports")
     }
-    assert defaults == {"dashboard_host": "0.0.0.0", "can_dashboard_ports": "",
-                        "motor_dashboard_ports": ""}
+    assert defaults == {"dashboard_host": "0.0.0.0", "can_dashboard_ports": "config",
+                        "motor_dashboard_ports": "config"}
 
 
 @pytest.mark.parametrize("can_port,motor_port,expected", [
@@ -109,6 +109,18 @@ def test_composed_dashboard_ports_are_exact_and_overridable(monkeypatch, can_por
     assert [node["namespace"] for node in dashboards] == namespaces
 
 
+@pytest.mark.parametrize("empty", ["''", '""', "{}"])
+def test_cli_empty_port_mappings_disable_composed_dashboards(monkeypatch, empty):
+    monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
+    nodes = compose({
+        "motor_names": ["one", "two"], "bus_names": ["main"],
+        "buses": {"main": {"backend": "sim"}},
+        "motors": {"one": {"motor_id": 1}, "two": {"motor_id": 2}},
+    }, dashboards=True, can_port=empty, motor_port=empty)
+    assert len(nodes) == 4
+    assert not any(node["executable"] == "dashboard.py" for node in nodes)
+
+
 @pytest.mark.parametrize("can_port,motor_port", [
     ("{main: 8081}", "{one: 8081}"), ("{main: 65536}", "{one: 8081}"),
     ("8080", "{one: 8081}"), ("{main: 8080}", "{missing: 8081}"),
@@ -124,9 +136,9 @@ def test_dashboard_port_conflicts_and_overflow_are_rejected(can_port, motor_port
 
 
 @pytest.mark.parametrize("package,motor_id,override,expected", [
-    ("can_bus", None, None, None),
+    ("can_bus", None, None, 8080),
     ("can_bus", None, "9200", 9200),
-    ("dm_motor_control", "1", None, None),
+    ("dm_motor_control", "1", None, 8081),
     ("dm_motor_control", "2", "", None),
     ("dm_motor_control", "2", "9200", 9200),
     ("dm_motor_control", "2", "config", 8081),
@@ -157,8 +169,10 @@ def test_standalone_dashboard_ports_match_composition(monkeypatch, package, moto
     assert nodes[0]["package"] == package
 
 
-@pytest.mark.parametrize("port,expected", [("", 1), ("9200", 2)])
-def test_motor_component_launch_dashboard_is_opt_in(monkeypatch, port, expected):
+@pytest.mark.parametrize("port,expected_port", [
+    (None, 8081), ("", None), ("9200", 9200), ("config", 8081),
+])
+def test_motor_component_launch_dashboard_uses_config_unless_overridden(monkeypatch, port, expected_port):
     spec = importlib.util.spec_from_file_location(
         "motor_optional_dashboard", Path(__file__).resolve().parents[1] / "launch/motor.launch.py")
     module = importlib.util.module_from_spec(spec)
@@ -166,20 +180,22 @@ def test_motor_component_launch_dashboard_is_opt_in(monkeypatch, port, expected)
     monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
     context = LaunchContext()
     context.launch_configurations.update(
-        dashboard_port=port, start_can_bus="false", namespace="robot/axis",
+        start_can_bus="false", namespace="robot/axis",
         can_bus_namespace="/robot/can/main", motor_id="2", command_timeout="0.15")
+    if port is not None:
+        context.launch_configurations["dashboard_port"] = port
     for entity in module.generate_launch_description().entities:
         if isinstance(entity, DeclareLaunchArgument):
             entity.execute(context)
     nodes = module.launch_motor(context)
-    assert len(nodes) == expected
-    if port:
+    assert len(nodes) == 1 + (expected_port is not None)
+    if expected_port is not None:
         dashboard = nodes[-1]
         assert dashboard["package"] == "dm_motor_control"
         assert dashboard["namespace"] == "robot/axis"
         assert dashboard["parameters"][0] == {
             **ConfigManager().node_parameters("dm_motor_control", "dashboard"),
-            "motor_id": 2, "host": "0.0.0.0", "port": 9200, "command_timeout": 0.15,
+            "motor_id": 2, "host": "0.0.0.0", "port": expected_port, "command_timeout": 0.15,
             "client_timeout": 0.75, "config_file": str(ConfigManager().path)}
         assert dashboard["parameters"][0]["simulation"] is False
 

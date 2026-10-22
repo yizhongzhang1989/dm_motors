@@ -1,4 +1,4 @@
-"""Follow launch port opt-in and standalone dashboard composition; no ROS processes."""
+"""Follow launch config defaults and standalone dashboard composition; no ROS processes."""
 
 import importlib.util
 from pathlib import Path
@@ -26,18 +26,19 @@ def launch(monkeypatch, filename, **overrides):
 
 
 @pytest.mark.parametrize("filename", ["lead_follow.launch.py", "dashboard.launch.py"])
-@pytest.mark.parametrize("port", ["", "18995", "config"])
-def test_only_explicit_ports_start_the_follow_dashboard(monkeypatch, filename, port):
-    nodes = launch(monkeypatch, filename, dashboard_port=port, dashboard_host="127.0.0.1")
+@pytest.mark.parametrize("port", [None, "", "18995", "config"])
+def test_follow_dashboard_uses_config_unless_overridden(monkeypatch, filename, port):
+    overrides = {} if port is None else {"dashboard_port": port}
+    nodes = launch(monkeypatch, filename, dashboard_host="127.0.0.1", **overrides)
     dashboards = [node for node in nodes if node["executable"] == "dashboard.py"]
-    assert len(dashboards) == bool(port)
-    assert len(nodes) == (filename == "lead_follow.launch.py") + bool(port)
-    if port:
+    assert len(dashboards) == (port != "")
+    assert len(nodes) == (filename == "lead_follow.launch.py") + (port != "")
+    if port != "":
         assert dashboards[0]["package"] == "dm_motor_lead_follow"
         assert dashboards[0]["namespace"] == "robot"
         assert dashboards[0]["parameters"][0] == {
             "controller_namespace": "lead_follow", "host": "127.0.0.1",
-            "port": 8083 if port == "config" else 18995, "config_file": str(ConfigManager().path)}
+            "port": 8083 if port in (None, "config") else 18995, "config_file": str(ConfigManager().path)}
 
 
 @pytest.mark.parametrize("filename", ["lead_follow.launch.py", "dashboard.launch.py"])

@@ -6,17 +6,18 @@ The dashboard does not launch the bus or any device. Monitoring registers no
 client and cannot transmit.
 
 ```bash
-ros2 launch can_bus dashboard.launch.py \
-  bus_namespace:=/can/main dashboard_port:=config
+ros2 launch can_bus dashboard.launch.py bus_namespace:=/can/main
 ```
 
 Executable: `ros2 run can_bus dashboard.py`. Launch arguments:
 `bus_namespace` (absolute, default `/can/main`), `dashboard_host` (default `0.0.0.0`),
-`dashboard_port` (empty by default: no dashboard). `config` selects `parameters.dashboard_port`
+`dashboard_port` defaults to `parameters.dashboard_port`
 from `packages.can_bus.launches["dashboard.launch.py"]` in
 [the common configuration](../../config/dm_motors.yaml); a numeric override must be in
-1..65535. The shared file also provides host/bus defaults; `config_file` and
-`COMMON_CONFIG` select an alternative file. Launch maps these to the HTTP server's
+1..65535. Use `dashboard_port:="''"` or an empty configured port to disable it.
+The shared file also provides host/bus defaults; optional `config_file` and
+`COMMON_CONFIG` select an alternative file, otherwise the installed default is used.
+Launch maps these to the HTTP server's
 `host`/`port` ROS parameters. Backend/FD capability, hardware port and bitrate are read from
 actual bus status; debugging remains disabled until that status is fresh.
 

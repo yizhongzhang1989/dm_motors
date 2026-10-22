@@ -66,7 +66,7 @@ def test_explicit_path_overrides_environment_and_launch_values_are_scoped(tmp_pa
         argument.execute(context)
     for argument in dashboard_arguments("camera_driver", "preview.launch.py"):
         argument.execute(context)
-    assert context.launch_configurations["dashboard_port"] == ""
+    assert context.launch_configurations["dashboard_port"] == "config"
     value = ConfigValue("fps", "camera_driver", "preview.launch.py", ("camera_driver", "camera"))
     assert value.perform(context) == "10"
     context.launch_configurations["config_launch"] = "record.launch.py"
@@ -105,6 +105,40 @@ def test_port_selection_is_not_part_of_the_generic_config_schema(tmp_path):
     assert optional_port("9080", configured=port) == 9080
     with pytest.raises(ValueError):
         optional_port("config", configured=True)
+
+
+@pytest.mark.parametrize("configured,override,expected", [
+    (9010, None, 9010),
+    ("", None, None),
+    (9010, "", None),
+    (9010, "''", None),
+    (9010, '""', None),
+    (9010, "9183", 9183),
+    ("", "9183", 9183),
+    (9010, "config", 9010),
+    ("", "config", None),
+])
+def test_default_dashboard_arguments_read_config_and_preserve_overrides(
+        tmp_path, configured, override, expected):
+    document = generic_config()
+    document["packages"]["camera_driver"]["launches"]["preview.launch.py"]["parameters"][
+        "dashboard_port"] = configured
+    path = write_config(tmp_path, document)
+    context = LaunchContext()
+    context.launch_configurations["config_file"] = str(path)
+    if override is not None:
+        context.launch_configurations["dashboard_port"] = override
+    for argument in dashboard_arguments("camera_driver", "preview.launch.py"):
+        argument.execute(context)
+    port = config_for_context(context).launch_value(
+        "camera_driver", "preview.launch.py", "dashboard_port")
+    assert optional_port(context.launch_configurations["dashboard_port"], configured=port) == expected
+
+
+@pytest.mark.parametrize("port", [None, True, 0, -1, 65536, 9010.5, "9010"])
+def test_invalid_configured_dashboard_ports_are_not_silently_disabled(port):
+    with pytest.raises(ValueError, match="dashboard_port"):
+        optional_port("config", configured=port)
 
 
 def test_no_silent_fallback_on_bad_path_or_missing_key(tmp_path, monkeypatch):

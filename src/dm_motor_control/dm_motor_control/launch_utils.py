@@ -107,8 +107,8 @@ def dashboard_ports(context, parameters):
     if not isinstance(buses, list) or not buses or not isinstance(motors, list) or not motors:
         raise ValueError("bus_names and motor_names must be nonempty lists")
     def read_ports(argument, names):
-        raw = LaunchConfiguration(argument, default="").perform(context)
-        if not raw:
+        raw = LaunchConfiguration(argument, default="config").perform(context)
+        if raw in ("", "''", '""'):
             return {}
         if raw == "config":
             values = config.launch_value(

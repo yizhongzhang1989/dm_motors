@@ -72,7 +72,9 @@ class PhysicalMotorScene(unittest.TestCase):
         self.parameter_client = self.node.create_client(
             SetParametersAtomically, self.controller_name + "/set_parameters_atomically")
         document = yaml.safe_load(ConfigManager().path.read_text())
-        profile = document["packages"]["dm_motor_bringup"]["launches"][self.controller_name + ".launch.py"]["variants"]["simulation"]
+        launch_profile = document["packages"]["dm_motor_bringup"]["launches"][self.controller_name + ".launch.py"]
+        launch_profile["parameters"].update(can_dashboard_ports={}, motor_dashboard_ports={}, dashboard_port="")
+        profile = launch_profile["variants"]["simulation"]
         profile["devices"] = {
             "motor_1": {"initial_position": 0.2, "persistence_file": str(Path(self.directory.name) / "one.flash.yaml")},
             "motor_2": {"initial_position": -0.1},

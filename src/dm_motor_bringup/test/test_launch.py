@@ -7,11 +7,12 @@ import socket
 from ament_index_python.packages import get_package_share_directory, get_package_prefix, get_packages_with_prefixes
 from launch import LaunchContext
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetLaunchConfiguration
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.utilities import normalize_to_list_of_substitutions, perform_substitutions
 import launch_ros.actions
 import pytest
 import yaml
-from common.config import default_config_path, ConfigManager
+from common.config import default_config_path, ConfigError, ConfigManager
 from dm_motor_control.launch_utils import load_parameters, node_parameters, dashboard_ports
 
 
@@ -36,7 +37,7 @@ def configured_launch(module=bringup, **overrides):
     return context, include, forwarded
 
 
-def test_default_configuration_uses_real_motors_without_dashboards():
+def test_default_configuration_uses_real_motors_and_configured_dashboards():
     _, _, forwarded = configured_launch()
     assert forwarded == {
         "config": "",
@@ -46,8 +47,8 @@ def test_default_configuration_uses_real_motors_without_dashboards():
         "namespace": "",
         "control_rate": "",
         "dashboard_host": "0.0.0.0",
-        "can_dashboard_ports": "",
-        "motor_dashboard_ports": "",
+        "can_dashboard_ports": "config",
+        "motor_dashboard_ports": "config",
         "simulation": "false",
     }
 
@@ -204,9 +205,9 @@ def test_hardware_entry_selects_serial_and_never_adds_simulator(monkeypatch):
             entity.execute(context)
     compose = next(entity for entity in bus.entities if isinstance(entity, OpaqueFunction))
     nodes = compose.execute(context)
-    assert len(nodes) == 3
+    assert len(nodes) == 6
     assert next(node for node in nodes if node["package"] == "can_bus")["parameters"][0]["backend"] == "serial"
-    assert not any(node["executable"] == "dashboard.py" for node in nodes)
+    assert sum(node["executable"] == "dashboard.py" for node in nodes) == 3
     assert not any(node["executable"] == "can_motor_simulator" for node in nodes)
     motors = [node["parameters"][0] for node in nodes if node["executable"] == "motor_node"]
     assert len(motors) == 2
@@ -258,8 +259,8 @@ def test_lead_follow_composes_existing_system_and_namespaced_controller(
         assert context.launch_configurations["config"].endswith("/test/config/" + config_name)
     else:
         assert context.launch_configurations["config"] == ""
-    assert context.launch_configurations["can_dashboard_ports"] == ""
-    assert context.launch_configurations["motor_dashboard_ports"] == ""
+    assert context.launch_configurations["can_dashboard_ports"] == "config"
+    assert context.launch_configurations["motor_dashboard_ports"] == "config"
     monkeypatch.setattr(launch_ros.actions, "Node", lambda **kwargs: kwargs)
     bus_include = next(entity for entity in system.entities if isinstance(entity, IncludeLaunchDescription))
     bus = bus_include.launch_description_source.get_launch_description(context)
@@ -268,7 +269,7 @@ def test_lead_follow_composes_existing_system_and_namespaced_controller(
             entity.execute(context)
     compose = next(entity for entity in bus.entities if isinstance(entity, OpaqueFunction))
     nodes = compose.execute(context)
-    assert len(nodes) == {"sim": 4, "serial": 3, "virtual": 5}[backend]
+    assert len(nodes) == {"sim": 7, "serial": 6, "virtual": 8}[backend]
     assert next(node for node in nodes if node["package"] == "can_bus")["parameters"][0]["backend"] == backend
     assert sum(node["executable"] == "can_motor_simulator" for node in nodes) == (backend == "sim")
     assert sum(node["executable"] == "sim_motor_node" for node in nodes) == (2 if simulation == "true" else 0)
@@ -403,8 +404,7 @@ def test_root_launch_profiles_do_not_mix_topology_parameters_or_ports(tmp_path, 
             "profile_entry", Path(__file__).resolve().parents[1] / "launch" / entry)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        context, include, forwarded = configured_launch(
-            module=module, config_file=str(path), motor_dashboard_ports="config")
+        context, include, forwarded = configured_launch(module=module, config_file=str(path))
         assert forwarded["config_package"] == "dm_motor_bringup"
         assert forwarded["config_launch"] == entry
         parameters = load_parameters(context)
@@ -420,3 +420,93 @@ def test_root_launch_profiles_do_not_mix_topology_parameters_or_ports(tmp_path, 
             assert context.launch_configurations["config_launch"] == entry
             assert node_parameters(context, "dm_motor_lead_follow", "lead_follow_node")["kp"] == 3.0
             assert load_parameters(context)["control_rate"] == rate
+
+
+LAUNCH_FILES = sorted(Path(__file__).resolve().parents[2].glob("*/launch/*.launch.py"))
+
+
+def composed_nodes(description, context):
+    nodes = []
+    for entity in description.entities:
+        if isinstance(entity, (DeclareLaunchArgument, SetLaunchConfiguration)):
+            entity.execute(context)
+        elif isinstance(entity, IncludeLaunchDescription):
+            for name, value in entity.launch_arguments:
+                context.launch_configurations[name] = perform_substitutions(
+                    context, normalize_to_list_of_substitutions(value))
+            child = entity.launch_description_source.get_launch_description(context)
+            nodes.extend(composed_nodes(child, context))
+        elif isinstance(entity, OpaqueFunction):
+            nodes.extend(entity.execute(context) or [])
+        else:
+            raise AssertionError(f"Unexpected launch action: {entity!r}")
+    return nodes
+
+
+@pytest.mark.parametrize("launch_file", LAUNCH_FILES, ids=lambda path: f"{path.parents[1].name}/{path.name}")
+@pytest.mark.parametrize("config_source", ["default", "environment", "argument", "headless"])
+def test_every_launch_reads_selected_config_without_port_arguments(
+        tmp_path, monkeypatch, launch_file, config_source):
+    monkeypatch.delenv("COMMON_CONFIG", raising=False)
+    path = Path(default_config_path())
+    document = yaml.safe_load(path.read_text())
+    package, filename = launch_file.parents[1].name, launch_file.name
+    profile = document["packages"][package]["launches"][filename]
+    parameters = profile["parameters"]
+    fields = {
+        "can_bus_node": ("can_bus", "io_rate", 250.0),
+        "motor_node": ("dm_motor_control", "command_timeout", 0.18),
+        "lead_follow_node": ("dm_motor_lead_follow", "kp", 3.0),
+        "bilateral_control_node": ("dm_motor_bilateral_control", "stiffness", 7.0),
+    }
+    if config_source != "default":
+        parameters["dashboard_host"] = "127.0.0.2"
+        if "dashboard_port" in parameters:
+            parameters["dashboard_port"] = "" if config_source == "headless" else 19190
+        for argument in ("can_dashboard_ports", "motor_dashboard_ports"):
+            if argument in parameters:
+                parameters[argument] = {} if config_source == "headless" else {
+                    name: port + 10000 for name, port in parameters[argument].items()}
+        for node, (owner, field, value) in fields.items():
+            profile.setdefault("nodes", {}).setdefault(owner, {}).setdefault(node, {})[field] = value
+        path = tmp_path / "runtime.yaml"
+        path.write_text(yaml.safe_dump(document))
+    context = LaunchContext()
+    context.launch_configurations["namespace"] = f"config_{tmp_path.name}"
+    if config_source == "environment":
+        monkeypatch.setenv("COMMON_CONFIG", str(path))
+    elif config_source in ("argument", "headless"):
+        monkeypatch.setenv("COMMON_CONFIG", str(tmp_path / "unused.yaml"))
+        monkeypatch.chdir(tmp_path)
+        context.launch_configurations["config_file"] = path.name
+    monkeypatch.setattr(launch_ros.actions, "Node", lambda **kwargs: kwargs)
+    monkeypatch.setattr("common.dashboard.check_endpoints", lambda *args: None)
+    description = PythonLaunchDescriptionSource(str(launch_file)).get_launch_description(context)
+    nodes = composed_nodes(description, context)
+    if filename != "dashboard.launch.py":
+        assert nodes
+    assert all(node["parameters"][0]["config_file"] == str(path.resolve()) for node in nodes)
+    config = ConfigManager(path)
+    for node in nodes:
+        if node["executable"] in fields:
+            owner, field, _ = fields[node["executable"]]
+            expected = config.node_parameters(owner, node["executable"], (package, filename))[field]
+            assert node["parameters"][0][field] == expected
+    dashboards = [node["parameters"][0] for node in nodes if node["executable"] == "dashboard.py"]
+    ports = [parameters["dashboard_port"]] if parameters.get("dashboard_port") else []
+    for argument in ("can_dashboard_ports", "motor_dashboard_ports"):
+        ports.extend(parameters.get(argument, {}).values())
+    assert sorted(node["port"] for node in dashboards) == sorted(ports)
+    assert all(node["host"] == parameters["dashboard_host"] for node in dashboards)
+
+
+@pytest.mark.parametrize("launch_file", LAUNCH_FILES, ids=lambda path: f"{path.parents[1].name}/{path.name}")
+def test_every_launch_rejects_a_missing_explicit_config_before_nodes(tmp_path, monkeypatch, launch_file):
+    context = LaunchContext()
+    context.launch_configurations["config_file"] = str(tmp_path / "missing.yaml")
+    created = []
+    monkeypatch.setattr(launch_ros.actions, "Node", lambda **kwargs: created.append(kwargs) or kwargs)
+    description = PythonLaunchDescriptionSource(str(launch_file)).get_launch_description(context)
+    with pytest.raises(ConfigError, match="Cannot load"):
+        composed_nodes(description, context)
+    assert created == []

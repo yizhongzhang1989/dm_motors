@@ -358,7 +358,7 @@ class SplitProcesses(unittest.TestCase):
             Status, f"{namespace}/status", statuses.append, 1)
         self.start("standalone", [
             "ros2", "launch", "can_bus", "can_bus.launch.py",
-            f"namespace:={namespace}", "backend:=sim"])
+            f"namespace:={namespace}", "backend:=sim", "dashboard_port:=''"])
         self.wait(lambda: statuses and statuses[-1].ready, timeout=10)
         nodes = [(name, ns) for name, ns in self.node.get_node_names_and_namespaces() if ns == namespace]
         self.assertIn(("can_bus", namespace), nodes)

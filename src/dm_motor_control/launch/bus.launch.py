@@ -171,9 +171,9 @@ def generate_launch_description():
         DeclareLaunchArgument("control_rate", default_value=ConfigValue("control_rate", PACKAGE, LAUNCH),
                               description="Override all motor control rates (20..1000 Hz); empty uses config."),
         DeclareLaunchArgument("dashboard_host", default_value=ConfigValue("dashboard_host", PACKAGE, LAUNCH)),
-        DeclareLaunchArgument("can_dashboard_ports", default_value="",
-                             description="Named bus port mapping or config; omitted disables CAN dashboards."),
-        DeclareLaunchArgument("motor_dashboard_ports", default_value="",
-                             description="Named motor port mapping or config; omitted disables motor dashboards."),
+        DeclareLaunchArgument("can_dashboard_ports", default_value="config",
+                             description="Named bus ports default to config; {} disables CAN dashboards."),
+        DeclareLaunchArgument("motor_dashboard_ports", default_value="config",
+                             description="Named motor ports default to config; {} disables motor dashboards."),
         OpaqueFunction(function=compose),
     ])

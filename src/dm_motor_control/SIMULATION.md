@@ -12,23 +12,24 @@ source /opt/ros/humble/setup.bash
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
 
-# 两台物理仿真电机、虚拟总线和各自可选面板
-ros2 launch dm_motor_control bus.launch.py simulation:=true \
-  can_dashboard_ports:=config motor_dashboard_ports:=config
+# 两台物理仿真电机、虚拟总线和配置的面板
+ros2 launch dm_motor_control bus.launch.py simulation:=true
 
 # 或：完整主从仿真场景（不要与上一条同时运行）
-ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
-  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true
 
 # 或：独立单电机
-ros2 launch dm_motor_control motor.launch.py simulation:=true motor_id:=1 dashboard_port:=8081
+ros2 launch dm_motor_control motor.launch.py simulation:=true motor_id:=1
 
 # 虚拟电机已运行时，只附加含外力操作的面板
-ros2 launch dm_motor_control dashboard.launch.py simulation:=true motor_id:=1 dashboard_port:=8081
+ros2 launch dm_motor_control dashboard.launch.py simulation:=true motor_id:=1
 ```
 
 最后一条仅在该端口没有其它面板时使用，不要重复启动。
-省略端口不启动对应面板。组场景仍默认使用 8080/8081/8082/8083 的显式映射，
+所有 launch 可用 `config_file:=/绝对路径/site.yaml` 选择配置，不传则读取默认配置。
+省略端口参数会使用该文件中的端口；显式空值关闭对应面板，例如
+`can_dashboard_ports:='{}' motor_dashboard_ports:='{}' dashboard_port:="''"`。
+组场景默认使用 8080/8081/8082/8083 的显式映射，
 支持任意不重复端口和 `namespace`。单电机默认总线为 `/motor_1/can`；
 组场景为 `/can/main`。同时运行不同场景应使用隔离 ROS domain/命名空间和端口。
 单电机入口可通过 `control_rate` 和 `can_fd` 覆盖驱动频率/虚拟 FD 模式；

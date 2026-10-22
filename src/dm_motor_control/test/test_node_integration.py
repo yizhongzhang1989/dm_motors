@@ -72,6 +72,7 @@ class SharedBusIntegration(unittest.TestCase):
         cls.process = subprocess.Popen([
             "ros2", "launch", "dm_motor_control", "bus.launch.py",
             f"namespace:={cls.namespace}", f"config:={cls.config.name}",
+            "can_dashboard_ports:={}", "motor_dashboard_ports:={}",
         ], stdout=cls.log, stderr=subprocess.STDOUT)
         cls.addClassCleanup(cls.cleanup)
         cls.wait(lambda: len(cls.states) == 2 and all(s.ready and s.feedback_fresh for s in cls.states.values()), 20)
@@ -649,6 +650,7 @@ class SharedBusIntegration(unittest.TestCase):
         log = tempfile.TemporaryFile(mode="w+")
         process = subprocess.Popen(
             ["ros2", "launch", "dm_motor_control", "bus.launch.py", f"namespace:={namespace}",
+             "can_dashboard_ports:={}", "motor_dashboard_ports:={}",
              "config:=" + str(Path(get_package_share_directory("dm_motor_control")) / "test/config/sim_bus.yaml")],
             stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -695,6 +697,7 @@ class SharedBusIntegration(unittest.TestCase):
         process = subprocess.Popen(
             ["ros2", "launch", "dm_motor_control", "motor.launch.py",
              f"namespace:={namespace}", "backend:=sim",
+             "dashboard_port:=''",
              "mode:=2",
              "estimated_torque_limit:=0.3", "measured_torque_limit:=0.5",
              "measured_velocity_limit:=0.5", "mos_temperature_stop:=60.0",
