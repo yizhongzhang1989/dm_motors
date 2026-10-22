@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MotorRequest.msg" "msg/MotorReply.msg"
   "msg/MotorConfiguration.msg"
   "msg/LeadFollowState.msg"
+  "msg/BilateralState.msg" "srv/BilateralControl.srv"
   "msg/ExternalTorque.msg" "msg/SimulationState.msg" "srv/SimulationControl.srv"
   "srv/LeadFollowControl.srv"
   "msg/MotorTask.msg" "msg/MotorTaskFeedback.msg" "msg/MotorTaskResult.msg" "msg/MotorTaskEvent.msg"

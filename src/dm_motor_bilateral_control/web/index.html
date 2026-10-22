@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>标准双边力控</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>标准双边力控</h1><small>相对坐标 MIT PD · 非简易位置互换</small></div>
+    <div class="top-actions"><span id="phase" class="badge" role="status">等待连接</span>
+      <span id="quality" class="badge">—</span>
+      <button id="start" type="submit" form="settings" disabled>开始</button>
+      <button id="stop" type="button" class="danger">停止 <kbd>Esc</kbd></button>
+    </div>
+  </header>
+  <main>
+    <p id="notice" class="notice" role="status">默认失能，连接恢复不会重新使能。</p>
+    <div class="workspace">
+      <section class="panel settings-panel">
+        <h2>耦合参数</h2>
+        <p id="availability" class="muted">等待两台电机就绪。</p>
+        <form id="settings">
+          <fieldset id="edit-fields" disabled>
+            <label>方向<select id="direction"><option value="1">同向</option><option value="-1">反向</option></select></label>
+            <div class="fields">
+              <label>耦合刚度 Kc / Nm·rad⁻¹<input id="stiffness" type="number" min="0" max="100" step="any" required></label>
+              <label>耦合阻尼 Dc<input id="coupling_damping" type="number" min="0" max="1" step="any" required></label>
+              <label>本地阻尼 B<input id="local_damping" type="number" min="0" max="1" step="any" required></label>
+              <label>共同 PD 预算 / Nm<input id="max_torque" type="number" min="0.000001" step="any" required></label>
+            </div>
+            <p class="muted">两侧 Kp/Kd 相同，Kd=Dc+B≤1，前馈请求始终为0。PD预算不是驱动硬限矩。</p>
+            <p class="muted">B=0 时没有本地阻尼；高预算下，延迟和量化扰动可能引起振荡。请先使用默认带阻尼参数，不要靠增大预算代替调参。</p>
+            <details open><summary>反馈配对与恢复 / 秒</summary>
+              <div class="fields">
+                <label>新鲜期限<input id="feedback_age" type="number" min="0.002" max="0.1" step="any" required></label>
+                <label>配对最大时差<input id="pair_skew" type="number" min="0.000001" step="any" required></label>
+                <label>失联停止期限<input id="feedback_stop" type="number" min="0.002" max="0.5" step="any" required></label>
+                <label>恢复爬升时间<input id="recovery_time" type="number" min="0.01" max="1" step="any" required></label>
+              </div>
+            </details>
+            <label class="check"><input id="motion_limits_enabled" type="checkbox">启用附加运动限制（默认关闭）</label>
+            <p class="muted">共同 PD 预算始终参与增益缩放。此开关不修改已有驱动的保护；真机双边 bringup 仍保留温度保护。</p>
+            <fieldset id="limit-fields">
+              <div class="fields">
+                <label>反馈力矩停机 / Nm<input id="max_feedback_torque" type="number" min="0.000001" step="any" required></label>
+                <label>相对行程 / rad<input id="max_travel" type="number" min="0.000001" step="any" required></label>
+                <label>温度预警 / °C<input id="warning_temperature" type="number" min="0" max="119" step="any" required></label>
+                <label>温度停机 / °C<input id="max_temperature" type="number" min="0.01" max="120" step="any" required></label>
+              </div>
+            </fieldset>
+          </fieldset>
+        </form>
+        <p id="dirty" class="muted"></p>
+        <p class="muted">开始时应用当前配置；运行中不可修改。没有两侧角差停机阈值，不自动保持共同位置。</p>
+      </section>
+      <div class="observations">
+        <section class="motors">
+          <article class="panel"><div class="heading"><h2>电机 A</h2><span id="a-status" class="badge">—</span></div>
+            <p id="a-name" class="muted"></p><div class="position"><b id="a-position">—</b><span>rad</span></div>
+            <dl><dt>速度 / rad/s</dt><dd id="a-velocity">—</dd><dt>反馈力矩 / Nm</dt><dd id="a-torque">—</dd>
+              <dt>最近 PD 估算 / Nm</dt><dd id="a-estimate">—</dd><dt>温度</dt><dd id="a-temperature">—</dd>
+              <dt>反馈年龄 / ms</dt><dd id="a-age">—</dd><dt>反馈率 / Hz</dt><dd id="a-rate">—</dd></dl></article>
+          <article class="panel"><div class="heading"><h2>电机 B</h2><span id="b-status" class="badge">—</span></div>
+            <p id="b-name" class="muted"></p><div class="position"><b id="b-position">—</b><span>rad</span></div>
+            <dl><dt>速度 / rad/s</dt><dd id="b-velocity">—</dd><dt>反馈力矩 / Nm</dt><dd id="b-torque">—</dd>
+              <dt>最近 PD 估算 / Nm</dt><dd id="b-estimate">—</dd><dt>温度</dt><dd id="b-temperature">—</dd>
+              <dt>反馈年龄 / ms</dt><dd id="b-age">—</dd><dt>反馈率 / Hz</dt><dd id="b-rate">—</dd></dl></article>
+        </section>
+        <section class="panel">
+          <h2>耦合与通信状态</h2>
+          <dl class="diagnostics"><dt>相对位置差 / rad</dt><dd id="position-error">—</dd>
+            <dt>相对速度 / rad/s</dt><dd id="relative-velocity">—</dd>
+            <dt>共同增益比例</dt><dd id="gain-scale">—</dd><dt>量化 Kp / Kd</dt><dd id="gains">—</dd>
+            <dt>配对年龄 / 时差 ms</dt><dd id="pair-timing">—</dd><dt>恢复 / 新鲜配对数</dt><dd id="recovery">—</dd>
+            <dt>累计配对 / 降级</dt><dd id="pair-count">—</dd><dt>驱动请求组数</dt><dd id="command-count">—</dd></dl>
+          <p id="controller-message" class="notice"></p>
+          <details><summary>最近发送的 MIT 请求目标</summary><pre id="targets"></pre></details>
+        </section>
+        <section class="panel plots">
+          <h2>双向响应</h2>
+          <p class="muted">青：A · 紫：B · 黄：相对位置差。力矩图实线为反馈、虚线为PD估算；不是外力传感器读数。</p>
+          <h3>相对启动位置 / rad</h3><canvas id="position-chart" aria-label="两侧相对位置和误差曲线"></canvas>
+          <h3>力矩 / Nm</h3><canvas id="torque-chart" aria-label="两侧反馈与估算力矩曲线"></canvas>
+          <small id="rate" class="muted"></small>
+        </section>
+      </div>
+    </div>
+    <section class="panel"><h2>事件</h2><ol id="events"></ol></section>
+    <footer>只用于可信内网，无登录鉴权。开始不等于已使能，停止不等于已确认失能；
+      零增益降级和软件STOP都不是抱闸或硬件急停。仿真请在单机面板操作外力/锚点，不在此页面伪造传感器。</footer>
+  </main>
+</body>
+</html>

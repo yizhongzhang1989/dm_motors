@@ -16,6 +16,7 @@
   <exec_depend>common</exec_depend>
   <exec_depend>dm_motor_control</exec_depend>
   <exec_depend>dm_motor_lead_follow</exec_depend>
+  <exec_depend>dm_motor_bilateral_control</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_index_python</test_depend>

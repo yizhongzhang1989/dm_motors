@@ -312,8 +312,8 @@ def test_lead_follow_preserves_explicit_config_override():
                          "simulation": "false"}
 
 
-def test_only_two_hardware_bringup_entries_are_shipped():
-    expected = {"dual_motor.launch.py", "lead_follow.launch.py"}
+def test_only_unified_bringup_entries_are_shipped():
+    expected = {"dual_motor.launch.py", "lead_follow.launch.py", "bilateral_control.launch.py"}
     for directory in (
             Path(__file__).resolve().parents[1] / "launch",
             Path(get_package_share_directory("dm_motor_bringup")) / "launch"):
@@ -328,11 +328,40 @@ def test_dashboard_executables_and_assets_are_installed_in_component_packages():
     local_install = workspace.parent / "install"
     assert all(package not in packages or not Path(packages[package]).is_relative_to(local_install)
                for package in retired), "Remove retired dashboard package install directories before rebuilding"
-    for package in ("can_bus", "dm_motor_control", "dm_motor_lead_follow"):
+    for package in ("can_bus", "dm_motor_control", "dm_motor_lead_follow", "dm_motor_bilateral_control"):
         executable = Path(get_package_prefix(package)) / "lib" / package / "dashboard.py"
         assert executable.is_file()
         share = Path(get_package_share_directory(package))
         assert all((share / "web" / asset).is_file() for asset in ("index.html", "dashboard.js", "dashboard.css"))
+
+
+def test_bilateral_profile_has_separate_port_and_safe_environment_selection():
+    config = ConfigManager()
+    profile = ("dm_motor_bringup", "bilateral_control.launch.py")
+    hardware = config.launch(*profile)
+    simulation = config.launch(*profile, variant="simulation")
+    assert hardware["parameters"]["dashboard_port"] == 8084
+    assert hardware["parameters"]["motor_dashboard_ports"] == {"motor_1": 8081, "motor_2": 8082}
+    assert hardware["system"]["buses"]["main"]["backend"] == "serial"
+    assert simulation["system"]["buses"]["main"]["backend"] == "virtual"
+    assert simulation["system"]["buses"]["main"]["port"] == ""
+    assert not config.node_parameters("dm_motor_bilateral_control", "bilateral_control_node", profile)["motion_limits_enabled"]
+    assert not config.node_parameters("dm_motor_bilateral_control", "bilateral_control_node", profile,
+                                      variant="simulation")["motion_limits_enabled"]
+
+
+def test_bilateral_hardware_uses_common_pd_budget_without_fixed_driver_torque_trips():
+    config = ConfigManager()
+    profile = ("dm_motor_bringup", "bilateral_control.launch.py")
+    motor = config.node_parameters("dm_motor_control", "motor_node", profile)
+    controller = config.node_parameters("dm_motor_bilateral_control", "bilateral_control_node", profile)
+    assert motor["estimated_torque_limit"] == 0
+    assert motor["measured_torque_limit"] == 0
+    assert motor["host_protection_enabled"] is True
+    assert motor["mos_temperature_stop"] == 55
+    assert motor["rotor_temperature_stop"] == 55
+    assert controller["max_torque"] == 0.5
+    assert controller["motion_limits_enabled"] is False
 
 
 def test_follow_dashboard_conflicts_are_checked_before_any_component_starts():

@@ -11,6 +11,7 @@
   <depend>rcl_interfaces</depend>
   <depend>std_srvs</depend>
   <depend>dm_motor_interfaces</depend>
+  <depend>dm_motor_control</depend>
   <depend>common</depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>launch</exec_depend>
@@ -21,7 +22,6 @@
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_index_python</test_depend>
   <test_depend>rclpy</test_depend>
-  <test_depend>dm_motor_control</test_depend>
   <test_depend>can_bus</test_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

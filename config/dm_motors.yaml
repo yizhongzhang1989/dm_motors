@@ -342,3 +342,93 @@ packages:
                   kp: 4.0
                   kd: 0.5
                   motion_limits_enabled: false
+      bilateral_control.launch.py:
+        parameters:
+          namespace: ''
+          control_rate: '500'
+          dashboard_host: 0.0.0.0
+          can_dashboard_ports:
+            main: 8080
+          motor_dashboard_ports:
+            motor_1: 8081
+            motor_2: 8082
+          dashboard_port: 8084
+        system:
+          bus_names: [main]
+          motor_names: [motor_1, motor_2]
+          buses:
+            main:
+              backend: serial
+              port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+          motors:
+            motor_1: {bus: main, motor_id: 1, configure_mode_on_startup: true}
+            motor_2: {bus: main, motor_id: 2, configure_mode_on_startup: true}
+        nodes:
+          dm_motor_control:
+            motor_node:
+              host_protection_enabled: true
+              measured_torque_limit: 0.0
+              estimated_torque_limit: 0.0
+              mos_temperature_stop: 55.0
+              rotor_temperature_stop: 55.0
+        variants:
+          simulation:
+            system:
+              buses:
+                main: {backend: virtual, port: '', can_fd: false}
+            devices: {}
+            nodes:
+              dm_motor_control:
+                motor_node:
+                  host_protection_enabled: false
+                  position_limit: 0.0
+                  velocity_limit: 0.0
+                  torque_limit: 0.0
+                  position_min: -1.7976931348623157e+308
+                  position_max: 1.7976931348623157e+308
+                  measured_velocity_limit: 0.0
+                  measured_torque_limit: 0.0
+                  estimated_torque_limit: 0.0
+                  mos_temperature_stop: 0.0
+                  rotor_temperature_stop: 0.0
+              dm_motor_bilateral_control:
+                bilateral_control_node:
+                  max_torque: 8.0
+                  motion_limits_enabled: false
+  dm_motor_bilateral_control:
+    nodes:
+      bilateral_control_node:
+        motor_a: motor_1
+        motor_b: motor_2
+        rate: 200.0
+        target_validity: 0.05
+        operator_timeout: 1.0
+        direction: 1
+        stiffness: 16.0
+        coupling_damping: 0.35
+        local_damping: 0.35
+        max_torque: 0.5
+        motion_limits_enabled: false
+        max_feedback_torque: 1.0
+        max_travel: 0.3
+        warning_temperature: 45.0
+        max_temperature: 55.0
+        feedback_age: 0.02
+        pair_skew: 0.005
+        feedback_stop: 0.08
+        recovery_time: 0.1
+      dashboard:
+        controller_namespace: bilateral_control
+        host: 0.0.0.0
+        port: 8084
+    launches:
+      bilateral_control.launch.py:
+        parameters:
+          namespace: ''
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8084
+      dashboard.launch.py:
+        parameters:
+          namespace: ''
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8084

@@ -31,7 +31,13 @@ from dm_motor_interfaces.msg import ExternalTorque, SimulationState
 from dm_motor_interfaces.srv import SimulationControl
 
 
-class VirtualMotorIntegration(unittest.TestCase):
+class PhysicalMotorScene(unittest.TestCase):
+    controller_name = "lead_follow"
+    controller_state_type = LeadFollowState
+
+    def configure_scene(self, document, profile):
+        pass
+
     def setUp(self):
         os.environ["ROS_DOMAIN_ID"] = str(145 + os.getpid() % 20)
         rclpy.init()
@@ -60,12 +66,13 @@ class VirtualMotorIntegration(unittest.TestCase):
                 MotorSetpoint, name + "/setpoint", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
             self.simulation[name] = self.node.create_client(SimulationControl, name + "/simulation/control")
         self.subscriptions.append(self.node.create_subscription(
-            LeadFollowState, "lead_follow/state", self.on_follow, 1))
-        self.start_client = self.node.create_client(Trigger, "lead_follow/start")
-        self.stop_client = self.node.create_client(Trigger, "lead_follow/stop")
-        self.parameter_client = self.node.create_client(SetParametersAtomically, "lead_follow/set_parameters_atomically")
+            self.controller_state_type, self.controller_name + "/state", self.on_follow, 1))
+        self.start_client = self.node.create_client(Trigger, self.controller_name + "/start")
+        self.stop_client = self.node.create_client(Trigger, self.controller_name + "/stop")
+        self.parameter_client = self.node.create_client(
+            SetParametersAtomically, self.controller_name + "/set_parameters_atomically")
         document = yaml.safe_load(ConfigManager().path.read_text())
-        profile = document["packages"]["dm_motor_bringup"]["launches"]["lead_follow.launch.py"]["variants"]["simulation"]
+        profile = document["packages"]["dm_motor_bringup"]["launches"][self.controller_name + ".launch.py"]["variants"]["simulation"]
         profile["devices"] = {
             "motor_1": {"initial_position": 0.2, "persistence_file": str(Path(self.directory.name) / "one.flash.yaml")},
             "motor_2": {"initial_position": -0.1},
@@ -83,9 +90,10 @@ class VirtualMotorIntegration(unittest.TestCase):
             profile["devices"]["motor_2"].update(inertia=1.0, ambient_temperature=60.0)
         if "native_fd" in self._testMethodName:
             profile["system"]["buses"]["main"]["can_fd"] = True
+        self.configure_scene(document, profile)
         config = Path(self.directory.name) / "config.yaml"
         config.write_text(yaml.safe_dump(document))
-        command = ["ros2", "launch", "dm_motor_bringup", "lead_follow.launch.py", "simulation:=true",
+        command = ["ros2", "launch", "dm_motor_bringup", self.controller_name + ".launch.py", "simulation:=true",
                    f"namespace:={self.namespace}", f"config_file:={config}"]
         self.web_port = None
         if "dashboard" in self._testMethodName:
@@ -93,6 +101,12 @@ class VirtualMotorIntegration(unittest.TestCase):
                 endpoint.bind(("127.0.0.1", 0))
                 self.web_port = endpoint.getsockname()[1]
             command += [f"motor_dashboard_ports:={{motor_1: {self.web_port}}}", "dashboard_host:=127.0.0.1"]
+        self.controller_port = None
+        if "operator_dashboard" in self._testMethodName:
+            with socket.socket() as endpoint:
+                endpoint.bind(("127.0.0.1", 0))
+                self.controller_port = endpoint.getsockname()[1]
+            command += [f"dashboard_port:={self.controller_port}", "dashboard_host:=127.0.0.1"]
         self.start("system", command)
         self.wait(lambda: len(self.states) == 2 and len(self.physics) == 2
                   and all(s.ready and s.feedback_fresh and s.simulated for s in self.states.values())
@@ -230,6 +244,7 @@ class VirtualMotorIntegration(unittest.TestCase):
         rclpy.shutdown()
         self.directory.cleanup()
 
+class VirtualMotorIntegration(PhysicalMotorScene):
     def test_external_force_moves_disabled_joint_and_expires(self):
         initial = self.states["motor_1"].position
         other = self.states["motor_2"].position

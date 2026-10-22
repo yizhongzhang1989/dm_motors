@@ -46,7 +46,7 @@ ros2 launch dm_motor_control dashboard.launch.py simulation:=true motor_id:=1 da
 
 ### 仿真默认不启用软件运动限制
 
-四个电机/系统仿真入口均显式关闭主机运动保护，撤销额外的位置、速度、力矩、
+电机/系统仿真入口均显式关闭主机运动保护，撤销额外的位置、速度、力矩、
 测量/估算阈值、温度停机阈值和软件行程边界，避免继承基础真机配置的可选软限制。
 主从仿真默认 `motion_limits_enabled=false`：不按跟随误差、行程、速度、力矩或温度阈值停机，
 也不对跟随目标做 `target_speed` 限速；误差仍正常计算和显示。

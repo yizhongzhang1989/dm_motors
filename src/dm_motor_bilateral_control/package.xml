@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dm_motor_bilateral_control</name>
+  <version>0.1.0</version>
+  <description>Standard symmetric relative-coordinate MIT bilateral coupling with paired feedback.</description>
+  <maintainer email="yizhongzhang1989@users.noreply.github.com">yizhongzhang1989</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>std_srvs</depend>
+  <depend>dm_motor_control</depend>
+  <depend>dm_motor_interfaces</depend>
+  <depend>common</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

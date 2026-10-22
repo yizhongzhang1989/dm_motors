@@ -52,7 +52,7 @@ install(CODE "file(REMOVE
   \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/config/sim_bus.yaml\"
   \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/config/dual_serial_test.yaml\")")
 ament_export_targets(dm_motor_core_targets HAS_LIBRARY_TARGET)
-ament_export_dependencies(can_bus rclcpp)
+ament_export_dependencies(can_bus rclcpp dm_motor_interfaces)
 if(BUILD_TESTING)
   install(DIRECTORY test/config DESTINATION share/${PROJECT_NAME}/test)
   find_package(ament_cmake_gtest REQUIRED)

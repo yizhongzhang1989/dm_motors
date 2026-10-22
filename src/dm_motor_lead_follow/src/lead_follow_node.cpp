@@ -1,5 +1,6 @@
 #include "dm_motor_lead_follow/follow.hpp"
 #include "common/config.hpp"
+#include "dm_motor_control/motor_session.hpp"
 
 #include <array>
 #include <chrono>
@@ -36,20 +37,7 @@ double steady_time()
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-struct Axis
-{
-  std::string name, token;
-  std::optional<Motor> state;
-  double received{0}, origin{0}, renew_at{0};
-  uint64_t sequence{0}, rejected{0}, stop_count{0}, stop_request{0};
-  std::optional<Request> pending;
-  double pending_since{0};
-  bool configuration_checked{false};
-  rclcpp::Publisher<Request>::SharedPtr control;
-  rclcpp::Publisher<Setpoint>::SharedPtr setpoint;
-  rclcpp::Subscription<Motor>::SharedPtr states;
-  rclcpp::Subscription<Reply>::SharedPtr replies;
-};
+using Axis = dm_motor::MotorSession;
 
 class LeadFollowNode final : public rclcpp::Node
 {
@@ -99,18 +87,7 @@ public:
     identity << "lead_follow_" << std::hex << random() << random();
     client_ = identity.str();
     for (auto & axis : axes_) {
-      if (axis.name.empty() || axis.name.back() == '/') {
-        throw std::invalid_argument("Motor namespaces must be nonempty without trailing slash");
-      }
-      axis.name = get_node_topics_interface()->resolve_topic_name(axis.name);
-      axis.control = create_publisher<Request>(axis.name + "/control", rclcpp::QoS(64).reliable());
-      axis.setpoint = create_publisher<Setpoint>(
-        axis.name + "/setpoint", rclcpp::QoS(1).best_effort());
-      axis.states = create_subscription<Motor>(
-        axis.name + "/state", rclcpp::QoS(1).reliable(),
-        [&axis](Motor::ConstSharedPtr state) {axis.state = *state; axis.received = steady_time();});
-      axis.replies = create_subscription<Reply>(
-        axis.name + "/control_result", rclcpp::QoS(256).reliable(),
+      dm_motor::attach_motor_session(*this, axis,
         [this, &axis](const Reply & reply) {receive_reply(axis, reply);});
     }
     if (axes_[0].name == axes_[1].name) {
@@ -228,13 +205,7 @@ private:
 
   bool fresh(const Axis & axis) const
   {
-    if (!axis.state) {return false;}
-    const auto & state = *axis.state;
-    const double elapsed = steady_time() - axis.received;
-    const double age = (now() - rclcpp::Time(state.header.stamp)).seconds();
-    return state.feedback_fresh && std::isfinite(state.feedback_age) && state.feedback_age >= 0 &&
-           elapsed >= 0 && state.feedback_age + elapsed <= feedback_timeout_ &&
-           age >= -0.05 && age + state.feedback_age <= feedback_timeout_;
+    return dm_motor::motor_state_fresh(axis, now(), feedback_timeout_);
   }
 
   bool disabled(const Axis & axis) const
@@ -304,21 +275,12 @@ private:
 
   void send(Axis & axis, uint8_t kind, uint8_t operation)
   {
-    Request request;
-    request.header.stamp = now(); request.client_id = client_; request.request_id = ++request_id_;
-    request.valid_for = 0.5; request.kind = kind; request.operation = operation;
-    request.token = axis.token; request.owner = client_; request.duration = 2.0;
-    axis.pending = request; axis.pending_since = steady_time();
-    axis.control->publish(request);
+    dm_motor::send_motor_request(axis, kind, operation, client_, request_id_, now());
   }
 
   void send_stop(Axis & axis)
   {
-    Request request;
-    request.header.stamp = now(); request.client_id = client_; request.request_id = ++request_id_;
-    request.kind = Request::OPERATION; request.operation = Request::DISABLE;
-    axis.stop_request = request.request_id;
-    axis.control->publish(request);
+    dm_motor::send_motor_stop(axis, client_, request_id_, now());
   }
 
   void receive_reply(Axis & axis, const Reply & reply)
@@ -400,13 +362,9 @@ private:
 
   void publish_target(Axis & axis, double position, double kp, double kd)
   {
-    Setpoint message;
-    message.header.stamp = now(); message.token = axis.token; message.sequence = ++axis.sequence;
-    message.client_id = client_;
-    message.valid_for = validity_; message.hold_until_lease_expiry = false;
-    message.target.mode = 1; message.target.position = position;
-    message.target.kp = kp; message.target.kd = kd;
-    axis.setpoint->publish(message);
+    dm_motor_interfaces::msg::MotorTarget target;
+    target.mode = 1; target.position = position; target.kp = kp; target.kd = kd;
+    dm_motor::send_motor_target(axis, target, client_, validity_, now());
   }
 
   void tick()

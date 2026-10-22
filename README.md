@@ -44,6 +44,17 @@ ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true \
 默认惯量/摩擦/负载参数不是工厂标定值；模型与实物的定量一致性需要现场辨识，
 不能以软件测试代替真实硬件安全或负载验收。
 
+**标准双边力控仿真**：使用相对起点、方向映射、共同增益预算和反馈配对/降级恢复，
+不是简易版的绝对位置互换。专用面板使用 8084：
+
+```bash
+ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true \
+  can_dashboard_ports:=config motor_dashboard_ports:=config dashboard_port:=config
+```
+
+与主从场景择一运行；不要同时开始两个控制器。算法、接口和硬件门禁见
+[标准双边力控](src/dm_motor_bilateral_control/README.md)。
+
 **真机主从跟随并开启四个面板**：显式指定所需面板端口。
 
 ```bash
@@ -58,16 +69,16 @@ ros2 launch dm_motor_bringup dual_motor.launch.py \
   can_dashboard_ports:=config motor_dashboard_ports:=config
 ```
 
-**以上场景选一个运行，不要占用相同命名空间和端口。** 两个 `dm_motor_bringup` 入口
+**以上场景选一个运行，不要占用相同命名空间和端口。** 三个 `dm_motor_bringup` 入口
 默认加载真实串口配置，不启动模拟器，也不会自动使能。
 bringup 不提供 `_hardware` 或独立仿真入口；同一个 launch 通过 `simulation` 参数选择模式。
 
 **不提供面板端口时，默认只启动控制节点，不启动任何 Dashboard。**
-`config` 表示读取所选 package/launch 的端口配置（默认 CAN 8080、电机 8081/8082、主从 8083）。
+`config` 表示读取所选 package/launch 的端口配置（默认 CAN 8080、电机 8081/8082、主从 8083、双边 8084）。
 每个面板端口都明确列出，不使用 base_port 或顺序递增。单面板可以传数字覆盖，
 多面板使用 `{实例名: 端口}` 映射覆盖。只需主从面板时传 `dashboard_port:=config`，
 不会连带启动单机/CAN 面板。
-Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow`，
+Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow` 和 `dm_motor_bilateral_control`，
 不再有独立的 Dashboard package，但 HTTP 服务仍是独立进程，不进入实时控制循环。
 所有功能包共享 `common` 配置模块，Python 和 C++ 节点从同一文件获取默认值。
 `common` 不含电机业务结构，未来其它 package 也可使用；同一包不同 launch 的参数相互独立。
@@ -83,6 +94,7 @@ Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow
 | 面板 | 本机地址 | 操作 |
 | --- | --- | --- |
 | **主从跟随** | **<http://127.0.0.1:8083/>** | 按上述主从面板端口启动；编辑参数，点击右上角「开始」/「停止」 |
+| **标准双边力控** | **<http://127.0.0.1:8084/>** | 双边入口选择端口后开启；右上开始/停止，查看两侧力矩、共同增益及配对状态 |
 | 电机 1 | <http://127.0.0.1:8081/> | 自动监控，右上角「使能」/「失能」 |
 | 电机 2 | <http://127.0.0.1:8082/> | 自动监控，右上角「使能」/「失能」 |
 | CAN 总线 | <http://127.0.0.1:8080/> | 总线状态、帧观察及独立调试 |
@@ -167,6 +179,7 @@ dm_motors/
 │   ├── dm_motor_interfaces/  # 电机 Topic、任务事件及仿真外力接口
 │   ├── dm_motor_bringup/     # 系统级启动入口，后续场景 launch 统一放在这里
 │   ├── dm_motor_lead_follow/ # 主从控制器及内置主从面板，显式开始/停止
+│   ├── dm_motor_bilateral_control/ # 标准双边 MIT PD、反馈配对与独立面板
 │   └── dm_motor_control/     # 生产驱动、独立物理仿真节点、CLI、统一面板与双模式 launch
 ├── build/                   # 自动生成，不提交 Git
 ├── install/                 # 自动生成，不提交 Git
@@ -279,12 +292,14 @@ ros2 run dm_motor_control motor_client.py --namespace /motor_2 state
 ros2 launch dm_motor_bringup dual_motor.launch.py
 ```
 
-`dm_motor_bringup` 是系统级启动包，提供两个统一入口，均默认真机：
+`dm_motor_bringup` 是系统级启动包，提供三个统一入口，均默认真机：
 
 - `dual_motor.launch.py`：读取同名 launch 配置中的 `system` 拓扑，连接真实适配器，不启动模拟器。
 - `lead_follow.launch.py`：在真实双电机系统上添加主从位置跟随控制器，仍不自动使能。
   使用方法、角色/方向配置及保护说明见 [dm_motor_lead_follow](src/dm_motor_lead_follow/README.md)。
   需通过专用面板或显式调用 `/lead_follow/start` 开始跟随。
+- `bilateral_control.launch.py`：双侧相对坐标 MIT PD 耦合；专用面板默认 8084，
+  或显式调用 `/bilateral_control/start`，不自动使能。
 
 主从入口传入 `dashboard_port:=config`（或具体端口）才会启动包内的 [Lead Follow Dashboard](src/dm_motor_lead_follow/DASHBOARD.md)
 （此时 <http://127.0.0.1:8083/>），可以在页面显式开始/停止、交换角色及配置跟随参数。
@@ -309,8 +324,9 @@ bringup launch 参数：
 | `namespace` | 空 | 部署前缀，例如 `robot` |
 | `control_rate` | 空（使用 YAML，当前 200 Hz） | 覆盖所有电机控制频率，20–1000 Hz；低于配置状态频率时同步降低状态频率 |
 | `dashboard_host` | `0.0.0.0` | 所有已选择面板的 IPv4 监听地址；设为 `127.0.0.1` 可限制为仅本机访问 |
-| `dashboard_port` | 空 | 主从面板 HTTP 端口；`config` 使用当前 launch 的 `parameters.dashboard_port`，数字直接覆盖；空则不启动 |
+| `dashboard_port` | 空 | 主从/双边专用面板 HTTP 端口；`config` 使用当前 launch 的 `parameters.dashboard_port`，数字直接覆盖；空则不启动 |
 | `leader` / `follower` | `motor_1` / `motor_2` | 主从入口使用的电机命名空间；相对部署 namespace 或绝对路径 |
+| `motor_a` / `motor_b` | `motor_1` / `motor_2` | 双边入口使用的两个对等电机命名空间 |
 | `can_dashboard_ports` | 空 | `config` 使用当前 launch 的同名映射，或显式 `{main: 8080}`；空则不启动 |
 | `motor_dashboard_ports` | 空 | `config` 使用当前 launch 的同名映射，或显式 `{motor_1: 8081, motor_2: 8082}`；空则不启动 |
 
@@ -318,7 +334,7 @@ bringup launch 参数：
 每个映射值必须是合法整数，不能使用 0、负数、auto 或布尔值。
 配置中写了端口并不自动启动面板，仍需显式选择。
 多总线/多电机按实例名匹配端口，不计算递增端口；重复、越界或未知实例名会在设备启动前报错。
-两个入口省略所有端口即完全无网页。主从专用面板端口也不能与通用面板重叠。
+所有入口省略端口即完全无网页。应用专用面板端口也不能与通用面板重叠。
 底层 `dm_motor_control bus.launch.py` 同样按 `can_dashboard_ports` / `motor_dashboard_ports` 显式选择面板，
 单独启动时读取 `packages.dm_motor_control.launches["bus.launch.py"]`；
 被 bringup 包含时沿用顶层入口的 profile，避免串用子 launch 默认值。
@@ -392,7 +408,7 @@ ros2 launch dm_motor_bringup dual_motor.launch.py \
 启动会读回模式、映射及失能状态，配置并独立回读非零硬件通信 watchdog。
 当前默认 `watchdog_timeout=0.2` 秒，对应该协议 `TIMEOUT=4000`，只改 RAM，
 **不保存 Flash、不归零、标定或自动使能**。通常模式不匹配会明确报错。
-默认两个 bringup profile 的 `system.motors` 为两台电机显式启用 `configure_mode_on_startup: true`：
+默认三个 bringup profile 的 `system.motors` 为两台电机显式启用 `configure_mode_on_startup: true`：
 仅在读回并确认新鲜失能反馈后，才将 CTRL_MODE 配置为 mode=1，独立回读并确认失能后继续启动。
 只写 RAM，不保存 Flash；下次启动会重新验证。其他配置该选项默认 false，保留严格模式匹配。
 
@@ -720,8 +736,8 @@ C++ 控制器另有默认 1 秒的 `operator_timeout`，面板进程崩溃后也
 
 **所有 Dashboard 均无登录鉴权，HTTP 不加密。** 只部署在本机或可信隔离网络，
 不要直接暴露公网；电机输出保活不是网络访问鉴权，CAN 调试的路由租约也不是用户认证。
-两个真机 bringup 入口及所有独立 Dashboard 启动方式均默认监听 `0.0.0.0`。
-其他电脑无需安装 ROS，只需能访问服务主机相应的 TCP 8080、8081、8082、8083 端口。
+所有 bringup 入口及独立 Dashboard 默认监听 `0.0.0.0`。
+其他电脑无需安装 ROS，只需能访问服务主机相应的 TCP 8080–8084 端口。
 在**连接电机的服务主机**启动真机服务：
 
 ```bash
@@ -740,6 +756,7 @@ ros2 launch dm_motor_bringup lead_follow.launch.py \
 | 电机 1 | `http://192.168.1.10:8081/` |
 | 电机 2 | `http://192.168.1.10:8082/` |
 | 主从跟随 | `http://192.168.1.10:8083/`，仅主从入口提供 |
+| 标准双边力控 | `http://192.168.1.10:8084/`，仅双边入口提供 |
 
 不要在其他电脑上输入 `127.0.0.1` / `localhost`，它们指向的是客户端自己。
 也可以显式设置 `dashboard_host:=192.168.1.10` 只绑定选定网卡，
@@ -758,13 +775,44 @@ CAN dashboard 允许配置的绑定主机名、本机系统主机名 / 短主机
 
 若仍打不开：
 
-- 在服务主机运行 `ss -ltnp '( sport = :8080 or sport = :8081 or sport = :8082 or sport = :8083 )'`。
+- 在服务主机运行 `ss -ltnp '( sport = :8080 or sport = :8081 or sport = :8082 or sport = :8083 or sport = :8084 )'`。
   无监听表示服务尚未启动；仅 `127.0.0.1` 监听表示仍是旧配置或显式限制为本机。
 - 从客户端直接打开上述 IP 地址。网络必须互通，防火墙须允许可信客户端访问相应 TCP 端口；
   Wi-Fi 客户端隔离、不同 VLAN、代理或 VPN 路由也可能阻断访问。
 - 单机页面无需连接/会话按钮：自动监控，首次明确操作时自动建立非独占保活；不会阻挡其它页面。
 
 防火墙、VPN、路由由现场管理，程序不会自动修改这些系统配置，也不做公网端口转发。
+
+### 4.5 标准双边力控面板
+
+独立包 `dm_motor_bilateral_control` 使用相对起点的对称 MIT PD 耦合，两侧前馈请求始终为零。
+两侧实时反馈按采集时间配对；同一比例缩放增益，量化后的 PD 估算不超过配置预算。
+配对短时过期时双方零增益，三组新鲜配对后渐进恢复；持续失联、设备故障及操作心跳失联请求失能。
+没有两侧角差停机阈值，也不自动保持共同位置。
+
+面板右上只有开始/停止；配置仅在停止且两台新鲜失能时可编辑。
+显示两侧位置、速度、反馈/估算力矩、最近目标，以及配对时差、降级和恢复进度。
+若要在仿真单机面板拖动外力圆盘，请将两个页面并排显示，不要隐藏运行中的双边控制页。
+网页恢复连接不会恢复运动，STOP 会撤销旧操作会话。
+
+```bash
+# 两台电机已经运行时，仅附加控制器和专用面板
+ros2 launch dm_motor_bilateral_control bilateral_control.launch.py dashboard_port:=config
+```
+
+真机默认 PD 预算 0.5 Nm，仿真默认预算 8 Nm，预算用于共同增益缩放，不是反馈力矩停机阈值。
+附加运动限制默认关闭；双边 bringup 不再给驱动叠加固定 1 Nm 的反馈/估算力矩停机门限，
+也不默认启用 0.3 rad 相对行程限制。真机驱动仍保留 55°C 温度保护、设备故障与通信看门狗，
+显式配置的机械关节范围及驱动保护也仍然有效；这不是安全认证。
+2026-10-21 的 0.2 Nm 保守预试验未达到运动指标；随后在现有 0.5 Nm 预算下，
+采用 `Kc=16, Dc=0.35, B=0.35` 和 6 秒周期的 ±0.03 rad 激励，四个双向/方向运动场景、
+中性使能、低增益耦合及三项进程失联保护均通过受限真机验收。
+2026-10-22 抖动排查后，默认增益已对齐为上述带本地阻尼的组合，默认 PD 预算仍为 0.5 Nm。
+`B=0` 没有本地阻尼，显著增大预算不能代替稳定性调参；10 Nm 不属于上述实机验收条件。
+这不等于所有工况或真实接触力标定通过。
+从旧的固定 1 Nm 保护配置升级时，须退出并重启整套双边 bringup，而不是只刷新 dashboard；
+驱动门限不能热更新，启动后仍需显式开始。
+完整算法、仿真验收和真机注意事项见[双边控制说明](src/dm_motor_bilateral_control/README.md)。
 
 ## 5. 命令行控制与参数访问
 
@@ -1302,7 +1350,7 @@ DDS 配置回归同时验证安装路径、保留用户配置、其他 RMW 不�
 物理仿真回归另覆盖四模式、全部七类任务、49 项寄存器、读写/保存/掉电恢复、
 设备/软件零点、多圈反馈、外力时效和主从正反跟随、驱动进程死亡后的独立 watchdog、
 FD 虚拟帧、已有 CLI、外力 HTTP 以及误接物理后端时拒绝注册。
-bringup 测试显式覆盖模拟 `config`，同时静态检查默认入口为真机且仅安装两个无后缀 launch。
+bringup 测试显式覆盖模拟 `config`，同时静态检查默认入口为真机且仅安装三个无后缀 launch。
 
 查看模拟链路延迟与 500/1000 Hz 实测控制频率（不验证真实 USB/CAN 或电机）：
 
@@ -1316,7 +1364,7 @@ python3 -m pytest -q -s src/can_bus/test/test_latency.py \
 后端用例可以单独运行（先按构建章节加载 ROS 和工作区环境）：
 
 ```bash
-colcon test --packages-select common can_bus dm_motor_control dm_motor_lead_follow dm_motor_bringup \
+colcon test --packages-select common can_bus dm_motor_control dm_motor_lead_follow dm_motor_bilateral_control dm_motor_bringup \
   --return-code-on-test-failure
 colcon test-result --test-result-base build/dm_motor_control
 colcon test-result --test-result-base build/can_bus

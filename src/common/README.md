@@ -134,9 +134,9 @@ C++ 的 `common::Config::get<T>()` 支持点分节点路径，也支持 `std::ve
 ## 验证
 
 ```bash
-colcon test --packages-select common can_bus dm_motor_control dm_motor_lead_follow dm_motor_bringup
+colcon test --packages-select common can_bus dm_motor_control dm_motor_lead_follow dm_motor_bilateral_control dm_motor_bringup
 colcon test-result --verbose
 ```
 
 测试覆盖完全不含电机字段的相机配置、Python/C++ 查询、路径优先级、launch 名字中的点号、
-两个入口的拓扑/节点参数/端口隔离、非连续且乱序的命名端口、无端口不开面板以及缺失配置拒绝。
+不同入口的拓扑/节点参数/端口隔离、非连续且乱序的命名端口、无端口不开面板以及缺失配置拒绝。

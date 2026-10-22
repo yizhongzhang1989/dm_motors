@@ -1355,19 +1355,32 @@ private:
               {
                 axis->protection_count = state.feedback_count;
                 const double position = joint_position(*axis, state);
-                const bool violation = position < axis->lower || position > axis->upper ||
-                  (axis->measured_velocity > 0 && std::abs(state.feedback.v) > axis->measured_velocity) ||
-                  (axis->measured_torque > 0 && std::abs(state.feedback.t) > axis->measured_torque) ||
-                  (axis->mos_stop > 0 && state.feedback.mos >= axis->mos_stop) ||
-                  (axis->rotor_stop > 0 && state.feedback.rotor >= axis->rotor_stop);
-                axis->violations = violation ? axis->violations + 1 : 0;
+                std::string violation;
+                if (position < axis->lower || position > axis->upper) {
+                  violation = "joint position " + std::to_string(position) + " rad outside [" +
+                    std::to_string(axis->lower) + ", " + std::to_string(axis->upper) + "] rad";
+                } else if (axis->measured_velocity > 0 && std::abs(state.feedback.v) > axis->measured_velocity) {
+                  violation = "absolute velocity " + std::to_string(std::abs(state.feedback.v)) +
+                    " rad/s > " + std::to_string(axis->measured_velocity) + " rad/s";
+                } else if (axis->measured_torque > 0 && std::abs(state.feedback.t) > axis->measured_torque) {
+                  violation = "absolute torque " + std::to_string(std::abs(state.feedback.t)) +
+                    " Nm > " + std::to_string(axis->measured_torque) + " Nm";
+                } else if (axis->mos_stop > 0 && state.feedback.mos >= axis->mos_stop) {
+                  violation = "MOS temperature " + std::to_string(state.feedback.mos) +
+                    " C >= " + std::to_string(axis->mos_stop) + " C";
+                } else if (axis->rotor_stop > 0 && state.feedback.rotor >= axis->rotor_stop) {
+                  violation = "rotor temperature " + std::to_string(state.feedback.rotor) +
+                    " C >= " + std::to_string(axis->rotor_stop) + " C";
+                }
+                axis->violations = violation.empty() ? 0 : axis->violations + 1;
                 if (axis->violations >= axis->violation_limit) {
-                  axis->bus->fail(axis->config.name, "measured feedback protection exceeded");
+                  axis->bus->fail(axis->config.name, "measured feedback protection exceeded: " + violation);
                 }
               } else if (state.phase != Phase::Enabled) {axis->violations = 0;}
               task_tick(*axis, axis->bus->snapshot(axis->config.name, time), time);
               if (axis->held_target && axis->streamed_target && !axis->task &&
-                state.phase == Phase::Enabled && session_deadline(*axis, axis->active_session) > time)
+                axis->bus->snapshot(axis->config.name, time).phase == Phase::Enabled &&
+                session_deadline(*axis, axis->active_session) > time)
               {
                 axis->bus->command(axis->config.name, native_target(*axis, axis->active), time);
               }
