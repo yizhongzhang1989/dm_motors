@@ -17,6 +17,8 @@ float64 gravity_torque
 float64 friction_torque
 float64 contact_torque
 float64 net_torque
+# Constant load and linear joint spring, excluding gravity/contact/external inputs.
+float64 load_torque
 float64 mechanical_energy
 float64 rotor_temperature
 float64 mos_temperature

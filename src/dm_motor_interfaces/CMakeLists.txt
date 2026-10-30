@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BilateralState.msg" "srv/BilateralControl.srv"
   "msg/ExternalTorque.msg" "msg/SimulationState.msg" "srv/SimulationControl.srv"
   "srv/LeadFollowControl.srv"
+  "srv/CalibrationControl.srv"
   "msg/MotorTask.msg" "msg/MotorTaskFeedback.msg" "msg/MotorTaskResult.msg" "msg/MotorTaskEvent.msg"
   DEPENDENCIES std_msgs)
 ament_export_dependencies(rosidl_default_runtime)

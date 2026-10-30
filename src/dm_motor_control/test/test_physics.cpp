@@ -85,3 +85,51 @@ TEST(Physics, InvalidParametersAndInputsAreRejected)
   EXPECT_DOUBLE_EQ(model.state().position, 0);
   EXPECT_DOUBLE_EQ(model.state().velocity, 0);
 }
+
+TEST(Physics, SelectableStribeckAndDirectionalFrictionRemainDissipative)
+{
+  for (const auto & name : {"viscous", "coulomb_viscous", "stribeck"}) {
+    for (double velocity : {-0.1, 0.1}) {
+      auto p = frictionless();
+      p.friction_model = name; p.initial_velocity = velocity;
+      p.coulomb_friction = 0.1; p.static_friction = 0.2; p.viscous_friction = 0.03;
+      p.stribeck_velocity = 0.2; p.friction_negative_scale = 1.5;
+      JointPhysics model(p);
+      model.step(0.00025, 0, 0, false);
+      EXPECT_LE(model.state().friction_torque * velocity, 0);
+      EXPECT_LT(std::abs(model.state().velocity), std::abs(velocity));
+      if (p.friction_model == "stribeck") {
+        const double expected = (0.1 + 0.1 * std::exp(-0.25) +
+          0.03 * std::abs(model.state().velocity)) * (velocity < 0 ? 1.5 : 1);
+        EXPECT_NEAR(std::abs(model.state().friction_torque), expected, 1e-10);
+      }
+    }
+  }
+  auto p = frictionless(); p.friction_model = "unsupported";
+  EXPECT_THROW(JointPhysics{p}, std::invalid_argument);
+  p.friction_model = "stribeck"; p.stribeck_velocity = 0;
+  EXPECT_THROW(JointPhysics{p}, std::invalid_argument);
+  p.stribeck_velocity = 0.1; p.friction_negative_scale = -1;
+  EXPECT_THROW(JointPhysics{p}, std::invalid_argument);
+}
+
+TEST(Physics, JointSpringAndConstantLoadAreDistinctFromFriction)
+{
+  auto p = frictionless(); p.initial_position = 0.5; p.joint_stiffness = 0.4; p.load_torque = 0.1;
+  JointPhysics model(p);
+  model.step(0.0005, 0, 0, false);
+  EXPECT_NEAR(model.state().load_torque, -0.3, 1e-12);
+  EXPECT_NEAR(model.state().velocity, -0.00015, 1e-12);
+  EXPECT_NEAR(model.state().friction_torque, 0, 1e-12);
+}
+
+TEST(Physics, ReversalUsesStaticThresholdInTheLoadDirection)
+{
+  auto p = frictionless(); p.initial_velocity = 1e-5;
+  p.coulomb_friction = 0.05; p.static_friction = 0.1; p.friction_negative_scale = 2;
+  JointPhysics model(p);
+  model.step(0.001, 0, -0.15, false);
+  EXPECT_DOUBLE_EQ(model.state().velocity, 0);
+  model.step(0.001, 0, -0.15, false);
+  EXPECT_DOUBLE_EQ(model.state().velocity, 0);
+}

@@ -53,6 +53,30 @@ ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true
 与主从场景择一运行；不要同时开始两个控制器。算法、接口和硬件门禁见
 [标准双边力控](src/dm_motor_bilateral_control/README.md)。
 
+**电机参数自动标定与摩擦补偿**：新增独立
+[dm_motor_calibration](src/dm_motor_calibration/README.md)，支持五种可选摩擦模型、
+惯量/负载联合辨识、静摩擦起动试验、结果保存和补偿 A/B 测试。
+先用不连接任何硬件的生产物理模型完成整套流程：
+
+```bash
+ros2 run dm_motor_calibration calibrate.py simulate --model auto --output /tmp/calibration-example
+```
+
+ROS 自动采样入口默认停止且拒绝真机运动；显式开始后才运行有限激励。
+电气、力矩常数和热学辨识需相应传感器数据，不能从现有运动反馈凭空恢复。
+独立电机启动后，可运行 `ros2 launch dm_motor_calibration calibration.launch.py`
+打开专用标定面板 **<http://127.0.0.1:8085/>**：模型选择、阶段进度、实时曲线、
+校正摩擦散点/模型、历史报告和补偿 A/B 对比均在同一页面。不要同时让主从/双边向该轴发目标。
+
+需要全速度精度时使用新增的[精密摩擦流程](src/dm_motor_calibration/README.md#精密全速度摩擦标定新流程)，
+而不是把 40 秒低速往复当成全速验收。它包含多角度静摩擦、正反向 14 档至 **2π rad/s**、
+整圈重复采样及独立中间速度验证，面板按档位显示精度和覆盖。
+先运行 `ros2 run dm_motor_calibration calibrate.py precision-simulate --output /tmp/precision-friction`；
+多圈实机试验需新的明确许可和专用保护配置，不会自动提高旧驱动的限制。
+静摩擦重复性、零偏、温漂或稳速质量未达到目标时，流程仍继续采集后续档位并保留实际数据。
+采集完成与模型合格分开报告，不会把不合格结果冒充合格补偿模型。Dashboard 默认显示最近60秒，
+每图最多1200点，全程概览也先降采样；完整原始数据不删减。
+
 **真机主从跟随并开启四个面板**：直接使用默认配置。
 
 ```bash
@@ -70,12 +94,13 @@ ros2 launch dm_motor_bringup dual_motor.launch.py
 bringup 不提供 `_hardware` 或独立仿真入口；同一个 launch 通过 `simulation` 参数选择模式。
 
 **所有 launch 默认读取配置文件中的参数，包括面板端口，无需再传 `:=config`。**
-所选 package/launch 的默认端口为 CAN 8080、电机 8081/8082、主从 8083、双边 8084。
+所选 package/launch 的默认端口为 CAN 8080、电机 8081/8082、主从 8083、双边 8084、标定 8085。
 每个面板端口都明确列出，不使用 base_port 或顺序递增。单面板可以传数字覆盖，
 多面板使用 `{实例名: 端口}` 映射覆盖。显式空值关闭对应面板；
 例如只需主从面板时传 `can_dashboard_ports:='{}' motor_dashboard_ports:='{}'`。
 也可在 YAML 中将单端口设为 `''`、端口映射设为 `{}`，使该入口默认无对应面板。
-Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow` 和 `dm_motor_bilateral_control`，
+Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow`、`dm_motor_bilateral_control`
+和 `dm_motor_calibration`，
 不再有独立的 Dashboard package，但 HTTP 服务仍是独立进程，不进入实时控制循环。
 所有功能包共享 `common` 配置模块，Python 和 C++ 节点从同一文件获取默认值。
 `common` 不含电机业务结构，未来其它 package 也可使用；同一包不同 launch 的参数相互独立。
@@ -93,6 +118,7 @@ Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow
 | --- | --- | --- |
 | **主从跟随** | **<http://127.0.0.1:8083/>** | 主从入口默认开启；编辑参数，点击右上角「开始」/「停止」 |
 | **标准双边力控** | **<http://127.0.0.1:8084/>** | 双边入口默认开启；右上开始/停止，查看两侧力矩、共同增益及配对状态 |
+| **参数标定** | **<http://127.0.0.1:8085/>** | 独立标定入口开启；模型选择、全过程曲线、结果回放及补偿比较；默认不运动 |
 | 电机 1 | <http://127.0.0.1:8081/> | 自动监控，右上角「使能」/「失能」 |
 | 电机 2 | <http://127.0.0.1:8082/> | 自动监控，右上角「使能」/「失能」 |
 | CAN 总线 | <http://127.0.0.1:8080/> | 总线状态、帧观察及独立调试 |
@@ -1226,6 +1252,11 @@ CONTROL_RATE、TASK_START、TASK_CANCEL。完整字段见
   它只建立非独占输出保活，最多 256 个同时有效会话；申请/续约不改目标。
   释放/到期仅在当前输出仍使用该会话时停止，不影响已切换到其他来源的输出。
 - OPERATION 提供使能/失能、模式、零点、清错、保存等原有操作。
+- `ENABLE_MANUAL_DRAG` 是显式的零增益拖动使能，不是普通 `ENABLE` 的默认行为。
+  必须有新鲜静止失能反馈、MIT 模式和已启用的主机保护；仅请求来源的有效连续、非保活
+  MIT 纯力矩目标可免于 `measured_velocity_limit` 停机判断。位置/速度目标及 kp/kd 必须为零，
+  否则拒绝并停机。换来源、超时、任务接管、失能或复位后不再豁免；
+  普通使能及自动任务仍使用原速度门限。力矩、温度、绝对位置及反馈/命令超时保护不变。
 - REGISTERS 每批 1..16 项；OPERATION_RESULT 查询异步寄存器事务终态。
 - CAPABILITIES 返回模式、寄存器目录和 `MotorConfiguration`，不再依赖 ROS 参数 Service。
 - CONTROL_RATE 的 value 为 Hz，不要求控制 token；运行期仅允许调整该频率。

@@ -28,7 +28,9 @@ add_executable(motor_node src/motor_node.cpp)
 target_link_libraries(motor_node dm_motor_core dm_can_client)
 ament_target_dependencies(motor_node rclcpp rcl_interfaces sensor_msgs diagnostic_msgs dm_motor_interfaces common)
 add_library(joint_simulation STATIC src/simulation/physics.cpp src/simulation/device.cpp)
-target_include_directories(joint_simulation PUBLIC include)
+target_include_directories(joint_simulation PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
 target_link_libraries(joint_simulation dm_motor_core)
 ament_target_dependencies(joint_simulation common)
 add_executable(sim_motor_node src/simulation/sim_motor_node.cpp)
@@ -41,6 +43,7 @@ install(TARGETS dm_motor_core EXPORT dm_motor_core_targets
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
 install(TARGETS dm_can_client EXPORT dm_motor_core_targets
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+install(TARGETS joint_simulation EXPORT dm_motor_core_targets ARCHIVE DESTINATION lib)
 install(TARGETS motor_node sim_motor_node can_motor_simulator DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS scripts/motor_client.py scripts/dashboard.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY web DESTINATION share/${PROJECT_NAME})
@@ -52,7 +55,7 @@ install(CODE "file(REMOVE
   \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/config/sim_bus.yaml\"
   \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/config/dual_serial_test.yaml\")")
 ament_export_targets(dm_motor_core_targets HAS_LIBRARY_TARGET)
-ament_export_dependencies(can_bus rclcpp dm_motor_interfaces)
+ament_export_dependencies(can_bus rclcpp dm_motor_interfaces common)
 if(BUILD_TESTING)
   install(DIRECTORY test/config DESTINATION share/${PROJECT_NAME}/test)
   find_package(ament_cmake_gtest REQUIRED)

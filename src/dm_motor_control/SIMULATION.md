@@ -78,13 +78,19 @@ CLI、主从控制器和通用面板不需要更换控制逻辑。
 
 ```text
 J * acceleration = motor_torque + external_torque + gravity_torque
-                   + friction_torque + contact_torque
+                   + friction_torque + contact_torque + load_torque
 ```
 
 包含转动惯量、粘性/库仑/静摩擦、正弦重力负载、弹簧阻尼关节限位、电磁力矩响应时间常数、
 转速相关力矩饱和、I²R 发热与散热。四种控制模式均通过力矩驱动模型，不瞬间改位置或速度。
 零位改变编码器偏置，不改变物理角度；CAN 反馈使用原协议的紧凑量化和回绕。
 TIMEOUT 由虚拟固件独立计时，丢失命令会锁存通信故障，即使主机控制节点已暂停。
+
+为[自动标定](../dm_motor_calibration/README.md)增加可选 Stribeck 滑动摩擦、
+负方向摩擦倍率、线性关节弹簧与恒定负载；默认仍是原来的库仑/黏性/静摩擦模型，
+新增负载默认零，不改变现有场景。`SimulationState.load_torque` 是实际施加的
+`-joint_stiffness*position-load_torque`，与重力/限位/手动外力分别记录。
+标定测试直接链接同一物理库，不另用拟合公式替代动力学积分。
 
 默认物理参数是可重复测试的示例，不是 J4310 工厂标定。需要真机测量惯量、摩擦、
 负载、带宽和热参数后才能主张具体工况下的近似精度。这里不模拟电源瞬态波形、
@@ -96,7 +102,11 @@ TIMEOUT 由虚拟固件独立计时，丢失命令会锁存通信故障，即使
 | `inertia` | kg·m²，输出轴等效转动惯量（含负载），默认 0.01 |
 | `viscous_friction` | Nm/(rad/s)，默认 0.02 |
 | `coulomb_friction` / `static_friction` | Nm，默认 0.03 / 0.05 |
+| `friction_model` | `viscous` / `coulomb_viscous`（默认）/ `stribeck`；纯黏性模式无干摩擦与静止锁定 |
+| `stribeck_velocity` | rad/s，指数固定 2 的 Stribeck 特征速度，默认 0.15 |
+| `friction_negative_scale` | 负方向的黏性/库仑/静摩擦共同倍率，默认 1；必须为正 |
 | `gravity_torque` / `gravity_offset` | 重力力矩幅值（例如 m·g·r）/ 安装相位，默认 0 / 0 |
+| `joint_stiffness` / `load_torque` | Nm/rad / Nm，线性关节弹簧和恒定阻力矩（符号沿输出轴坐标），默认均 0 |
 | `max_torque` / `no_load_speed` | Nm / rad/s，执行器峰值力矩及空载速度，默认 10 / 50 |
 | `torque_time_constant` | s，电磁力矩一阶响应，默认 0.002 |
 | `lower_limit` / `upper_limit` | rad，机械角度限位，默认 ±1e6（多圈测试，不代表真机行程） |

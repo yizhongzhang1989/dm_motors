@@ -9,6 +9,7 @@ namespace dm_motor::simulation
 void PhysicsParameters::validate() const
 {
   for (double value : {inertia, viscous_friction, coulomb_friction, static_friction,
+      stribeck_velocity, friction_negative_scale, joint_stiffness, load_torque,
       gravity_torque, gravity_offset, max_torque, no_load_speed, torque_time_constant,
       lower_limit, upper_limit, contact_stiffness, contact_damping, ambient_temperature,
       heat_capacity, thermal_resistance, winding_resistance, torque_constant,
@@ -19,12 +20,18 @@ void PhysicsParameters::validate() const
   if (inertia < 1e-5 || inertia > 1e4 || max_torque <= 0 || max_torque > 1000 ||
     no_load_speed <= 0 || torque_time_constant < 0 ||
     viscous_friction < 0 || coulomb_friction < 0 || static_friction < coulomb_friction ||
+    stribeck_velocity <= 0 || friction_negative_scale <= 0 || joint_stiffness < 0 ||
     gravity_torque < 0 || lower_limit >= upper_limit || contact_stiffness < 0 || contact_damping < 0 ||
     heat_capacity <= 0 || thermal_resistance <= 0 || winding_resistance < 0 || torque_constant <= 0 ||
     ambient_temperature < -40 || ambient_temperature > 150 ||
     initial_position < lower_limit || initial_position > upper_limit)
   {
     throw std::invalid_argument("Invalid inertia, friction, actuator, thermal or joint-limit parameters");
+  }
+  if (friction_model != "viscous" && friction_model != "coulomb_viscous" &&
+    friction_model != "stribeck")
+  {
+    throw std::invalid_argument("friction_model must be viscous, coulomb_viscous or stribeck");
   }
 }
 
@@ -35,7 +42,9 @@ JointPhysics::JointPhysics(PhysicsParameters parameters) : parameters_(parameter
   state_.velocity = parameters.initial_velocity;
   state_.rotor_temperature = state_.mos_temperature = parameters.ambient_temperature;
   state_.mechanical_energy = parameters.inertia * state_.velocity * state_.velocity / 2 +
-    parameters.gravity_torque * (1 - std::cos(state_.position + parameters.gravity_offset));
+    parameters.gravity_torque * (1 - std::cos(state_.position + parameters.gravity_offset)) +
+    parameters.joint_stiffness * state_.position * state_.position / 2 +
+    parameters.load_torque * state_.position;
   if (!std::isfinite(state_.mechanical_energy)) {throw std::invalid_argument("Initial mechanical energy is not finite");}
 }
 
@@ -67,17 +76,27 @@ void JointPhysics::step(double dt, double requested, double external, bool enabl
     -p.contact_stiffness * penetration - p.contact_damping * s.velocity;
   if (penetration > 0) {s.contact_torque = std::min(0.0, s.contact_torque);}
   if (penetration < 0) {s.contact_torque = std::max(0.0, s.contact_torque);}
-  const double drive = s.motor_torque + external + s.gravity_torque + s.contact_torque;
+  s.load_torque = -p.joint_stiffness * s.position - p.load_torque;
+  const double drive = s.motor_torque + external + s.gravity_torque + s.contact_torque + s.load_torque;
   const double old_velocity = s.velocity;
-  if (std::abs(old_velocity) < 1e-8 && std::abs(drive) <= p.static_friction) {
+  const double direction = std::abs(old_velocity) > 1e-8 ? old_velocity : drive;
+  const double scale = direction < 0 ? p.friction_negative_scale : 1;
+  const double static_limit = p.friction_model == "viscous" ? 0 :
+    (drive < 0 ? p.friction_negative_scale : 1) * p.static_friction;
+  if (std::abs(old_velocity) < 1e-8 && std::abs(drive) <= static_limit) {
     s.velocity = 0;
     s.friction_torque = -drive;
   } else {
-    const double sign = std::copysign(1.0, std::abs(old_velocity) > 1e-8 ? old_velocity : drive);
-    const double coulomb = -p.coulomb_friction * sign;
+    const double sign = std::copysign(1.0, direction);
+    double dry = p.friction_model == "viscous" ? 0 : p.coulomb_friction;
+    if (p.friction_model == "stribeck") {
+      dry += (p.static_friction - p.coulomb_friction) *
+        std::exp(-std::pow(old_velocity / p.stribeck_velocity, 2));
+    }
+    const double coulomb = -scale * dry * sign;
     s.velocity = (old_velocity + dt * (drive + coulomb) / p.inertia) /
-      (1 + dt * p.viscous_friction / p.inertia);
-    if (old_velocity * s.velocity < 0 && std::abs(drive) <= p.static_friction) {s.velocity = 0;}
+      (1 + dt * scale * p.viscous_friction / p.inertia);
+    if (old_velocity * s.velocity < 0 && std::abs(drive) <= static_limit) {s.velocity = 0;}
     s.friction_torque = p.inertia * (s.velocity - old_velocity) / dt - drive;
   }
   s.net_torque = drive + s.friction_torque;
@@ -92,6 +111,7 @@ void JointPhysics::step(double dt, double requested, double external, bool enabl
     s.position > p.upper_limit ? s.position - p.upper_limit : 0;
   s.mechanical_energy = p.inertia * s.velocity * s.velocity / 2 +
     p.gravity_torque * (1 - std::cos(s.position + p.gravity_offset)) +
+    p.joint_stiffness * s.position * s.position / 2 + p.load_torque * s.position +
     p.contact_stiffness * contact * contact / 2;
   ++s.integration_steps;
   if (!std::isfinite(s.position) || !std::isfinite(s.velocity) ||

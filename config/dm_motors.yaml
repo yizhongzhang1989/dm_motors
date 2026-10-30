@@ -89,8 +89,13 @@ packages:
         viscous_friction: 0.02
         coulomb_friction: 0.03
         static_friction: 0.05
+        friction_model: coulomb_viscous
+        stribeck_velocity: 0.15
+        friction_negative_scale: 1.0
         gravity_torque: 0.0
         gravity_offset: 0.0
+        joint_stiffness: 0.0
+        load_torque: 0.0
         max_torque: 10.0
         no_load_speed: 50.0
         torque_time_constant: 0.002
@@ -432,3 +437,266 @@ packages:
           namespace: ''
           dashboard_host: 0.0.0.0
           dashboard_port: 8084
+  dm_motor_calibration:
+    nodes:
+      calibration_node:
+        motor_namespace: /motor_1
+        experiment: calibrate
+        model: auto
+        collect_warmup: true
+        collect_static: true
+        collect_training: true
+        collect_validation: true
+        protocol_mode: full
+        allow_hardware: false
+        allow_multiturn_calibration: false
+        output_directory: ~/.ros/dm_motor_calibration
+        calibration_file: ''
+        rate: 200.0
+        target_validity: 0.05
+        duration: 40.0
+        amplitude: 1.2
+        frequency: 0.12
+        kp: 2.0
+        kd: 0.25
+        max_torque: 1.0
+        max_speed: 3.0
+        max_travel: 2.0
+        max_temperature: 50.0
+        feedback_timeout: 0.08
+        fit_bias: true
+        known_bias: 0.0
+        fit_gravity: false
+        fit_stiffness: false
+        integration_window: 0.08
+        adaptive_window: true
+        trajectory_control: auto
+        min_speed: 0.04
+        max_gap: 0.03
+        max_rmse: 0.02
+        compensation_fraction: 0.8
+        compensation_deadband: 0.03
+        compensation_smoothing: 0.03
+        compensation_filter: 0.01
+        compensation_slew: 5.0
+        minimum_improvement: 0.15
+        breakaway_ramp_rate: 0.05
+        breakaway_speed: 0.04
+        breakaway_position: 0.005
+        breakaway_samples: 3
+        breakaway_approach: 0.03
+        breakaway_return_tolerance: 0.003
+        breakaway_settle_time: 0.5
+        precision_speeds: [0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.5, 6.283185307179586]
+        precision_warmup_repetitions: 1
+        precision_warmup_profile: rotation_sine
+        precision_warmup_speeds: [2.0943951023931953, 3.141592653589793, 6.283185307179586]
+        precision_warmup_turns_per_direction: 100
+        precision_warmup_sine_cycles: 100
+        precision_warmup_sine_amplitude: 3.141592653589793
+        precision_warmup_sine_start_frequency: 0.1
+        precision_warmup_sine_end_frequency: 0.5
+        precision_warmup_sine_min_fraction: 0.9
+        precision_warmup_sine_kp: 4.0
+        precision_warmup_sine_kd: 0.3
+        precision_warmup_max_torque: 0.8
+        precision_warmup_max_speed: 12.0
+        precision_warmup_max_travel: 320.0
+        precision_zero_position: 0.0
+        precision_repetitions: 3
+        precision_revolutions: 1
+        precision_sample_time: 1.0
+        precision_settle_time: 0.8
+        precision_settle_timeout: 5.0
+        precision_baseline_time: 2.0
+        precision_baseline_settle_time: 0.0
+        precision_velocity_window: 0.4
+        precision_control_window: 0.1
+        precision_velocity_kd: 0.8
+        precision_velocity_ki: 2.0
+        precision_speed_tolerance: 0.006
+        precision_relative_speed_tolerance: 0.002
+        precision_relative_speed_ripple: 0.03
+        precision_acceleration: 3.0
+        precision_jerk: 12.0
+        precision_max_torque: 0.4
+        precision_max_speed: 7.2
+        precision_max_travel: 64.0
+        precision_max_temperature: 48.0
+        precision_feedback_timeout: 0.08
+        precision_max_gap: 0.03
+        precision_time_budget: 10800.0
+        precision_rmse_limit: 0.003
+        precision_max_error: 0.005
+        precision_repeatability_limit: 0.003
+        precision_ci95_limit: 0.005
+        precision_temperature_span: 2.0
+        precision_static_conditioning_repetitions: 0
+        precision_static_repetitions: 3
+        precision_static_angles: [-3.141592653589793, -1.5707963267948966, 0.0, 1.5707963267948966]
+        precision_static_ramp_rate: 0.03
+        precision_static_average_time: 0.4
+        precision_static_position: 0.005
+        precision_static_speed: 0.04
+        precision_static_confirmations: 3
+        precision_approach: 0.03
+        precision_home_tolerance: 0.003
+        precision_neutral_time: 1.0
+        fourier_frequency: 0.1
+        fourier_harmonics: 5
+        fourier_amplitude: 3.141592653589793
+        fourier_reference_speed: 6.6
+        fourier_minimum_peak_speed: 6.346017160251382
+        fourier_acceleration: 24.0
+        fourier_jerk: 120.0
+        fourier_kp: 10.0
+        fourier_kd: 0.5
+        fourier_max_torque: 0.8
+        fourier_max_travel: 4.0
+        fourier_settle_cycles: 2
+        fourier_training_cycles: 8
+        fourier_slow_training_cycles: 6
+        fourier_validation_settle_cycles: 1
+        fourier_validation_cycles: 4
+        fourier_slow_validation_cycles: 4
+        fourier_slow_scale: 0.05
+        fourier_validation_frequency_ratio: 1.25
+        fourier_validation_amplitude_ratio: 0.9
+        fourier_feedback_rate: 1000
+        fourier_phase_samples: 2000
+        fourier_derivative_harmonics: 80
+        fourier_integration_window: 0.02
+        fourier_rmse_limit: 0.003
+        fourier_max_error: 0.005
+        fourier_search_candidates: 1024
+        fourier_seed: 1729
+        fourier_position_fit_limit: 0.003
+        fourier_condition_limit: 1000.0
+      dashboard:
+        controller_namespace: /calibration
+        host: 0.0.0.0
+        port: 8085
+    launches:
+      calibration.launch.py:
+        parameters:
+          namespace: calibration
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8085
+      dashboard.launch.py:
+        parameters:
+          namespace: ''
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8085
+      fourier_20rad_test:
+        parameters:
+          namespace: calibration
+          motor_namespace: /motor_2
+          motor_id: 2
+          start_motor: false
+          simulation: false
+          allow_hardware: false
+          allow_multiturn_calibration: false
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8085
+        nodes:
+          dm_motor_calibration:
+            calibration_node:
+              experiment: fourier
+              max_torque: 0.4
+              max_speed: 1.0
+              max_travel: 0.7
+              max_temperature: 48.0
+              amplitude: 0.45
+              frequency: 0.1
+              kp: 0.3
+              kd: 0.5
+              model: auto
+              fit_gravity: true
+              min_speed: 0.04
+              integration_window: 0.12
+              feedback_timeout: 0.08
+              target_validity: 0.1
+              collect_warmup: false
+              collect_static: false
+              collect_training: true
+              collect_validation: true
+              precision_warmup_repetitions: 0
+              precision_time_budget: 300.0
+              precision_baseline_settle_time: 10.0
+              precision_baseline_time: 10.0
+              precision_max_speed: 24.0
+              fourier_reference_speed: 22.0
+              fourier_minimum_peak_speed: 20.5
+              fourier_frequency: 0.25
+              fourier_harmonics: 8
+              fourier_acceleration: 180.0
+              fourier_jerk: 2000.0
+              fourier_phase_samples: 800
+              fourier_kp: 10.0
+              fourier_kd: 0.25
+              fourier_max_torque: 0.8
+          dm_motor_control:
+            motor_node:
+              host_protection_enabled: true
+              velocity_limit: 26.0
+              measured_velocity_limit: 26.0
+              torque_limit: 0.8
+              measured_torque_limit: 1.0
+              estimated_torque_limit: 1.0
+              mos_temperature_stop: 50.0
+              rotor_temperature_stop: 50.0
+              protection_samples: 1
+      precision.launch.py:
+        parameters:
+          namespace: calibration
+          motor_namespace: /motor_1
+          motor_id: 1
+          start_motor: false
+          simulation: false
+          allow_hardware: false
+          allow_multiturn_calibration: false
+          dashboard_host: 0.0.0.0
+          dashboard_port: 8085
+          start_can_bus: true
+          can_bus_namespace: ''
+          backend: serial
+          port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+        nodes:
+          dm_motor_calibration:
+            calibration_node:
+              experiment: precision
+              target_validity: 0.1
+          dm_motor_control:
+            motor_node:
+              configure_mode_on_startup: true
+              host_protection_enabled: true
+              state_rate: 200.0
+              position_min: -350.0
+              position_max: 350.0
+              velocity_limit: 13.0
+              torque_limit: 0.8
+              measured_velocity_limit: 13.0
+              measured_torque_limit: 1.0
+              estimated_torque_limit: 1.0
+              mos_temperature_stop: 50.0
+              rotor_temperature_stop: 50.0
+              protection_samples: 1
+        variants:
+          simulation:
+            parameters: {backend: virtual, port: ''}
+            devices: {}
+            nodes:
+              dm_motor_control:
+                motor_node:
+                  host_protection_enabled: true
+                  state_rate: 200.0
+                  position_min: -350.0
+                  position_max: 350.0
+                  velocity_limit: 13.0
+                  torque_limit: 0.8
+                  measured_velocity_limit: 13.0
+                  measured_torque_limit: 1.0
+                  estimated_torque_limit: 1.0
+                  mos_temperature_stop: 50.0
+                  rotor_temperature_stop: 50.0
+                  protection_samples: 1

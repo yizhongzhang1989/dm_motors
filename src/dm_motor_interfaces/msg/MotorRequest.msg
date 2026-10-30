@@ -20,6 +20,8 @@ uint8 CLEAR_MOTOR_FAULT=5
 uint8 SET_DEVICE_ZERO=6
 uint8 SET_SOFTWARE_ZERO=7
 uint8 SAVE_PARAMETERS=8
+# Opt-in streamed torque-only manual drag; ordinary ENABLE retains measured-speed protection.
+uint8 ENABLE_MANUAL_DRAG=9
 std_msgs/Header header
 string client_id
 uint64 request_id

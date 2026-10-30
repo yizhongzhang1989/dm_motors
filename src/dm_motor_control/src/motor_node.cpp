@@ -173,6 +173,7 @@ struct Axis
   std::map<std::string, Keepalive> keepalives;
   std::map<std::string, SourceOrder> source_order;
   std::string active_session, active_source;
+  std::string manual_drag_source;
   uint64_t sequence{0}, rejected{0};
   uint64_t applied_sequence{0};
   double accepted_target_age_ms{0}, applied_target_age_ms{0};
@@ -511,6 +512,7 @@ private:
     axis.applied.mode = axis.requested.mode;
     axis.source_order.clear();
     axis.active_session.clear(); axis.active_source.clear();
+    axis.manual_drag_source.clear();
   }
 
   void end_task(Axis & axis, bool success, const std::string & reason)
@@ -648,6 +650,15 @@ private:
       throw std::invalid_argument("held target requires a live non-exclusive keepalive session; use streaming targets without a token");
     }
     const auto target = from_message(msg.target);
+    if (!axis.manual_drag_source.empty()) {
+      if (msg.client_id != axis.manual_drag_source) {
+        axis.manual_drag_source.clear();
+      } else if (held || target.mode != Mode::Mit || target.position != 0 || target.velocity != 0 ||
+        target.kp != 0 || target.kd != 0)
+      {
+        throw std::invalid_argument("manual drag requires streamed MIT torque-only targets with zero position/velocity/gains");
+      }
+    }
     submit(axis, target, time);
     end_task(axis, false, "Superseded by a newer manual target");
     axis.source_order[source] = {stamp.nanoseconds(), msg.sequence, time};
@@ -774,10 +785,22 @@ private:
           else {
             require_ready(axis);
             if (axis.task) {throw std::runtime_error("cancel task before maintenance");}
-            if (req->operation == Request::ENABLE) {
+            if (req->operation == Request::ENABLE || req->operation == Request::ENABLE_MANUAL_DRAG) {
+              const bool manual_drag = req->operation == Request::ENABLE_MANUAL_DRAG;
+              if (manual_drag) {
+                const auto state = axis.bus->snapshot(axis.config.name, time);
+                if (req->client_id.empty() || !axis.host_protection || state.mode != Mode::Mit ||
+                  state.phase != Phase::Disabled || state.feedback.status != 0 ||
+                  state.feedback_age < 0 || state.feedback_age > axis.config.feedback_timeout ||
+                  std::abs(state.feedback.v) > 0.05)
+                {
+                  throw std::runtime_error("manual drag enable requires a named source, host protection and fresh stationary disabled MIT feedback");
+                }
+              }
               reset_targets(axis); axis.bus->enable(axis.config.name, time);
               if (session_deadline(axis, req->token) > time) {axis.active_session = req->token;}
               axis.active_source = req->client_id;
+              if (manual_drag) {axis.manual_drag_source = req->client_id;}
             } else if (req->operation == Request::RESET_HOST_FAULT) {
               axis.bus->reset(axis.config.name, time); reset_targets(axis);
             } else if (req->operation == Request::SET_MODE) {
@@ -1359,7 +1382,10 @@ private:
                 if (position < axis->lower || position > axis->upper) {
                   violation = "joint position " + std::to_string(position) + " rad outside [" +
                     std::to_string(axis->lower) + ", " + std::to_string(axis->upper) + "] rad";
-                } else if (axis->measured_velocity > 0 && std::abs(state.feedback.v) > axis->measured_velocity) {
+                } else if (axis->measured_velocity > 0 && std::abs(state.feedback.v) > axis->measured_velocity &&
+                  !(axis->streamed_target && !axis->held_target && !axis->task &&
+                  time <= axis->target_deadline && !axis->manual_drag_source.empty() &&
+                  axis->active_source == axis->manual_drag_source)) {
                   violation = "absolute velocity " + std::to_string(std::abs(state.feedback.v)) +
                     " rad/s > " + std::to_string(axis->measured_velocity) + " rad/s";
                 } else if (axis->measured_torque > 0 && std::abs(state.feedback.t) > axis->measured_torque) {

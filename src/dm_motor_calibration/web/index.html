@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>电机参数标定</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/view_model.js" defer></script>
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <header class="topbar" aria-label="当前电机实时状态">
+    <div class="topbar-main">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">τ</span><div>
+        <h1>电机参数标定</h1><p id="motor-name">等待电机反馈</p>
+      </div></div>
+      <div class="top-actions">
+        <div class="controller-status">
+          <span id="connection" class="badge">等待连接</span><span id="source" class="badge">来源未知</span>
+          <span id="controller-stage" class="badge phase-badge">等待标定器状态</span>
+          <span id="disabled-state" class="badge">失能状态未知</span>
+        </div>
+      </div>
+    </div>
+    <section class="metrics stale" aria-label="当前电机实时反馈">
+      <article class="metric"><span>位置</span><div class="metric-reading"><strong id="position-value">—</strong><small>rad</small></div></article>
+      <article class="metric"><span>速度</span><div class="metric-reading"><strong id="velocity-value">—</strong><small>rad/s</small></div></article>
+      <article class="metric" title="电机力矩，不是外力测量"><span>力矩</span><div class="metric-reading"><strong id="torque-value">—</strong><small>Nm</small></div></article>
+      <article class="metric" title="转子 / MOS 温度"><span>温度</span><div class="metric-reading"><strong id="temperature-value">—</strong><small>°C</small></div></article>
+    </section>
+  </header>
+  <main>
+    <p id="connection-notice" class="notice" role="status">正在连接标定器。打开或刷新页面只恢复监控，不会使能电机。</p>
+    <p id="action-notice" class="notice" role="alert" hidden></p>
+    <div class="workspace">
+      <aside class="control-column" aria-label="当前电机控制与标定进度">
+        <section class="panel process" aria-label="当前标定进度">
+          <div class="heading"><h2>标定控制</h2><span class="eyebrow">CALIBRATION</span></div>
+          <form id="settings">
+            <fieldset id="editable" disabled>
+              <label>标定任务<select id="experiment" name="experiment">
+                <option value="precision">精密全速摩擦 + 静摩擦标定</option>
+                <option value="fourier">傅里叶级数运动 · 摩擦与动力学辨识</option>
+                <option value="calibrate">快速机械辨识（低速）</option>
+                <option value="breakaway">独立静摩擦起动验证</option>
+                <option value="validate">摩擦补偿 A/B 轨迹验证</option>
+              </select></label>
+              <p id="calibration-summary" class="muted">模型及辨识选项在“计算与质量验收 → 参数”中设置。</p>
+              <label id="calibration-choice" hidden>验证使用的已标定模型
+                <select id="calibration_file" name="calibration_file"><option value="">请选择匹配电机的标定结果</option></select>
+              </label>
+              <div id="calibration-values" hidden>
+                <select id="model" name="model">
+                  <option value="auto">自动选择</option><option value="viscous">黏性</option>
+                  <option value="coulomb_viscous">库仑 + 黏性</option><option value="stribeck">Stribeck</option>
+                  <option value="asymmetric_coulomb_viscous">非对称库仑 + 黏性</option><option value="asymmetric_stribeck">非对称 Stribeck</option>
+                </select>
+                <input id="duration" name="duration" type="hidden"><input id="amplitude" name="amplitude" type="hidden">
+                <input id="frequency" name="frequency" type="hidden"><input id="kp" name="kp" type="hidden"><input id="kd" name="kd" type="hidden">
+                <input id="compensation_fraction" name="compensation_fraction" type="hidden">
+                <input id="fit_bias" name="fit_bias" type="checkbox"><input id="known_bias" name="known_bias" type="hidden">
+                <input id="fit_gravity" name="fit_gravity" type="checkbox"><input id="fit_stiffness" name="fit_stiffness" type="checkbox">
+              </div>
+              <label id="hardware-confirmation" class="check hardware" hidden>
+                <input id="confirm_hardware" type="checkbox"><span id="hardware-confirmation-text">已确认真机固定、可用行程及物理停止措施</span>
+              </label>
+              <div class="form-actions"><button id="apply" type="button" class="secondary small">应用标定设置</button>
+                <button id="reload-settings" type="button" class="text-button">恢复节点配置</button></div>
+            </fieldset>
+          </form>
+          <div class="global-controls" role="group" aria-label="当前电机整体控制">
+            <button id="start" type="submit" form="settings" disabled>开始标定</button>
+            <button id="stop" class="danger" type="button">停止 <kbd>Esc</kbd></button>
+          </div>
+          <p id="dirty" class="muted">应用设置不启动；开始时原子提交标定表单。</p>
+          <p id="stage-label" class="stage-label" aria-live="polite">等待实验</p>
+          <ol id="steps" class="steps">
+            <li id="step-checking"><label><input type="checkbox" checked disabled><span id="step-name-checking">就绪与安全检查</span></label><button id="parameters-checking" type="button" class="secondary step-parameters" aria-label="就绪与安全检查参数">参数</button><span id="step-state-checking" class="step-state">等待</span><small id="step-detail-checking"></small></li>
+            <li id="step-warmup"><label><input id="collect_warmup" name="collect_warmup" form="settings" type="checkbox" checked disabled><span id="step-name-warmup">预运行</span></label><button id="parameters-warmup" type="button" class="secondary step-parameters" aria-label="预运行参数">参数</button><span id="step-state-warmup" class="step-state">等待</span><small id="step-detail-warmup"></small></li>
+            <li id="step-baseline"><label><input type="checkbox" checked disabled><span id="step-name-baseline">失能零偏测量</span></label><button id="parameters-baseline" type="button" class="secondary step-parameters" aria-label="失能零偏参数">参数</button><span id="step-state-baseline" class="step-state">等待</span><small id="step-detail-baseline"></small></li>
+            <li id="step-static"><label><input id="collect_static" name="collect_static" form="settings" type="checkbox" checked disabled><span id="step-name-static">独立静摩擦</span></label><button id="parameters-static" type="button" class="secondary step-parameters" aria-label="静摩擦参数">参数</button><span id="step-state-static" class="step-state">等待</span><small id="step-detail-static"></small></li>
+            <li id="step-training"><label><input id="collect_training" name="collect_training" form="settings" type="checkbox" checked disabled><span id="step-name-training">训练数据采集</span></label><button id="parameters-training" type="button" class="secondary step-parameters" aria-label="训练采集参数">参数</button><span id="step-state-training" class="step-state">等待</span><small id="step-detail-training"></small></li>
+            <li id="step-validation"><label><input id="collect_validation" name="collect_validation" form="settings" type="checkbox" checked disabled><span id="step-name-validation">独立验证</span></label><button id="parameters-validation" type="button" class="secondary step-parameters" aria-label="独立验证参数">参数</button><span id="step-state-validation" class="step-state">等待</span><small id="step-detail-validation"></small></li>
+            <li id="step-stopping"><label><input type="checkbox" checked disabled><span id="step-name-stopping">停止与失能确认</span></label><button id="parameters-stopping" type="button" class="secondary step-parameters" aria-label="停止确认参数">参数</button><span id="step-state-stopping" class="step-state">等待</span><small id="step-detail-stopping"></small></li>
+            <li id="step-saving"><label><input type="checkbox" checked disabled><span id="step-name-saving">原始数据保存</span></label><button id="parameters-saving" type="button" class="secondary step-parameters" aria-label="数据保存参数">参数</button><span id="step-state-saving" class="step-state">等待</span><small id="step-detail-saving"></small></li>
+            <li id="step-analysis"><label><input type="checkbox" checked disabled><span id="step-name-analysis">计算与质量验收</span></label><button id="parameters-analysis" type="button" class="secondary step-parameters" aria-label="计算与验收参数">参数</button><span id="step-state-analysis" class="step-state">等待</span><small id="step-detail-analysis"></small></li>
+          </ol>
+          <div class="form-actions"><button id="stage-profile-full" type="button" class="secondary small" disabled>完整标定默认</button><button id="stage-profile-test" type="button" class="secondary small" disabled>约 2 分钟 / 阶段测试</button></div>
+          <p id="protocol-mode" class="notice">完整标定配置</p>
+          <p id="stage-selection-note" class="muted">默认执行全部采集阶段。安全检查、零偏、失能确认和保存不可跳过；未勾选阶段不会自动复用历史数据。</p>
+          <div class="progress-track" role="progressbar" id="progress" aria-label="当前采集阶段进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="progress-fill"></div>
+          </div>
+          <div class="progress-caption"><span id="progress-text">尚未开始</span><span id="sample-count">0 条原始样本</span></div>
+          <p id="stage-detail" class="muted">曲线来自实际反馈；完整数据在实验结束后保存。</p>
+          <p id="precision-current" class="notice" hidden></p>
+          <p id="fourier-current" class="notice" hidden></p>
+          <details id="fourier-protocol-details" hidden>
+            <summary>当前傅里叶采集方案</summary>
+            <dl id="fourier-protocol"></dl>
+            <p class="muted">保留预运行与独立静摩擦试验，使用独立训练 / 验证轨迹。辨识使用实测反馈，不把指令当作实际运动。</p>
+          </details>
+          <details class="control-help"><summary>任务说明</summary>
+            <div id="precision-info" class="hint" hidden>
+              <b>全速精密模式</b>
+              <p>按配置完成预运行后，测失能力矩零偏和多角度静摩擦，再双向分档扫描至 2π rad/s，使用整圈功积分、重复试验与独立中间速度验证。</p>
+              <p id="precision-budget"></p>
+              <p>需要多圈连续旋转空间。这里只展示已配置的精度与安全预算，不会自动提高驱动保护上限。</p>
+            </div>
+            <p id="fourier-info" class="hint" hidden>预运行和轨迹在各阶段参数中设置；摩擦模型、偏置、重力和刚度位于“计算与质量验收 → 参数”。通用快速激励和增益不控制傅里叶任务。</p>
+          </details>
+          <details class="limits"><summary>当前轴保护与控制边界</summary><dl id="limits"></dl>
+            <p class="muted">显示当前控制器的边界。下方拖动由操作者控制速度、行程和停止，驱动保护仍有效。</p></details>
+        </section>
+        <section id="drag-panel" class="panel" aria-label="零力拖动测试">
+          <div class="heading"><h2>拖动测试</h2><span class="eyebrow">FRICTION ASSIST</span></div>
+          <p class="muted">仅摩擦助力：无位置/速度保持，无重力补偿，不是外力闭环；静止不主动起动。</p>
+          <form id="drag-settings">
+            <fieldset id="drag-editable" disabled>
+              <label>使用已验证的摩擦模型<select id="drag-calibration-file" required><option value="">请选择匹配当前电机的合格模型</option></select></label>
+              <p id="drag-model-note" class="notice">不会使用未合格候选或流程测试结果。</p>
+              <a id="drag-model-report" target="_blank" rel="noopener noreferrer" hidden>查看所选模型原报告</a>
+              <div class="fields">
+                <label>补偿比例<input id="drag-fraction" type="number" min="0" max="1" step="0.05" value="0.8" required></label>
+              </div>
+              <p class="muted">0：无补偿；1：模型全额补偿，保护仍有效。</p>
+              <p id="drag-motion-note" class="muted">拖动速度和行程由操作者控制，不设置额外软件门限；驱动自身保护仍然有效。</p>
+              <label id="drag-hardware-confirmation" class="check hardware" hidden>
+                <input id="drag-confirm-hardware" type="checkbox"><span id="drag-hardware-confirmation-text">已确认可手动控制速度、实际机械行程与停止，无重力坠落风险及有独立停止措施；拖动不会定时结束</span>
+              </label>
+            </fieldset>
+            <div class="global-controls">
+              <button id="drag-start" type="submit" disabled>开始拖动测试</button>
+              <button id="drag-stop" type="button" class="danger">停止 <kbd>Esc</kbd></button>
+            </div>
+          </form>
+          <label id="fault-reset-hardware-confirmation" class="check hardware" hidden>
+            <input id="fault-reset-confirm" type="checkbox">已确认电机静止、现场可安全复位；复位后保持失能
+          </label>
+          <button id="fault-reset" type="button" class="secondary" disabled>复位主机故障（不使能）</button>
+          <p id="fault-reset-status" class="muted">仅清除已失能电机的主机故障，不清除固件故障，不自动启动。</p>
+          <p id="drag-action" class="notice" role="alert" hidden></p>
+          <p id="drag-status" class="notice" role="status">等待控制器</p>
+          <p id="drag-last-stop" class="notice error" role="status" hidden></p>
+          <p id="drag-domain-alert" class="notice error" role="alert" hidden>当前速度超出模型辨识包络，域外效果未验证；请减速或停止。</p>
+          <dl class="drag-readings">
+            <dt>已运行</dt><dd><span id="drag-elapsed">—</span> s</dd>
+            <dt>实测速度</dt><dd><span id="drag-velocity">—</span> rad/s</dd>
+            <dt>请求补偿力矩</dt><dd><span id="drag-output">—</span> Nm</dd>
+          </dl>
+          <details id="drag-model-details"><summary>模型适用范围与警告</summary><p id="drag-domain-note" class="warnings"></p></details>
+          <details class="limits" open><summary>固定保护与实际运行值</summary><dl id="drag-limits"></dl></details>
+          <p class="muted">与标定互斥，不定时结束，由用户开启和停止。两处停止和 Esc 均停止当前电机。关闭页面或断网不会停止拖动；离开前请停止并等待实际失能确认。</p>
+        </section>
+      </aside>
+      <div class="observations" aria-label="结果图表与历史数据">
+        <section class="panel" aria-label="原始数据保存与辨识来源">
+          <div class="heading"><h2>原始数据保存与辨识来源</h2></div>
+          <p id="recording-status" class="notice">等待记录状态。</p>
+          <p id="recording-path" class="muted"></p>
+          <p class="muted">精密 / 傅里叶记录在预运行使能前建立，运行中写 *.pending.csv，停止后提交 CSV 与哈希清单。
+            已入队、写入和已同步到磁盘是不同状态；同步不是硬件级断电无损保证。</p>
+          <div class="constraint-scroll"><table>
+            <thead><tr><th>数据流</th><th>已入队</th><th>已写入</th><th>已同步</th><th>队列</th><th>同步大小 / MiB</th></tr></thead>
+            <tbody id="recording-streams"></tbody>
+          </table></div>
+          <details open><summary>阶段候选数据的用途（不等于最终拟合窗口）</summary><dl id="recording-usage"></dl></details>
+          <p class="muted">预运行只用于温度与运动诊断；失能零偏用于力矩校正；静摩擦预处理不计入正式阈值统计。
+            傅里叶 role=0/2 为过渡，role=1 为训练候选，role=3 为独立验证候选。
+            低速黏滞 / 换向、限幅、缺口和不完整周期还需在分析中筛选，不把所有采集数据混入拟合。</p>
+          <p id="recording-selection" class="notice"></p>
+        </section>
+        <section class="panel" aria-label="分层约束与配置总览">
+          <details id="constraint-overview">
+            <summary>分层约束与配置总览 / 应用参数调整</summary>
+            <p id="constraint-status" class="notice">等待当前控制器配置。</p>
+            <p class="muted">此处始终展示当前轴，不跟随历史记录切换，也不包含未应用的表单草稿。
+              “节点配置”用于下一次标定；“执行配置”是当前或最近一次任务的配置，不代表所有阶段同时生效。
+              未回读的驱动参数不会使用默认值补齐；协议映射范围不是电机持续额定能力。</p>
+            <label>筛选参数<input id="constraint-filter" type="search" placeholder="名称、层级或说明，例如 torque / 温度 / timeout"></label>
+            <button id="constraint-edit" class="secondary" type="button" disabled>调整应用层约束</button>
+            <p class="muted">编辑先保存到标定草稿，再点“应用标定设置”提交；必须保持失能。
+              力矩与速度预算受驱动能力约束，其余保护／验收项不超过节点启动预算，并保留关联校验。
+              拖动使用已应用的通用约束，开始拖动不会自动提交标定草稿。
+              驱动启动参数和协议／固件边界只读，不自动重启驱动。</p>
+            <p id="constraint-fault" class="notice"></p>
+            <h3>当前任务保护值（待机／结束时仅供参考）</h3>
+            <dl id="constraint-active"></dl>
+            <div class="constraint-scroll" tabindex="0" role="region" aria-label="约束参数表">
+              <table class="constraint-table">
+                <thead><tr><th>层级 / 参数</th><th>节点配置 / 来源值</th><th>执行配置 / 说明</th><th>编辑入口</th></tr></thead>
+                <tbody id="constraint-rows"></tbody>
+              </table>
+            </div>
+            <p id="constraint-count" class="muted"></p>
+          </details>
+        </section>
+        <section class="panel" aria-label="历史原始数据合并重算">
+          <details id="reanalysis-panel">
+            <summary>读取历史 / 新采集数据，合并重新标定</summary>
+            <p class="muted">新采集保存为独立记录。显式勾选旧、新记录，逐份读取原始数据并按各自零偏处理，再基于全部所选数据重算。仅支持同一电机、同一种方法、兼容采集方案；不覆盖原记录，不发送运动指令。</p>
+            <div id="reanalysis-sources" class="reanalysis-sources"></div>
+            <button id="reanalyze" class="secondary" type="button" disabled>基于所选原始数据重新计算</button>
+            <p id="reanalysis-status" class="notice" role="status">等待支持离线重算的 Dashboard 服务。</p>
+            <a id="reanalysis-result" href="#" hidden>查看新的标定结果</a>
+          </details>
+        </section>
+        <section class="panel">
+          <div class="heading"><h2>全过程运动记录</h2><div class="legend"><span class="cyan">实测</span><span class="purple">目标 / 命令</span><span class="amber">摩擦前馈</span></div></div>
+          <div class="view-controls"><label>查看实验<select id="history"><option value="">当前实时过程</option></select></label>
+            <button id="live-view" class="secondary small" type="button">回到实时</button>
+            <label>绘图范围<select id="chart-window">
+              <option value="10">最近 10 秒</option><option value="30">最近 30 秒</option>
+              <option value="60" selected>最近 60 秒</option><option value="120">最近 2 分钟</option>
+              <option value="300">最近 5 分钟</option><option value="0">全程概览（降采样）</option>
+            </select></label>
+            <label>回放位置<input id="chart-position" type="range" min="0" max="1" step="0.1" value="1" disabled></label>
+            <button id="chart-follow" class="secondary small" type="button">跟随最新</button></div>
+          <p id="view-notice" class="muted">显示抽样不超过 10 Hz；原始采样不降频，停止后可下载完整 CSV。</p>
+          <p id="chart-window-info" class="muted">实时图默认显示最近 60 秒，每张图最多绘制 1200 点；原始数据完整保存。</p>
+          <div class="plots-grid">
+            <div><h3>位置 / rad</h3><canvas id="position-chart" role="img" aria-label="位置目标与反馈曲线"></canvas></div>
+            <div><h3>速度 / rad/s</h3><canvas id="velocity-chart" role="img" aria-label="速度目标与反馈曲线"></canvas></div>
+            <div class="wide"><h3>力矩 / Nm（电机侧 MIT-PD 时，紫线为编码后合成请求估计）</h3><canvas id="torque-chart" role="img" aria-label="实测力矩、合成请求估计与摩擦前馈曲线"></canvas></div>
+          </div>
+          <div id="downloads" class="downloads"></div>
+          <p><a id="html-report-link" class="html-report-link" target="_blank" rel="noopener noreferrer" hidden>打开完整 HTML 分析报告</a></p>
+          <p id="html-report-hint" class="muted" hidden>只读单文件报告，图表已内嵌，可离线保存。首次生成可能需要稍等，不会启动电机。</p>
+        </section>
+        <section class="panel">
+          <div class="heading"><h2>摩擦辨识</h2><span id="fit-model" class="badge">等待拟合</span></div>
+          <p id="friction-caption" class="muted">采集中显示原始速度—力矩点，尚未扣除惯量和负载，不等于纯摩擦。辨识成功后显示校正窗口与模型。</p>
+          <div class="fit-grid"><div><canvas id="friction-chart" role="img" aria-label="摩擦观测散点与拟合模型曲线"></canvas>
+              <div class="legend"><span class="cyan">正转观测</span><span class="purple">反转观测</span><span class="green">模型曲线</span></div></div>
+            <div><table><thead><tr><th>物理参数</th><th>恢复值</th><th>单位</th></tr></thead><tbody id="parameter-table"></tbody></table>
+              <p id="fit-empty" class="muted">不会把未完成的拟合或默认值显示成标定结果。</p></div></div>
+          <dl id="fit-quality" class="quality"></dl><ul id="fit-warnings" class="warnings"></ul>
+        </section>
+        <section id="fourier-panel" class="panel" hidden>
+          <div class="heading"><h2>傅里叶辨识结果</h2><span class="badge">独立训练与验证轨迹</span></div>
+          <dl id="fourier-quality"></dl>
+          <div class="table-scroll"><table><thead><tr><th>候选参数</th><th>值</th><th>单位</th></tr></thead><tbody id="fourier-parameters"></tbody></table></div>
+          <p id="fourier-notes" class="muted"></p>
+        </section>
+        <section id="precision-panel" class="panel" hidden>
+          <div class="heading"><h2>逐档精度与覆盖验收</h2><span class="badge">目标上限 ±2π rad/s · 60 rpm</span></div>
+          <p class="muted">静摩擦为同向预处理后的多角度起动测量。动摩擦使用整圈力矩—转角功积分；加速和制动不进入正式速度单元，未稳速单元保留并标注质量提示。</p>
+          <div class="precision-scroll"><table>
+            <thead><tr><th>目标 / rad/s</th><th>重复</th><th>实测速度</th><th>平均力矩 / Nm</th><th>重复标准差</th><th>95%界限</th><th>独立验证误差</th></tr></thead>
+            <tbody id="speed-bins"></tbody>
+          </table></div>
+          <h3>静摩擦角度图</h3>
+          <div class="precision-scroll"><table>
+            <thead><tr><th>相对角度 / rad</th><th>方向</th><th>起动力矩 / Nm</th><th>重复标准差</th><th>95%界限</th></tr></thead>
+            <tbody id="static-bins"></tbody>
+          </table></div>
+          <p id="precision-quality" class="muted"></p>
+          <ul id="precision-issues" class="warnings"></ul>
+        </section>
+        <section class="panel" id="comparison-panel">
+          <div class="heading"><h2>补偿效果对比</h2><span class="eyebrow">BASELINE / COMPENSATED</span></div>
+          <p id="comparison-empty" class="muted">选择“摩擦补偿 A/B 对比”：基线轨迹 → 回位 → 同轨迹加补偿 → 停机评估。</p>
+          <div id="comparison"></div>
+          <p class="muted">比较速度/位置误差及反馈控制努力，而非要求电机总力矩下降。实测拖动力需要独立外力传感器。</p>
+        </section>
+        <section class="panel">
+          <div class="heading"><h2>过程事件与结果</h2><span id="run-id" class="muted">尚无实验</span></div>
+          <p id="events-note" class="muted"></p>
+          <ol id="events" class="events"></ol><p id="result-error" class="notice error" hidden></p>
+          <p id="output-path" class="path"></p>
+        </section>
+      </div>
+    </div>
+    <footer>仅用于可信内网，无登录鉴权。关闭页面不会停止已启动的任务，拖动不会定时结束；恢复连接也不会自动开始；
+      请使用“停止”并等待确认失能。软件停止不能替代物理急停。</footer>
+  </main>
+  <dialog id="stage-parameter-dialog" aria-labelledby="stage-parameter-title">
+    <form id="stage-parameter-form">
+      <div class="heading"><h2 id="stage-parameter-title">阶段参数</h2><button id="stage-parameter-close" type="button" class="text-button">关闭</button></div>
+      <p id="stage-parameter-note" class="muted"></p>
+      <p id="stage-parameter-estimate" class="notice"></p>
+      <div class="form-actions">
+        <button id="identification-preset" type="button" class="secondary small" hidden>低速摩擦采样建议</button>
+        <button id="validation-preset" type="button" class="secondary small" hidden>低增益对比预设</button>
+      </div>
+      <div id="stage-parameter-fields" class="fields"></div>
+      <h3>固定保护 / 记录信息（只读）</h3><dl id="stage-parameter-limits"></dl>
+      <p id="stage-parameter-error" class="notice error" role="alert" hidden></p>
+      <div class="form-actions"><button id="stage-parameter-save" type="submit">保存到标定控制</button><button id="stage-parameter-cancel" type="button" class="secondary">取消</button></div>
+      <p class="muted">保存只修改标定草稿；“应用标定设置”或“开始标定”才会原子提交。运行中只读。Esc 仍会请求停止当前电机。</p>
+    </form>
+  </dialog>
+</body>
+</html>

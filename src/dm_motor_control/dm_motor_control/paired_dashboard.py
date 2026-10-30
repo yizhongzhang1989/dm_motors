@@ -352,6 +352,7 @@ class DashboardServer(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "DM-Paired-Control"
+    max_body_bytes = 4096
 
     def setup(self):
         super().setup()
@@ -407,8 +408,8 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", ""))
         except ValueError as error:
             raise ApiError(400, "Content-Length is required") from error
-        if not 0 < length <= 4096:
-            raise ApiError(413, "JSON body must be 1..4096 bytes")
+        if not 0 < length <= self.max_body_bytes:
+            raise ApiError(413, f"JSON body must be 1..{self.max_body_bytes} bytes")
 
         def reject_constant(value):
             raise ValueError(f"Non-finite JSON value: {value}")

@@ -55,8 +55,13 @@ public:
     physics.viscous_friction = parameter<double>("viscous_friction");
     physics.coulomb_friction = parameter<double>("coulomb_friction");
     physics.static_friction = parameter<double>("static_friction");
+    physics.friction_model = parameter<std::string>("friction_model");
+    physics.stribeck_velocity = parameter<double>("stribeck_velocity");
+    physics.friction_negative_scale = parameter<double>("friction_negative_scale");
     physics.gravity_torque = parameter<double>("gravity_torque");
     physics.gravity_offset = parameter<double>("gravity_offset");
+    physics.joint_stiffness = parameter<double>("joint_stiffness");
+    physics.load_torque = parameter<double>("load_torque");
     physics.max_torque = parameter<double>("max_torque");
     physics.no_load_speed = parameter<double>("no_load_speed");
     physics.torque_time_constant = parameter<double>("torque_time_constant");
@@ -271,6 +276,7 @@ private:
     output.anchor_stiffness = model_->parameters().anchor_stiffness;
     output.gravity_torque = physical.gravity_torque; output.friction_torque = physical.friction_torque;
     output.contact_torque = physical.contact_torque; output.net_torque = physical.net_torque;
+    output.load_torque = physical.load_torque;
     output.mechanical_energy = physical.mechanical_energy;
     output.rotor_temperature = physical.rotor_temperature; output.mos_temperature = physical.mos_temperature;
     output.bus_voltage = model_->voltage(); output.external_remaining = model_->external_remaining();
