@@ -245,11 +245,13 @@ class CalibrationNode(Node):
         if self.experiment not in ("calibrate", "validate", "compensate", "breakaway", "precision", "fourier"):
             raise CalibrationError("Unknown calibration experiment")
         precision_values = {name: self.get_parameter("precision_" + name).value for name in asdict(PrecisionSettings())}
-        self.precision_settings = PrecisionSettings.from_mapping(precision_values, steady_budget=self.experiment != "fourier")
+        steady_budget = {"precision": True, "fourier": False}.get(self.experiment)
+        self.precision_settings = PrecisionSettings.from_mapping(precision_values, steady_budget=steady_budget)
         self.acquisition_stages = AcquisitionStages(**{
             name: boolean(name) for name in asdict(AcquisitionStages())})
         if not self.acquisition_stages.collect_warmup:
-            self.precision_settings = replace(self.precision_settings, warmup_repetitions=0, _steady_budget=False)
+            self.precision_settings = replace(self.precision_settings, warmup_repetitions=0,
+                                              _steady_budget=False if steady_budget is not None else None)
         self.precision_warm_limits = self.precision_settings.warmup_limits
         self.fourier_settings = FourierSettings.from_mapping(
             {name: self.get_parameter("fourier_" + name).value for name in asdict(FourierSettings())})
@@ -431,11 +433,13 @@ class CalibrationNode(Node):
         if self.resume_checkpoint is not None and (
                 stages != AcquisitionStages() or any(name in EDITABLE_STAGE_TYPES or name in EDITABLE_CONSTRAINT_TYPES for name in changes)):
             raise CalibrationError("Checkpoint continuation cannot change acquisition stages; use independent recordings and explicit reanalysis")
+        steady_budget = {"precision": True, "fourier": False}.get(values["experiment"])
         precision = PrecisionSettings.from_mapping({
             name: values.get("precision_" + name, self.get_parameter("precision_" + name).value)
-            for name in asdict(PrecisionSettings())}, steady_budget=values["experiment"] != "fourier")
+            for name in asdict(PrecisionSettings())}, steady_budget=steady_budget)
         if not stages.collect_warmup:
-            precision = replace(precision, warmup_repetitions=0, _steady_budget=False)
+            precision = replace(precision, warmup_repetitions=0,
+                                _steady_budget=False if steady_budget is not None else None)
         fourier = FourierSettings.from_mapping({
             name: values.get("fourier_" + name, self.get_parameter("fourier_" + name).value)
             for name in asdict(FourierSettings())})
@@ -716,12 +720,24 @@ class CalibrationNode(Node):
                for position in positions):
             raise CalibrationError("Precision static datum must start inside the native position-command range")
         if configuration is not None:
-            if (not configuration.host_protection_enabled or
-                    not reference_speed * 1.01 < configuration.measured_velocity_limit <= maximum_speed * 1.2 or
-                    not maximum_torque <= configuration.measured_torque_limit <= maximum_torque * 1.5 or
-                    configuration.estimated_torque_limit <= 0 or
+            mismatches = []
+            if not configuration.host_protection_enabled:
+                mismatches.append(f"host_protection_enabled={configuration.host_protection_enabled} (required True)")
+            if not reference_speed * 1.01 < configuration.measured_velocity_limit <= maximum_speed * 1.2:
+                mismatches.append(
+                    f"measured_velocity_limit={configuration.measured_velocity_limit:g} rad/s "
+                    f"(required {reference_speed * 1.01:g} < value <= {maximum_speed * 1.2:g} rad/s)")
+            if not maximum_torque <= configuration.measured_torque_limit <= maximum_torque * 1.5:
+                mismatches.append(
+                    f"measured_torque_limit={configuration.measured_torque_limit:g} Nm "
+                    f"(required {maximum_torque:g} <= value <= {maximum_torque * 1.5:g} Nm)")
+            if (configuration.estimated_torque_limit <= 0 or
                     configuration.estimated_torque_limit > maximum_torque * 1.5):
-                raise CalibrationError("Driver high-speed, torque and host-protection limits must be explicitly configured")
+                mismatches.append(
+                    f"estimated_torque_limit={configuration.estimated_torque_limit:g} Nm "
+                    f"(required 0 < value <= {maximum_torque * 1.5:g} Nm)")
+            if mismatches:
+                raise CalibrationError("Driver high-speed, torque and host-protection limits mismatch: " + "; ".join(mismatches))
 
     def on_state(self, message: MotorState) -> None:
         self.state = message
@@ -1206,7 +1222,9 @@ class CalibrationNode(Node):
                 report[self.experiment + "_progress"] = self.precision_engine.status()
             self.get_logger().error(self.error)
         report.update(status=self.phase, error=self.error, failure_stage=self.failure_stage)
-        self.status_message()
+        display_state = self.status_message()
+        report["dashboard_state"] = {key: display_state[key] for key in (
+            "elapsed", "progress", "stage", "precision", "precision_settings", "fourier_settings")}
         report["events"] = list(self.stage_events)
         report["event_count"] = self.stage_event_count
         report["events_truncated"] = self.stage_event_count > len(self.stage_events)
@@ -1832,7 +1850,9 @@ class CalibrationNode(Node):
         if self.error:
             self.phase = "failed"
         report.update(status=self.phase, error=self.error, failure_stage=self.failure_stage)
-        self.status_message()
+        display_state = self.status_message()
+        report["dashboard_state"] = {key: display_state[key] for key in (
+            "elapsed", "progress", "stage", "precision", "precision_settings", "fourier_settings")}
         report["events"] = list(self.stage_events)
         try:
             atomic_json(self.output / "report.json", report)

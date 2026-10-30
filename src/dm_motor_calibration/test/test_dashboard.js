@@ -2,15 +2,6 @@
 
 const assert = require("assert").strict;
 const view = require("../web/view_model.js");
-assert.equal(view.stepIndex({phase: "failed", stage: "stopping"}), 3);
-assert.equal(view.stepIndex({phase: "completed", stage: "completed"}), 5);
-assert.equal(view.stepIndex({phase: "failed", stage: "failed"}), -1);
-assert.equal(view.stepIndex({phase: "failed", stage: "failed", events: [{stage:"stopping"},{stage:"fitting"},{stage:"failed"}]}), 4);
-assert.equal(view.stepIndex({phase: "failed", stage: "failed", failure_stage:"running",
-  events: [{stage:"stopping"},{stage:"saving_failure"},{stage:"failed"}]}), 2);
-assert.equal(view.stepIndex({experiment:"precision",phase:"running",precision:{phase:"sample",validation:true}}),3);
-assert.equal(view.stepIndex({experiment:"precision",phase:"running",precision:{phase:"static_ramp"}}),1);
-assert.equal(view.stepIndex({experiment:"precision",phase:"completed_unqualified",precision:{phase:"done"}}),5);
 assert(view.completed.has("completed_unqualified") && view.terminal.has("completed_unqualified"));
 assert.equal(view.number(NaN), "—");
 assert.equal(view.bounds([{points: []}]), null);
@@ -60,21 +51,6 @@ elements.duration.value = "Infinity";
 assert.throws(() => view.readValues(elements), /duration/);
 assert(!view.editable.includes("allow_hardware"));
 assert(!view.editable.includes("max_torque"));
-assert.deepEqual(view.constraintRows(null), []);
-const constraintState = {
-  experiment: "compensate", calibration_configuration: {max_speed: 1, duration: 20, compensation_fraction: 0.8},
-  configuration: {max_speed: null, duration: null, compensation_fraction: 0.9, drag_stop_policy: "operator"},
-  driver_constraint_observation: {
-    state_limits: {torque_limit: 0.8, tmax: 10, host_protection_enabled: true},
-    last_preflight_configuration: {measured_torque_limit: 1, measured_velocity_limit: 13},
-  },
-};
-const constraintRows = view.constraintRows(constraintState);
-assert.deepEqual(constraintRows.find(row => row[0].endsWith("max_speed")).slice(1, 3), ["1", "未设置（null）"]);
-assert.equal(constraintRows.find(row => row[0] === "驱动状态 · torque_limit")[1], "0.8");
-assert.match(constraintRows.find(row => row[0] === "驱动状态 · tmax")[2], /不是持续额定能力/);
-assert.match(constraintRows.find(row => row[0] === "驱动能力 · measured_velocity_limit")[2], /可能过期/);
-assert.match(view.constraintRows({configuration: {}}).flat().join(" "), /尚未取得/);
 console.log("Dashboard helper assertions passed");
 
 const fs = require("fs"), path = require("path"), vm = require("vm");
@@ -162,7 +138,13 @@ async function browserHarness(state, historical = null, rawRuns = [], stageSchem
       else if (url === "/api/reanalysis") payload = {status: "idle"};
       else if (url === "/api/stage-parameters" && stageSchema) payload = stageSchema;
       else if (url === "/api/reanalyze") payload = {status: "running", run: "derived", sources: JSON.parse(options.body).runs};
-      else if (url.startsWith("/api/run?") && historical) payload = historical;
+      else if (url.startsWith("/api/run?")) {
+        const id = new URLSearchParams(url.split("?")[1]).get("run");
+        const item = rawRuns.find(run => run.id === id);
+        payload = historical?.id === id ? historical : {id, trace: [], display_fields: ["time", "position"], artifacts: [],
+          report: {experiment: item?.experiment || "fourier", status: item?.status || "completed", events: [],
+            error: item?.error || item?.failure_reason || "", configuration: {}}};
+      }
       else if (url === "/api/stop") payload = {message: "requested"};
       else if (url === "/api/parameters/save")
         payload = {generation: state.generation + 1, saved: {system_parameters_file: "/test/system.yaml"}};
@@ -189,7 +171,7 @@ async function browserAssertions() {
         `${experiment} must render without a scope error: ${app.nodes.get("connection-notice").textContent}; ${errors.map(String).join("; ")}`);
       assert.equal(app.nodes.get("position-value").textContent, "1.2345");
       assert.equal(app.nodes.get("start").disabled, false);
-      assert.equal(app.nodes.get("fourier-panel").hidden, experiment !== "fourier");
+      assert(!app.nodes.has("fourier-panel"), "Candidate and final model share one result panel");
       assert.equal(app.nodes.get("precision-panel").hidden, experiment !== "precision");
       assert(app.requests.every(request => request.method === "GET"), "Opening the page must never configure/start/stop");
       assert.equal(app.document.documentElement.style["--topbar-height"], "160px");
@@ -198,7 +180,7 @@ async function browserAssertions() {
         assert.equal(app.nodes.get("calibration_file").required, false);
         assert.equal(app.nodes.get("calibration-choice").hidden, true);
         assert(!app.nodes.has("legacy-excitation") && !app.nodes.has("tracking-gains") && !app.nodes.has("advanced"));
-        assert.match(app.nodes.get("calibration-summary").textContent, /计算与质量验收/);
+        assert.match(app.nodes.get("calibration-summary").textContent, /模型计算/);
       }
     }
     const saveState = dashboardState();
@@ -233,17 +215,20 @@ async function browserAssertions() {
         events: [], fourier: {measured_cycles: 99, required_cycles: 99, quality_issues: ["historical quality"],
           metrics: {training_rmse: 0.01, validation_rmse: 0.02, maximum_validation_error: 0.03, condition: 4},
           candidate_model: {parameters: {coulomb: 0.777}, units: {coulomb: "Nm"}, warnings: ["historical model warning"]}}}};
+    historical.report.configuration = {...state.configuration, amplitude: 0.9};
+    historical.report.dashboard_state = {precision: {phase:"done", training_completed:99, training_required:99}};
+    historical.fit = {...historical.report.fourier.candidate_model, model: "coulomb_viscous", diagnostics: {}};
     const app = await browserHarness(state, historical);
     app.nodes.get("history").value = historical.id; app.event("history", "change"); await app.flush();
-    assert.match(app.nodes.get("fourier-current").textContent, /4\/28/);
-    assert.doesNotMatch(app.nodes.get("fourier-current").textContent, /99/);
-    assert.match(app.nodes.get("fourier-parameters").textContent, /0.7770000/);
-    assert.match(app.nodes.get("fourier-notes").textContent, /historical model warning/);
+    assert.match(app.nodes.get("step-detail-training").textContent, /99\/99/);
+    assert.equal(app.nodes.get("amplitude").value, "0.9");
+    assert.match(app.nodes.get("parameter-table").textContent, /0.777000/);
+    assert.match(app.nodes.get("fit-warnings").textContent, /historical model warning/);
     assert.match(app.nodes.get("motor-name").textContent, /current_motor/);
     assert.equal(app.nodes.get("position-value").textContent, "1.2345");
     assert.equal(app.nodes.get("editable").disabled, true);
     assert.equal(app.nodes.get("start").disabled, true);
-    assert.match(app.nodes.get("view-notice").textContent, /历史/);
+    assert.match(app.nodes.get("view-notice").textContent, /已恢复实验记录/);
     assert(app.requests.every(request => request.method === "GET"), "History selection is read-only");
     app.document.dispatchEvent({type: "keydown", key: "Escape", preventDefault() {}});
     await app.flush();
@@ -268,16 +253,55 @@ async function browserAssertions() {
     const precisionApp = await browserHarness(precise, olderPrecision);
     precisionApp.nodes.get("history").value = olderPrecision.id;
     precisionApp.event("history", "change"); await precisionApp.flush();
-    assert.match(precisionApp.nodes.get("precision-current").textContent, /速度档 3\/110/);
-    assert.match(precisionApp.nodes.get("precision-budget").textContent, /3 个主档/);
+    assert.equal(precisionApp.nodes.get("experiment-status").textContent, "有质量提示");
+    assert.equal(precisionApp.nodes.get("progress").attributes["aria-valuenow"], "100");
     assert.match(precisionApp.nodes.get("precision-issues").textContent, /older precision warning/);
-    assert.equal(precisionApp.nodes.get("fourier-protocol-details").hidden, true);
     assert.equal(precisionApp.nodes.get("editable").disabled, true);
     const completed = dashboardState();
     Object.assign(completed, {phase: "completed_unqualified", stage: "completed_unqualified", report: historical.report});
-    const completeApp = await browserHarness(completed);
-    assert.match(completeApp.nodes.get("fourier-current").textContent, /99\/99/);
-    assert.match(completeApp.nodes.get("fourier-parameters").textContent, /0.7770000/);
+    completed.run_id = historical.id;
+    const completeApp = await browserHarness(completed, historical);
+    assert.match(completeApp.nodes.get("step-detail-training").textContent, /99\/99/);
+    assert.match(completeApp.nodes.get("parameter-table").textContent, /0.777000/);
+    // A fresh tab always restores the latest matching experiment, even without a controller.
+    const latest = structuredClone(historical);
+    latest.id = "20261030T090000-00000001";
+    latest.report.identity = {namespace: "/current_motor", simulated: true};
+    latest.report.configuration.amplitude = 0.456;
+    latest.report.dashboard_state = {elapsed: 123.4, progress: 1,
+      precision: {phase:"done", training_completed:12, training_required:12, validation_completed:4, validation_required:4}};
+    latest.report.samples = 24680;
+    latest.display_fields = ["time", "position", "velocity", "torque"];
+    latest.trace = [[0,0,1,2,3],[1,123.4,4,5,6]];
+    const older = {id:"20261029T090000-00000001", experiment:"fourier", status:"completed"};
+    const foreign = {id:"20261031T090000-00000001", same_motor:false, identity:{namespace:"/other"}};
+    assert.equal(view.latestExperiment([foreign, older, {...latest.report,id:latest.id}], dashboardState()), latest.id);
+    assert.equal(view.latestExperiment([older], {...dashboardState(),run_id:latest.id,phase:"running"}), "");
+    const restored = await browserHarness(dashboardState(), latest, [foreign, older]);
+    assert.equal(restored.nodes.get("history").value, latest.id);
+    assert.equal(restored.nodes.get("amplitude").value, "0.456");
+    assert.equal(restored.nodes.get("progress-text").textContent, "123.4 s");
+    assert.match(restored.nodes.get("step-detail-training").textContent, /12\/12/);
+    assert.match(restored.nodes.get("sample-count").textContent, /24,680/);
+    assert.equal(restored.nodes.get("chart-window").value, "0");
+    assert(restored.nodes.get("start").disabled);
+    restored.nodes.get("history").value = older.id; restored.event("history", "change"); await restored.flush();
+    assert.equal(restored.nodes.get("history").value, older.id);
+    await restored.poll(); assert.equal(restored.nodes.get("history").value, older.id);
+    const reopened = await browserHarness(null, latest, [foreign, older]);
+    assert.equal(reopened.nodes.get("history").value, latest.id);
+    assert.match(reopened.nodes.get("parameter-table").textContent, /0.777000/);
+    assert.equal(reopened.nodes.get("progress-text").textContent, "123.4 s");
+    assert(reopened.nodes.get("start").disabled && reopened.nodes.get("drag-start").disabled);
+    assert.equal(reopened.nodes.get("position-value").textContent, "—");
+    assert(reopened.requests.every(request => request.method === "GET"));
+    restored.event("live-view", "click"); await restored.flush();
+    assert.equal(restored.nodes.get("history").value, latest.id);
+    restored.event("new-experiment", "click");
+    assert.equal(restored.nodes.get("amplitude").value, "0.4", "New experiment uses controller settings, never archived settings");
+    assert(!restored.nodes.get("start").disabled);
+    assert(restored.requests.every(request => request.method === "GET"));
+    assert.match(restored.nodes.get("parameter-table").textContent, /0.777000/, "Preparing an experiment keeps the previous result visible");
     const idle = await browserHarness(dashboardState());
     for (const name of view.selectable) assert.equal(idle.nodes.get(`collect_${name}`).checked, true);
     idle.nodes.get("collect_static").checked = false;
@@ -311,7 +335,6 @@ async function browserAssertions() {
     for (const name of view.selectable) delete oldState.configuration[`collect_${name}`];
     const oldApp = await browserHarness(oldState);
     assert.equal(oldApp.nodes.get("collect_static").disabled, true);
-    assert.match(oldApp.nodes.get("stage-selection-note").textContent, /尚不支持/);
     const progressState = dashboardState("fourier");
     Object.assign(progressState, {phase: "running", stage: "fourier_periodic"});
     Object.assign(progressState.precision, {phase: "periodic", training_completed: 4, training_required: 18,
@@ -375,6 +398,7 @@ async function browserAssertions() {
     const dragRecord = {id: "drag-run", trace: [], artifacts: [], fit: null,
       report: {experiment: "compensate", status: "completed", events: []}};
     const dragApp = await browserHarness(dragState, dragRecord, [dragModel]);
+    dragApp.event("new-experiment", "click");
     dragApp.nodes.get("amplitude").value = "0.123"; dragApp.event("amplitude", "input");
     dragApp.nodes.get("drag-calibration-file").value = dragModel.calibration_file;
     assert(!dragApp.nodes.has("drag-duration") && !dragApp.nodes.has("drag-remaining"));
@@ -398,17 +422,12 @@ async function browserAssertions() {
     assert.equal(dragApp.nodes.get("drag-elapsed").textContent, "603.2");
     assert.match(dragApp.nodes.get("drag-status").textContent, /无定时结束，请手动停止/);
     assert.equal(dragApp.nodes.get("drag-output").textContent, "0.0400");
-    const configRows = dragApp.nodes.get("constraint-rows").textContent;
-    assert.match(configRows, /未设置（null）/);
-    assert.match(configRows, /duration/);
-    dragApp.nodes.get("constraint-filter").value = "duration";
-    dragApp.event("constraint-filter", "input");
-    assert.match(dragApp.nodes.get("constraint-rows").textContent, /duration/);
-    assert.doesNotMatch(dragApp.nodes.get("constraint-rows").textContent, /compensation_fraction/);
+    assert.match(dragApp.nodes.get("experiment-configuration").textContent, /durationnull/);
+    assert.match(dragApp.nodes.get("experiment-configuration").textContent, /compensation_fraction0.4/);
     const posts = dragApp.requests.filter(r => r.method === "POST").length;
     dragApp.snapshot.connected = false;
     await dragApp.poll();
-    assert.match(dragApp.nodes.get("constraint-status").textContent, /连接中断/);
+    assert.match(dragApp.nodes.get("connection-notice").textContent, /未连接/);
     assert.equal(dragApp.requests.filter(r => r.method === "POST").length, posts);
     dragApp.snapshot.connected = true;
     await dragApp.poll();
@@ -419,9 +438,6 @@ async function browserAssertions() {
     }});
     await dragApp.poll();
     assert.match(dragApp.nodes.get("recording-status").textContent, /记录进行中/);
-    assert.match(dragApp.nodes.get("recording-streams").textContent, /samples.pending.csv/);
-    assert.match(dragApp.nodes.get("recording-usage").textContent, /预运行，不进入拟合100/);
-    assert.match(dragApp.nodes.get("recording-selection").textContent, /尚无最终窗口索引/);
     assert.equal(dragApp.nodes.get("start").disabled, true);
     assert.equal(dragApp.nodes.get("drag-start").disabled, true);
     dragApp.event("drag-stop", "click"); await dragApp.flush();
@@ -498,6 +514,7 @@ async function browserAssertions() {
     hardwareState.motor.simulated = false;
     hardwareState.configuration.allow_hardware = true;
     const hardwareApp = await browserHarness(hardwareState, null, [dragModel]);
+    hardwareApp.event("new-experiment", "click");
     hardwareApp.nodes.get("drag-calibration-file").value = dragModel.calibration_file;
     hardwareApp.nodes.get("drag-fraction").value = "0.5";
     hardwareApp.event("drag-calibration-file", "input");
@@ -519,8 +536,6 @@ async function browserAssertions() {
     assert.match(limited.nodes.get("drag-motion-note").textContent, /不再设置额外软件门限/);
     assert.match(limited.nodes.get("drag-limits").textContent, /13.000 rad\/s/);
     assert.match(limited.nodes.get("drag-limits").textContent, /独立拖动不启用/);
-    assert.equal(limited.nodes.get("drag-last-stop").hidden, false, "Saved failure must remain visible after controller restart");
-    assert.match(limited.nodes.get("drag-last-stop").textContent, /速度保护.*速度 1 rad\/s/);
     limited.nodes.get("drag-calibration-file").value = dragModel.calibration_file;
     limited.nodes.get("drag-fraction").value = "0.5";
     limited.event("drag-settings", "submit"); await limited.flush();

@@ -1,5 +1,6 @@
 import json
 from collections import OrderedDict
+from dataclasses import asdict, replace
 import math
 import os
 from pathlib import Path
@@ -17,8 +18,13 @@ from rclpy.clock import Clock
 from rclpy.task import Future
 from std_srvs.srv import Trigger
 from std_msgs.msg import String
+from common import ConfigManager
 
 from dm_motor_calibration import CalibrationError, FitResult
+from dm_motor_calibration.compensation import CompensationSettings
+from dm_motor_calibration.experiment import AcquisitionStages, ExperimentSettings
+from dm_motor_calibration.fourier_trajectory import FourierSettings
+from dm_motor_calibration.identification import MechanicalOptions
 from dm_motor_calibration.precision import Drive, PrecisionSettings, Sample
 from dm_motor_calibration.ros_node import CalibrationNode
 from dm_motor_calibration.recording import PrecisionRecording
@@ -27,6 +33,90 @@ from dm_motor_interfaces.msg import MotorConfiguration, MotorFeedback, MotorStat
 import test_ros_calibration as calibration_tests
 
 scene = calibration_tests.scene
+
+
+@pytest.fixture
+def settings_controller():
+    # Exercise production validation without creating a ROS node or motor publisher.
+    parameters = {
+        **{"precision_" + name: value for name, value in asdict(PrecisionSettings()).items()},
+        **{"fourier_" + name: value for name, value in asdict(FourierSettings()).items()},
+        **asdict(AcquisitionStages()),
+        **ConfigManager().node_parameters("dm_motor_calibration", "calibration_node"),
+        "experiment": "fourier", "precision_time_budget": 1200.0,
+        "precision_warmup_repetitions": 0, "precision_baseline_time": 20.0,
+    }
+    controller = SimpleNamespace(
+        get_parameter=lambda name: SimpleNamespace(value=parameters[name]),
+        resume_checkpoint=None, rate=200.0, settings=ExperimentSettings(),
+        options=MechanicalOptions(), compensation_settings=CompensationSettings(),
+        constraint_bounds=lambda: {name: {"min": 0, "max": value} for name, value in parameters.items()
+                                   if isinstance(value, (int, float))})
+    return controller
+
+
+@pytest.mark.parametrize("experiment", ["calibrate", "validate", "breakaway", "compensate"])
+@pytest.mark.parametrize("collect_warmup", [True, False])
+def test_inactive_precision_budget_does_not_block_other_experiments(settings_controller, experiment, collect_warmup):
+    changes = {"experiment": experiment, "collect_warmup": collect_warmup}
+    precision = CalibrationNode.validated_settings(settings_controller, changes)[4]
+    assert len(precision.speeds) == 14
+    assert precision.minimum_duration > precision.time_budget == 1200.0
+    precision = CalibrationNode.validated_settings(settings_controller, {
+        **changes, "precision_time_budget": 60.0, "precision_baseline_time": 100.0})[4]
+    assert precision.preparation_minimum_duration > precision.time_budget == 60.0
+
+
+def test_active_precision_budget_still_requires_full_measurements(settings_controller):
+    with pytest.raises(CalibrationError, match="time budget"):
+        CalibrationNode.validated_settings(settings_controller, {"experiment": "precision"})
+
+
+@pytest.mark.parametrize("training,validation", [(True, True), (True, False), (False, True)])
+def test_fourier_budget_covers_only_selected_cycles_and_preparation(settings_controller, training, validation):
+    changes = {"collect_training": training, "collect_validation": validation}
+    *_, precision, fourier = CalibrationNode.validated_settings(settings_controller, changes)
+    planned = replace(fourier, training_enabled=training, validation_enabled=validation)
+    minimum = precision.preparation_minimum_duration + planned.duration
+    accepted = CalibrationNode.validated_settings(settings_controller, {
+        **changes, "precision_time_budget": minimum})[4]
+    assert accepted.time_budget == minimum
+    with pytest.raises(CalibrationError, match="preparation and Fourier cycles"):
+        CalibrationNode.validated_settings(settings_controller, {**changes, "precision_time_budget": minimum - 0.1})
+
+
+@pytest.mark.parametrize("changes", [
+    {"precision_time_budget": float("nan")}, {"precision_time_budget": 15000.0},
+    {"precision_max_torque": 5.0}, {"precision_max_speed": 1.0},
+    {"precision_speeds": [1.0, 0.5, math.tau]}, {"precision_static_angles": [0.0, 1.0, 2.0, 3.0]},
+])
+def test_inactive_precision_budget_keeps_parameter_safety_validation(settings_controller, changes):
+    with pytest.raises(CalibrationError):
+        CalibrationNode.validated_settings(settings_controller, {"experiment": "calibrate", **changes})
+
+
+def test_inactive_precision_budget_is_accepted_during_node_initialization(tmp_path):
+    from rclpy.context import Context
+    from rclpy.parameter import Parameter
+    context = Context()
+    context.init(domain_id=229)
+    controller = None
+    try:
+        controller = CalibrationNode(
+            context=context, namespace=f"/budget_test_{os.getpid()}",
+            parameter_overrides=[Parameter(name, value=value) for name, value in {
+                "motor_namespace": f"/budget_test_{os.getpid()}/motor",
+                "output_directory": str(tmp_path), "experiment": "compensate", "allow_hardware": False,
+                "collect_warmup": False, "precision_warmup_repetitions": 0,
+                "precision_time_budget": 60.0, "precision_baseline_time": 100.0,
+            }.items()])
+        assert controller.phase == "idle" and not controller.motion_requested
+        assert controller.precision_settings.preparation_minimum_duration > 60.0
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        if controller is not None:
+            controller.destroy_node()
+        context.shutdown()
 
 
 def test_precision_launch_starts_only_a_disabled_protected_virtual_scene(tmp_path, monkeypatch):
@@ -92,6 +182,62 @@ def test_precision_refuses_legacy_limits_and_unapproved_hardware():
         CalibrationNode.precision_preflight(controller, state, configuration)
     configuration.measured_velocity_limit = 7.5
     CalibrationNode.precision_preflight(controller, state, configuration)
+
+
+@pytest.fixture
+def precision_preflight_configuration():
+    controller = SimpleNamespace(
+        experiment="precision", precision_settings=PrecisionSettings(warmup_repetitions=0),
+        allow_multiturn=True, run_open=False, precision_engine=None, resume_checkpoint=None)
+    state = MotorState(simulated=False, position=0.0, direction=1.0, software_offset=0.0,
+                       pmax=12.5, velocity_limit=50.0, kp_limit=500.0, kd_limit=1.0,
+                       position_min=-64.0, position_max=64.0)
+    configuration = MotorConfiguration(host_protection_enabled=True, measured_velocity_limit=7.5,
+                                       measured_torque_limit=0.5, estimated_torque_limit=0.5)
+    return controller, state, configuration
+
+
+@pytest.mark.parametrize("field,value,required", [
+    ("measured_velocity_limit", 1.5, "6.34602 < value <= 8.64 rad/s"),
+    ("measured_velocity_limit", math.tau * 1.01, "6.34602 < value <= 8.64 rad/s"),
+    ("measured_velocity_limit", 9.0, "6.34602 < value <= 8.64 rad/s"),
+    ("measured_torque_limit", 0.39, "0.4 <= value <= 0.6 Nm"),
+    ("measured_torque_limit", 1.0, "0.4 <= value <= 0.6 Nm"),
+    ("estimated_torque_limit", 0.0, "0 < value <= 0.6 Nm"),
+    ("estimated_torque_limit", 1.0, "0 < value <= 0.6 Nm"),
+])
+def test_precision_preflight_reports_actual_protection_limits_and_ranges(
+        precision_preflight_configuration, field, value, required):
+    controller, state, configuration = precision_preflight_configuration
+    setattr(configuration, field, value)
+    with pytest.raises(CalibrationError) as rejected:
+        CalibrationNode.precision_preflight(controller, state, configuration)
+    assert f"{field}={value:g}" in str(rejected.value)
+    assert required in str(rejected.value)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("measured_velocity_limit", 7.2 * 1.2),
+    ("measured_torque_limit", 0.4), ("measured_torque_limit", 0.4 * 1.5),
+    ("estimated_torque_limit", 0.4 * 1.5),
+])
+def test_precision_preflight_still_accepts_inclusive_protection_boundaries(
+        precision_preflight_configuration, field, value):
+    controller, state, configuration = precision_preflight_configuration
+    setattr(configuration, field, value)
+    CalibrationNode.precision_preflight(controller, state, configuration)
+
+
+def test_precision_preflight_reports_all_incompatible_protection_fields(precision_preflight_configuration):
+    controller, state, configuration = precision_preflight_configuration
+    configuration.host_protection_enabled = False
+    configuration.measured_velocity_limit = 26.0
+    configuration.measured_torque_limit = configuration.estimated_torque_limit = 1.0
+    with pytest.raises(CalibrationError) as rejected:
+        CalibrationNode.precision_preflight(controller, state, configuration)
+    for field in ("host_protection_enabled=False", "measured_velocity_limit=26",
+                  "measured_torque_limit=1", "estimated_torque_limit=1"):
+        assert field in str(rejected.value)
 
 
 def test_static_review_rechecks_the_original_datum_not_a_second_plan_from_the_last_angle():

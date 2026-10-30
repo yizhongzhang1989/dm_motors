@@ -15,7 +15,7 @@ from rclpy.task import Future
 
 from dm_motor_calibration import ros_node
 from dm_motor_calibration.precision import PrecisionExperiment
-from dm_motor_interfaces.msg import MotorFeedback, MotorRequest, MotorState
+from dm_motor_interfaces.msg import MotorConfiguration, MotorFeedback, MotorRequest, MotorState
 from dm_motor_interfaces.srv import CalibrationControl
 import test_ros_calibration as calibration_tests
 from test_fourier_ros import FOURIER_SCENE
@@ -72,7 +72,7 @@ def test_dashboard_complete_calibration_and_ab_workflow(scene):
     assert scene.state.phase == MotorState.DISABLED
     assert web.current["trace"] == []
     with urlopen(web.url + "/", timeout=3) as page:
-        assert "全过程运动记录" in page.read().decode()
+        assert "运动记录" in page.read().decode()
     original = web.current["state"]["configuration"].copy()
     code, _ = web.request("/api/configure", web.body({"allow_hardware": True}))
     assert code == 400
@@ -102,6 +102,9 @@ def test_dashboard_complete_calibration_and_ab_workflow(scene):
     run = web.current["state"]["run_id"]
     code, details = web.request(f"/api/run?run={run}")
     assert code == 200, details
+    saved_state = details["report"]["dashboard_state"]
+    assert saved_state["elapsed"] > 0 and saved_state["stage"] == "completed"
+    assert "can_start" not in saved_state and "motor" not in saved_state
     assert details["plot"]["kind"] == "corrected_windows"
     assert details["plot"]["residual_rmse"] == pytest.approx(details["fit"]["diagnostics"]["rmse"], abs=1e-10)
     assert details["fit"]["parameters"]["inertia"] == pytest.approx(0.018, rel=0.2)
@@ -194,6 +197,9 @@ def test_baseline_only_dashboard_and_reanalysis_never_enable_motor(scene):
     assert web.current["state"]["phase"] == "completed_unqualified", web.current["state"]["error"]
     assert set(observed) == {MotorState.DISABLED}
     original = web.current["state"]["run_id"]
+    saved = web.request("/api/run?run=" + original)[1]["report"]["dashboard_state"]
+    assert saved["precision"] == web.current["state"]["precision"]
+    assert saved["fourier_settings"] == web.current["state"]["fourier_settings"]
     code, response = web.request("/api/reanalyze", {"runs": [original]})
     assert code == 200, response
     result = {}
@@ -212,7 +218,8 @@ def test_baseline_only_dashboard_and_reanalysis_never_enable_motor(scene):
 def test_stage_parameters_are_atomic_and_update_the_actual_experiment_plan(scene):
     web = start_dashboard(scene)
     code, schema = web.request("/api/stage-parameters")
-    assert code == 200 and len(schema["groups"]) == 9
+    assert code == 200 and set(schema["groups"]) == {
+        "checking", "warmup", "baseline", "static", "training", "validation", "stopping", "saving", "analysis", "constraints"}
     before = web.current["state"]
     changes = {"precision_baseline_time": 3.0, "precision_static_repetitions": 3,
                "precision_static_angles": [-3.141592653589793, -1.5707963267948966, 0.0, 1.5707963267948966],
@@ -234,7 +241,7 @@ def test_stage_parameters_are_atomic_and_update_the_actual_experiment_plan(scene
     assert web.current["state"]["generation"] == generation
     assert web.current["state"]["fourier_settings"]["training_cycles"] == 5
     code, error = web.request("/api/configure", web.body({"fourier_max_torque": 5.0}))
-    assert code == 400, error
+    assert code == 409 and "fourier_max_torque" in error["error"], error
     assert scene.state.phase == MotorState.DISABLED
 
 
@@ -378,7 +385,7 @@ def test_checking_waits_for_post_review_feedback_before_enable(scene, monkeypatc
         controller.phase = "checking"
         controller.pending = Future()
         controller.pending.set_result(SimpleNamespace(
-            success=True, ready=True, configuration=SimpleNamespace(command_timeout=0.25)))
+            success=True, ready=True, configuration=MotorConfiguration(command_timeout=0.25, position_min=-64.0, position_max=64.0)))
         sender = Mock(return_value=(1, Future()))
         monkeypatch.setattr(controller.topics, "send", sender)
         controller.tick()

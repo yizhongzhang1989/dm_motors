@@ -13,7 +13,7 @@ from ament_index_python.packages import get_package_prefix
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-from dm_motor_interfaces.msg import MotorCommand, MotorSetpoint, MotorState, MotorTarget
+from dm_motor_interfaces.msg import MotorCommand, MotorRequest, MotorSetpoint, MotorState, MotorTarget
 from dm_motor_control.topic_client import (
     ControlLease, MotorOperation, RegisterAccess, GetOperation, SetTarget, create_motor_client,
 )
@@ -56,18 +56,24 @@ class SplitProcesses(unittest.TestCase):
             "-r", f"__ns:={self.bus_namespace}", "-p", f"can_bus_namespace:={self.bus_namespace}",
             "-p", "motor_names:=[one,two]", "-p", "motors.one.motor_id:=1",
             "-p", "motors.two.motor_id:=2"])
-        self.start_motor("one", 1)
+        self.start_motor("one", 1, pipe_output=self._testMethodName ==
+                         "test_closed_console_pipe_preserves_control_rate_and_feedback")
         self.start_motor("two", 2)
         self.addCleanup(self.teardown_processes)
         self.wait(lambda: len(self.states) == 2 and all(
             state.ready and state.feedback_fresh for state in self.states.values()), timeout=20)
 
-    def start(self, name, command):
-        log = tempfile.TemporaryFile(mode="w+")
-        self.logs.append((name, log))
-        self.processes[name] = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+    def start(self, name, command, *, pipe_output=False):
+        if pipe_output:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.addCleanup(process.stdout.close)
+        else:
+            log = tempfile.TemporaryFile(mode="w+")
+            self.logs.append((name, log))
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        self.processes[name] = process
 
-    def start_motor(self, name, motor_id):
+    def start_motor(self, name, motor_id, *, pipe_output=False):
         command = [
             str(self.control / "motor_node"), "--ros-args", "-r", f"__ns:={self.namespace}/{name}",
             "-p", f"motor_name:={name}", "-p", f"motor_id:={motor_id}",
@@ -78,7 +84,7 @@ class SplitProcesses(unittest.TestCase):
             command += ["-p", "mode:=2", "-p", "configure_mode_on_startup:=true"]
         if self._testMethodName == "test_fd_motor_uses_native_frames_and_registered_stops":
             command += ["-p", "can_fd:=true"]
-        self.start(name, command)
+        self.start(name, command, pipe_output=pipe_output)
 
     def wait(self, predicate, timeout=5, action=None):
         deadline = time.monotonic() + timeout
@@ -207,6 +213,27 @@ class SplitProcesses(unittest.TestCase):
         self.assertEqual(self.states[name].status, 0, "Target must never automatically re-enable")
         self.node.destroy_publisher(second)
         self.node.destroy_publisher(direct)
+
+    def test_closed_console_pipe_preserves_control_rate_and_feedback(self):
+        process = self.processes["one"]
+        # A detached terminal or log collector can disappear while the driver runs.
+        # The next control-rate change logs before replying to the request.
+        process.stdout.close()
+        client = create_motor_client(self.node, None, "one/control_rate")
+        for rate in (1000.0, 200.0):
+            before = self.states["one"].feedback_count
+            future = client.call_async(MotorRequest(value=rate))
+            self.wait(lambda: future.done() or process.poll() is not None)
+            self.assertIsNone(process.poll(), "Closed log pipe must not terminate the motor driver")
+            response = future.result()
+            self.assertTrue(response.success, response.message)
+            self.assertEqual(response.control_rate, rate)
+            self.wait(lambda: self.states["one"].control_rate == rate and
+                      self.states["one"].feedback_count > before + 20)
+            self.assertTrue(self.states["one"].feedback_fresh)
+            self.assertEqual(self.states["one"].phase, MotorState.DISABLED)
+        self.terminate("one")
+        self.assertEqual(process.returncode, 0)
 
     def test_motor_process_death_does_not_take_down_other_motor_or_bus(self):
         self.enable("one")

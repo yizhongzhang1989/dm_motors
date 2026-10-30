@@ -26,7 +26,7 @@ from dm_motor_interfaces.srv import CalibrationControl
 
 from .data import CalibrationError, FitResult, ModelResult, Trace, read_json
 from .html_report import REPORT_CSP, REPORT_META, REPORT_NAME
-from .report_data import TERMINAL_STATES
+from .report_data import TERMINAL_STATES, csv_rows, reduce_trace
 from .report_jobs import ReportJobs
 from .merged_analysis import ReanalysisJobs
 from .stage_parameters import parameter_schema, workflow_test_profile
@@ -41,6 +41,23 @@ RUN_NAME = re.compile(r"^\d{8}T\d{6}-[0-9a-f]{8}$")
 ARTIFACTS = {"samples.csv", "report.json", "calibration.json", "breakaway.json", "display.json", "precision.json",
              "fourier.json", "static.json", "warmup.json", "recording.json", "feedback.csv", "state.csv", "commands.csv", "events.csv",
              "inputs.json", REPORT_NAME, REPORT_META}
+
+
+def saved_motion(path: Path) -> tuple[list, tuple]:
+    """Recover a whole-run overview without loading an unbounded CSV into RAM."""
+    fields, rows = (), []
+    for row in csv_rows(path):
+        if not fields:
+            fields = tuple(name for name in DISPLAY_FIELDS if name in row)
+            if not {"time", "position", "velocity", "torque"} <= set(fields):
+                raise CalibrationError("Saved motion needs time, position, velocity and torque columns")
+        values = [float(row[name]) for name in fields]
+        if not all(math.isfinite(value) for value in values):
+            raise CalibrationError("Saved motion contains nonfinite samples")
+        rows.append(values)
+        if len(rows) >= 24000:
+            rows = reduce_trace(rows, 12000)
+    return [[index, *row] for index, row in enumerate(reduce_trace(rows, 12000))], fields
 
 
 class Dashboard(Node):
@@ -59,6 +76,11 @@ class Dashboard(Node):
             raise ValueError("controller_namespace must be a valid ROS namespace")
         self.controller = (controller if controller.startswith("/") else
                            self.get_namespace().rstrip("/") + "/" + controller).rstrip("/")
+        # Saved experiments remain readable before the controller reconnects.
+        defaults = config.node_parameters("dm_motor_calibration", "calibration_node")
+        self.report_directory = Path(self.declare_parameter(
+            "output_directory", defaults["output_directory"]).value).expanduser().resolve()
+        self.report_motor = self.declare_parameter("motor_namespace", defaults["motor_namespace"]).value
         self.lock = threading.RLock()
         self.operation_lock = threading.Lock()
         self.state: dict | None = None
@@ -106,6 +128,9 @@ class Dashboard(Node):
             else:
                 self.state = state
                 self.received = time.monotonic()
+                if state["configuration"].get("output_directory"):
+                    self.report_directory = Path(state["configuration"]["output_directory"]).expanduser().resolve()
+                self.report_motor = state["configuration"].get("motor_namespace", getattr(self, "report_motor", ""))
             key = state["controller_id"] + ":" + state["run_id"] + ":" + str(state.get("display_epoch", 0))
             self.buffer.update(key, state["display_total"], rows)
             self.need_snapshot = not self.buffer.complete
@@ -169,6 +194,7 @@ class Dashboard(Node):
         with self.lock:
             connected = self.state is not None and time.monotonic() - self.received < 1.5 and not self.error
             return {"controller": self.controller or "/", "connected": bool(connected),
+                    "report_motor": self.report_motor,
                     "state": self.state, "error": self.error, "stream_id": self.buffer.stream_id,
                     "trace": self.buffer.after(cursor if stream == self.buffer.stream_id else -1),
                     "trace_complete": self.buffer.complete, "display_fields": DISPLAY_FIELDS,
@@ -321,9 +347,9 @@ class Dashboard(Node):
 
     def root(self) -> Path:
         with self.lock:
-            if self.state is None:
-                raise ApiError(503, "尚未收到控制器的报告目录配置")
-            return Path(self.state["configuration"]["output_directory"]).expanduser().resolve()
+            if self.state is not None:
+                return Path(self.state["configuration"]["output_directory"]).expanduser().resolve()
+            return self.report_directory
 
     def artifact(self, run: str, filename: str) -> Path:
         if not RUN_NAME.fullmatch(run) or filename not in ARTIFACTS:
@@ -366,6 +392,9 @@ class Dashboard(Node):
                              tested_calibration=report.get("tested_calibration"),
                              raw_recording=(directory / "recording.json").is_file() and
                              report.get("status") in TERMINAL_STATES)
+                namespace = (report.get("identity") or {}).get("namespace") or report.get("configuration", {}).get("motor_namespace")
+                expected = (self.state or {}).get("configuration", {}).get("motor_namespace") or getattr(self, "report_motor", "")
+                entry["same_motor"] = not expected or not namespace or namespace == expected
                 if report.get("status") == "checking" and self.state and self.state["run_id"] == directory.name:
                     entry.update(status=self.state["phase"], experiment=self.state["experiment"],
                                  samples=self.state["samples"])
@@ -418,11 +447,16 @@ class Dashboard(Node):
         root = self.root()
         artifacts = [name for name in sorted(ARTIFACTS) if (root / run / name).is_file()]
         fit = None
-        if "calibration.json" in artifacts:
-            fit = FitResult.load(self.artifact(run, "calibration.json"))
-        elif isinstance(report.get("source_fit"), dict):
-            source = report["source_fit"]
-            fit = ModelResult.from_mapping(source)
+        model_error = ""
+        try:
+            if "calibration.json" in artifacts:
+                fit = FitResult.load(self.artifact(run, "calibration.json"))
+            elif isinstance(report.get("source_fit"), dict):
+                fit = ModelResult.from_mapping(report["source_fit"])
+            elif isinstance(report.get(report.get("experiment")), dict) and report[report["experiment"]].get("candidate_model"):
+                fit = load_model(self.artifact(run, "report.json"), report=report).result
+        except (CalibrationError, ValueError, OSError) as error:
+            model_error = f"模型读取失败：{error}"
         precision = report.get("experiment") in ("precision", "fourier")
         usage = None
         if precision and "recording.json" in artifacts:
@@ -430,6 +464,8 @@ class Dashboard(Node):
             usage = metadata.get("data_usage")
         manual_drag = report.get("configuration", {}).get("drag_stop_policy") == "operator"
         trace = Trace.read(self.artifact(run, "samples.csv")) if "samples.csv" in artifacts and not (precision or manual_drag) else None
+        display_fields = DISPLAY_FIELDS
+        display = None
         if "display.json" in artifacts:
             display = read_json(self.artifact(run, "display.json"))
             if not isinstance(display, dict) or tuple(display.get("fields", ())) != DISPLAY_FIELDS:
@@ -439,6 +475,14 @@ class Dashboard(Node):
             displayed = buffer.after(-1)
         else:
             displayed = display_trace(trace) if trace is not None else []
+        # Older/offline experiments may have no display cache; a drag cache can
+        # contain only its tail. Stream raw samples with a bounded plot budget.
+        trace_error = ""
+        if "samples.csv" in artifacts and (not displayed or display and display.get("truncated")):
+            try:
+                displayed, display_fields = saved_motion(self.artifact(run, "samples.csv"))
+            except (CalibrationError, ValueError, OSError) as error:
+                trace_error = f"运动记录恢复失败：{error}"
         plot, plot_error = None, ""
         if isinstance(report.get("fourier"), dict):
             plot = report["fourier"].get("validation_friction") or report["fourier"].get("training_friction")
@@ -451,7 +495,7 @@ class Dashboard(Node):
                     plot_error = str(error)
         if precision and isinstance(report.get("precision"), dict):
             points = []
-            for entry in report["precision"]["levels"]:
+            for entry in report["precision"].get("levels", []):
                 if not all(isinstance(entry.get(key), (int, float)) and math.isfinite(entry[key])
                            for key in ("actual_speed", "mean_torque")):
                     continue
@@ -463,9 +507,10 @@ class Dashboard(Node):
         return {"id": run, "report": report, "fit": asdict(fit) if fit else None,
                 "trace": displayed,
                 "raw_samples": report.get("samples", 0) if precision or manual_drag else len(trace.columns["time"]) if trace is not None else 0,
-                "plot": plot, "plot_error": plot_error, "artifacts": artifacts,
+                "plot": plot, "plot_error": plot_error, "model_error": model_error, "trace_error": trace_error,
+                "artifacts": artifacts,
                 "data_usage": {key: value for key, value in usage.items() if key != "segments"} if usage else None,
-                "display_fields": DISPLAY_FIELDS}
+                "display_fields": display_fields}
 
 
 class DashboardServer(SharedServer):

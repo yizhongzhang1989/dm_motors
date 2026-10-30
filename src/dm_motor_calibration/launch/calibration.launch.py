@@ -38,6 +38,7 @@ def launch_calibration(context):
             namespace=value("namespace"), output="screen",
             parameters=[{**dashboard,
                          "host": value("dashboard_host"), "port": port, "config_file": str(config.path),
+                         "output_directory": value("output_directory"), "motor_namespace": value("motor_namespace"),
                          "controller_namespace": "/" + value("namespace").strip("/")}]))
     return nodes
 

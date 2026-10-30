@@ -14,7 +14,7 @@ const CalibrationView = (() => {
     saving_failure: "保存中断 / 失败现场", running: "自动采样 / 实验执行",
     completed: "实验完成 · 结果已保存", failed: "实验失败 / 已中断",
     completed_unqualified: "采集完成 · 有质量提示",
-    recorded: "原始数据已保存 · 待计算",
+    recorded: "原始数据已保存 · 待计算", qualified: "实验完成", incomplete: "实验记录不完整",
     precision_await_warmup_enable: "预运行 / 预热 · 等待使能",
     precision_warmup_ramp: "预运行 / 预热 · 平滑变速",
     precision_warmup_settle: "预运行 / 预热 · 稳速准备",
@@ -58,12 +58,46 @@ const CalibrationView = (() => {
   const bools = new Set(["fit_bias", "fit_gravity", "fit_stiffness", ...selectable.map(name => `collect_${name}`)]);
   const strings = new Set(["experiment", "model", "calibration_file"]);
   const active = new Set(["checking", "arming", "running", "returning", "stopping", "fitting", "resetting"]);
-  const completed = new Set(["completed", "completed_unqualified"]);
-  const terminal = new Set([...completed, "failed"]);
+  const completed = new Set(["completed", "completed_unqualified", "qualified"]);
+  const terminal = new Set([...completed, "failed", "incomplete", "recorded"]);
   const maxChartPoints = 1200;
   const colors = {measured: "#69d6df", target: "#b3a0ff", feedforward: "#f2bc67", fit: "#72dfa8"};
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const number = (value, digits = 4) => finite(value) ? value.toFixed(digits) : "—";
+  function experimentState(detail) {
+    if (!detail?.report) return null;
+    const report = detail.report, saved = report.dashboard_state || {}, config = report.configuration || {};
+    const experiment = report.experiment || "", phase = report.status || "incomplete";
+    const settings = prefix => Object.fromEntries(Object.entries(config)
+      .filter(([name]) => name.startsWith(prefix)).map(([name, value]) => [name.slice(prefix.length), value]));
+    const analysis = report[experiment] || {};
+    const precision = saved.precision || report[`${experiment}_progress`] || {
+      phase: terminal.has(phase) ? "done" : "", warmup: report.warmup || analysis.warmup,
+      static_diagnostics: analysis.static, observations: analysis.observations || [],
+      completed_cells: analysis.measured_cells, cells: analysis.required_cells,
+    };
+    const traceFields = detail.display_fields || [], trace = detail.trace || [];
+    const timeColumn = traceFields.indexOf("time") >= 0 ? traceFields.indexOf("time") + 1
+      : traceFields.indexOf("elapsed") >= 0 ? traceFields.indexOf("elapsed") + 1 : -1;
+    const times = (report.events || []).map(event => event.elapsed).filter(finite);
+    if (trace.length && timeColumn > 0) times.push(trace[trace.length - 1][timeColumn]);
+    return {...saved, run_id: detail.id, experiment, phase, stage: phase,
+      configuration: config, calibration_configuration: config, identity: report.identity,
+      elapsed: finite(saved.elapsed) ? saved.elapsed : times.length ? Math.max(...times) : null,
+      samples: report.samples ?? detail.raw_samples ?? 0, events: report.events || [],
+      stop_confirmed: report.stop_confirmed === true, error: report.error || "",
+      failure_stage: report.failure_stage, report, fit: detail.fit, precision,
+      precision_settings: saved.precision_settings || report.precision?.settings || settings("precision_"),
+      fourier_settings: saved.fourier_settings || report.fourier?.settings || settings("fourier_"),
+      progress: completed.has(phase) ? 1 : saved.progress ?? 0};
+  }
+  function latestExperiment(runs, state, motor = "") {
+    if (state?.run_id && (active.has(state.phase) || state.stage === "stopping")) return "";
+    const namespace = state?.identity?.namespace || state?.configuration?.motor_namespace || motor;
+    const matching = runs.filter(run => run.same_motor !== false &&
+      (!namespace || !run.identity?.namespace || run.identity.namespace === namespace));
+    return matching.map(run => run.id).concat(state?.run_id ? [state.run_id] : []).sort().at(-1) || "";
+  }
   function parseStageValue(text, spec) {
     if (spec.type === "boolean") {
       if (typeof text !== "boolean") throw new Error(`${spec.label} 需要明确的勾选值`);
@@ -131,9 +165,9 @@ const CalibrationView = (() => {
     const p = planning ? null : state.precision, phase = planning ? "idle" : state.phase;
     const stage = planning ? "" : state.stage, local = p?.phase || "";
     const keys = ["checking", "warmup", "baseline", "static", "training", "validation", "stopping", "saving", "analysis"];
-    const labels = ["就绪与安全检查", "预运行", "失能零偏测量", "独立静摩擦",
+    const labels = ["启动检查", "预运行", "零偏测量", "静摩擦",
       fourier ? "傅里叶训练采集" : prepared ? "双向稳速采集" : experiments[state.experiment],
-      "独立验证", "停止与失能确认", "原始数据保存", "计算与质量验收"];
+      "独立验证", "停止确认", "保存记录", "模型计算"];
     let current = "checking";
     if (prepared && (local.includes("warmup") || stage.includes("warmup"))) current = "warmup";
     else if (prepared && ["baseline", "await_enable"].includes(local)) current = "baseline";
@@ -153,9 +187,9 @@ const CalibrationView = (() => {
     if (stage === "stopping") current = "stopping";
     else if (phase === "fitting") current = "analysis";
     if (completed.has(phase)) current = "analysis";
-    const done = completed.has(phase), failed = phase === "failed";
-    const count = (value, total, unit) => `${value ?? 0}/${total ?? "—"} ${unit}` +
-      (total > 0 ? ` · ${Math.min(100, Math.floor(100 * (value || 0) / total))}%` : "");
+    const done = completed.has(phase), failed = ["failed", "incomplete"].includes(phase);
+    const count = (value, total, unit) => `${finite(value) ? value : "—"}/${finite(total) ? total : "—"} ${unit}` +
+      (finite(value) && total > 0 ? ` · ${Math.min(100, Math.floor(100 * (value || 0) / total))}%` : "");
     return keys.map((id, index) => {
       const selected = !selectable.includes(id) || !prepared || selections[`collect_${id}`] !== false;
       const visible = prepared || !["warmup", "baseline"].includes(id) &&
@@ -176,22 +210,22 @@ const CalibrationView = (() => {
           const saved = state.report?.recording_complete || done;
           status = saved ? "已保存" : failed ? "检查报告" : state.run_id ? "持续记录" : "等待";
           kind = saved ? "done" : failed ? "warning" : state.run_id ? "current" : "";
-          detail = `${(state.samples || 0).toLocaleString()} 条原始样本 · 显示抽样不影响原始记录`;
+          detail = "";
         }
         if (id === "analysis" && phase === "completed_unqualified") { status = "未达标"; kind = "warning"; }
         if (p && id === "warmup" && selected && !warmupOff) {
           const w = p.warmup;
           detail = `旋转 ${count(w?.completed_cells, w?.required_cells, "单元")}`;
           if (w?.sine) detail += `\n正弦 ${count(w.sine.completed_cycles, w.sine.required_cycles, "周期")}`;
-          if (current === id) detail += `\n${stages[stage] || stage} · ${number(p.target_speed, 3)} rad/s · ${number(p.sample_revolutions, 2)}/${p.required_revolutions} 圈`;
+          if (!terminal.has(phase) && current === id) detail += `\n${stages[stage] || stage} · ${number(p.target_speed, 3)} rad/s · ${number(p.sample_revolutions, 2)}/${p.required_revolutions} 圈`;
         }
         if (p && id === "baseline") {
           detail = current === id ? `${p.baseline_settling ? "失能稳定等待" : "统计零偏"} · ${number(p.phase_elapsed, 1)} s · ${p.baseline_samples ?? "—"} 样本` : "";
         }
         if (p && id === "static" && selected) {
           const completedTrials = done || motionIndex > 3 ? p.static_trials : p.static_completed ?? Math.max(0, p.static_trial - 1);
-          detail = count(completedTrials, p.static_trials, "次");
-          if (current === id) detail += `\n${p.static_conditioning ? "预处理" : "测量"} · ${number(p.static_angle, 3)} rad · ${stages[stage] || stage}`;
+          detail = finite(p.static_trials) ? count(completedTrials, p.static_trials, "次") : "";
+          if (!terminal.has(phase) && current === id) detail += `\n${p.static_conditioning ? "预处理" : "测量"} · ${number(p.static_angle, 3)} rad · ${stages[stage] || stage}`;
           if (p.static_diagnostics?.qualified === false || state.report?.[state.experiment]?.static?.qualified === false) {
             status = "有质量提示"; kind = "warning";
           }
@@ -206,37 +240,21 @@ const CalibrationView = (() => {
               : (speedCount - 1) * 2 : undefined);
           const finished = p[`${id}_completed`] ?? (done ? total : undefined);
           detail = count(finished, total, fourier ? "周期（含过渡）" : "速度单元");
-          if (current === id) detail += fourier
+          if (!terminal.has(phase) && current === id) detail += fourier
             ? `\n${{0:"训练过渡",1:"训练",2:"验证过渡",3:"验证"}[p.fourier?.role] || "定位 / 回零"} · 第 ${(p.fourier?.cycle ?? -1) + 1} 周期`
             : `\n${stages[stage] || stage} · ${number(p.target_speed, 3)} rad/s · 第 ${p.repetition} 次 · ${number(p.sample_revolutions, 2)}/${p.required_revolutions} 圈`;
         }
         if (id === "stopping" && stage === "stopping") detail = "等待停止请求之后的新鲜失能反馈；请求成功不代表已失能";
-        if (id === "analysis" && phase === "completed_unqualified") detail = "保留数据与诊断，不发布合格补偿模型";
+        if (id === "analysis" && phase === "completed_unqualified") detail = "质量提示见模型结果";
+      }
+      if (phase === "recorded" && selected && !warmupOff) {
+        status = id === "analysis" ? "待计算" : id === "saving" ? "已保存"
+          : id === "stopping" ? state.stop_confirmed ? "已确认" : "待确认" : "完成";
+        kind = id === "analysis" ? "" : "done";
+        detail = "";
       }
       return {id, label: labels[index], selected, visible, status, kind, detail};
     });
-  }
-  function stepIndex(state) {
-    if (["precision", "fourier"].includes(state.experiment)) {
-      const p = state.precision;
-      if (completed.has(state.phase)) return 5;
-      if (!p || p.phase.startsWith("warmup_") || ["baseline", "await_enable", "await_warmup_enable"].includes(p.phase)) return 0;
-      if (p.phase.startsWith("static") || p.phase === "review_static") return 1;
-      if (state.phase === "fitting" || state.phase === "failed") return 5;
-      if (state.stage === "stopping") return 4;
-      return p.validation ? 3 : 2;
-    }
-    if (state.stage === "stopping") return 3;
-    if (state.phase === "failed") {
-      const origin = {idle: 0, checking: 0, arming: 1, running: 2, returning: 2, stopping: 3, fitting: 4}[state.failure_stage];
-      if (origin !== undefined) return origin;
-      const previous = (state.events || []).filter(event => !["failed", "saving_failure"].includes(event.stage)).slice(-1)[0];
-      if (!previous) return -1;
-      const step = {idle: 0, checking: 0, arming: 1, stopping: 3, fitting: 4, completed: 5}[previous.stage];
-      return step === undefined ? 2 : step;
-    }
-    const index = {idle: 0, checking: 0, arming: 1, running: 2, returning: 2, stopping: 3, fitting: 4, completed: 5, failed: -1}[state.phase];
-    return index === undefined ? -1 : index;
   }
   function bounds(series) {
     const points = series.flatMap(item => item.points).filter(p => finite(p[0]) && finite(p[1]));
@@ -333,47 +351,8 @@ const CalibrationView = (() => {
     const match = translations.find(item => message.startsWith(item[0]));
     return match ? `${match[1]} 原始诊断：${message}` : message;
   }
-  function constraintRows(state, schema) {
-    if (!state) return [];
-    const format = value => value === undefined ? "未提供" : value === null ? "未设置（null）"
-      : typeof value === "boolean" ? value ? "true（是）" : "false（否）"
-      : typeof value === "object" ? JSON.stringify(value) : String(value);
-    const config = state.calibration_configuration || state.configuration || {};
-    const effective = state.configuration || {};
-    const rows = [];
-    const keys = [...new Set([...Object.keys(config), ...Object.keys(effective)])].sort();
-    for (const name of keys) {
-      const layer = name.startsWith("precision_") ? "精密 / 预运行"
-        : name.startsWith("fourier_") ? "傅里叶" : name.startsWith("compensation_") ? "补偿"
-        : name.startsWith("drag_") ? "拖动策略" : "应用通用";
-      const label = schema?.fields?.[name]?.label;
-      const groups = Object.values(schema?.groups || {}).filter(group =>
-        [...(group.fields || []), ...(group[state.experiment] || [])].includes(name)).map(group => group.title);
-      const access = groups.length ? `已有阶段参数弹窗：${groups.join(" / ")}（保留校验）`
-        : name === "compensation_fraction" || name === "calibration_file" ? "现有任务 / 拖动表单（保留校验）"
-        : editable.includes(name) ? "现有标定表单 / 参数接口（保留校验）" : "只读；本页不提供写入";
-      rows.push([`${layer} · ${label ? label + "\n" : ""}${name}`, format(config[name]), format(effective[name]), access]);
-    }
-    const driver = state.driver_constraint_observation;
-    for (const [name, value] of Object.entries(driver?.state_limits || {})) {
-      rows.push([`驱动状态 · ${name}`, format(value),
-        ["pmax", "vmax", "tmax"].includes(name) ? "协议映射范围，不是持续额定能力" : "最近状态消息；失联时为旧值",
-        "只读；驱动配置"]);
-    }
-    const capabilities = driver?.last_preflight_configuration;
-    if (capabilities) {
-      for (const [name, value] of Object.entries(capabilities)) {
-        rows.push([`驱动能力 · ${name}`, format(value),
-          "最近一次启动前回读；不是实时重核，驱动重启后可能过期", "只读；驱动配置"]);
-      }
-    } else {
-      rows.push(["驱动能力回读", "尚未取得", "本页不为读取参数而启动电机，也不使用默认值补齐", "只读"]);
-    }
-    if (!driver?.state_limits) rows.push(["驱动状态边界", "当前服务未提供", "需要新版控制器状态；不推测边界", "只读"]);
-    return rows;
-  }
-  return {stages, experiments, models, editable, selectable, stageRows, parseStageValue, stageEstimate, readDragValues, constraintRows, active, completed, terminal, maxChartPoints,
-    bools, colors, finite, number, stepIndex, bounds, readValues, mergeRows, limitRows, windowRows, reason};
+  return {stages, experiments, models, editable, selectable, stageRows, parseStageValue, stageEstimate, readDragValues, experimentState, latestExperiment, active, completed, terminal, maxChartPoints,
+    bools, colors, finite, number, bounds, readValues, mergeRows, limitRows, windowRows, reason};
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = CalibrationView;

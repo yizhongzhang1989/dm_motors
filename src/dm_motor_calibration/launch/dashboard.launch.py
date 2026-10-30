@@ -27,6 +27,7 @@ def launch_dashboard(context):
                  namespace=value("namespace"), output="screen",
                  parameters=[{**parameters,
                               "host": value("dashboard_host"), "port": port,
+                              "output_directory": value("output_directory"), "motor_namespace": value("motor_namespace"),
                               "controller_namespace": value("controller_namespace"), "config_file": str(config.path)}])]
 
 
@@ -36,5 +37,7 @@ def generate_launch_description():
         DeclareLaunchArgument("namespace", default_value=ConfigValue("namespace", PACKAGE, LAUNCH)),
         DeclareLaunchArgument("controller_namespace", default_value=ConfigValue(
             "controller_namespace", PACKAGE, LAUNCH, (PACKAGE, "dashboard"))),
+        *(DeclareLaunchArgument(name, default_value=ConfigValue(name, PACKAGE, LAUNCH, (PACKAGE, "calibration_node")))
+          for name in ("output_directory", "motor_namespace")),
         *dashboard_arguments(PACKAGE, LAUNCH), OpaqueFunction(function=launch_dashboard),
     ])

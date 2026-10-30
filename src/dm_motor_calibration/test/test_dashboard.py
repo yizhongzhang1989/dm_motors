@@ -225,7 +225,7 @@ def test_http_static_read_only_and_control_validation(tmp_path):
     connection = HTTPConnection(*server.server_address, timeout=4)
     try:
         for path, expected in (("/", b"friction-chart"), ("/dashboard.js", b"mergeRows"),
-                               ("/view_model.js", b"stepIndex"), ("/dashboard.css", b".steps")):
+                               ("/view_model.js", b"stageRows"), ("/dashboard.css", b".steps")):
             connection.request("GET", path)
             response = connection.getresponse()
             assert response.status == 200
@@ -272,7 +272,7 @@ def test_unqualified_precision_history_keeps_measured_points_without_a_loadable_
                   {"actual_speed": -1.0, "mean_torque": -0.13, "ci95": 0.006},
                   {"actual_speed": None, "mean_torque": None, "ci95": None}]}}
     (directory / "report.json").write_text(json.dumps(report))
-    (directory / "samples.csv").write_text("Raw precision data must not be loaded as an in-memory history trace.\n")
+    (directory / "samples.csv").write_text("time,position,velocity,torque\n0,0,1,0.12\n1,0,-1,-0.13\n")
     node = fake_node(tmp_path)
     result = node.run_details(run)
     assert result["fit"] is None and result["raw_samples"] == 1000000
@@ -320,11 +320,10 @@ def test_dashboard_layout_separates_live_controls_from_viewed_results():
         attrs, ancestors = parser.elements["collect_" + name]
         assert attrs["form"] == "settings" and attrs["type"] == "checkbox" and "checked" in attrs
         assert "steps" in ancestors
-    for identifier in ("settings", "stage-label", "steps", "progress", "precision-current",
-                       "fourier-current", "fourier-protocol", "limits"):
+    for identifier in ("settings", "stage-label", "steps", "progress", "new-experiment"):
         assert "control-column" in parser.elements[identifier][1]
     for identifier in ("history", "position-chart", "velocity-chart", "torque-chart", "friction-chart",
-                       "fourier-parameters", "fourier-quality", "speed-bins", "static-bins",
+                       "parameter-table", "fit-quality", "speed-bins", "static-bins",
                        "comparison", "events", "html-report-link"):
         assert "observations" in parser.elements[identifier][1]
     assert "process" in parser.elements["settings"][1]
@@ -341,3 +340,92 @@ def test_dashboard_layout_separates_live_controls_from_viewed_results():
     assert parser.elements["start"][0]["form"] == "settings"
     assert parser.elements["start"][0]["type"] == "submit"
     assert parser.elements["stop"][0]["type"] == "button"
+
+    for identifier in ("drag-details", "parameter-save-section", "experiment-details", "reanalysis-panel"):
+        assert "open" not in parser.elements[identifier][0]
+    for identifier in ("constraint-overview", "fourier-panel", "recording-streams"):
+        assert identifier not in parser.elements
+
+
+def test_saved_experiment_is_readable_without_a_controller_after_dashboard_restart(tmp_path):
+    run = "20261030T090000-01020304"
+    directory = tmp_path / run
+    directory.mkdir()
+    saved_state = {"elapsed": 120.5, "progress": 1, "stage": "completed",
+                   "precision": None, "precision_settings": {}, "fourier_settings": {}}
+    report = {"status": "completed", "experiment": "calibrate", "samples": 12050,
+              "identity": {"namespace": "/motor_2", "simulated": True}, "stop_confirmed": True,
+              "configuration": {"amplitude": 0.4, "motor_namespace": "/motor_2"},
+              "events": [{"stage": "completed", "elapsed": 120.5}], "dashboard_state": saved_state}
+    (directory / "report.json").write_text(json.dumps(report))
+    (directory / "display.json").write_text(json.dumps({"fields": DISPLAY_FIELDS, "trace": [record(0), record(1)]}))
+    calibration().save(directory / "calibration.json", report["identity"])
+    results = []
+    for _ in range(2):
+        dashboard = fake_node(tmp_path)
+        dashboard.state = None
+        dashboard.report_directory, dashboard.report_motor = tmp_path, "/motor_2"
+        assert dashboard.runs()[0]["same_motor"]
+        results.append(dashboard.run_details(run))
+        dashboard.operate.assert_not_called()
+        dashboard.stop.assert_not_called()
+    assert results[0] == results[1]
+    assert results[1]["report"]["dashboard_state"] == saved_state
+    assert results[1]["trace"] == [record(0), record(1)]
+    assert results[1]["fit"]["parameters"] == calibration().parameters
+
+
+@pytest.mark.parametrize("truncated_cache", [False, True])
+def test_saved_motion_recovers_entire_experiment_with_bounded_memory(tmp_path, truncated_cache):
+    from dm_motor_calibration.dashboard import saved_motion
+    run = "20261030T090000-01020304"
+    directory = tmp_path / run
+    directory.mkdir()
+    report = {"status": "failed", "experiment": "precision", "samples": 30000,
+              "error": "Operator stop", "configuration": {}}
+    (directory / "report.json").write_text(json.dumps(report))
+    source = directory / "samples.csv"
+    with source.open("w") as stream:
+        stream.write("time,position,velocity,torque\n")
+        for index in range(30000):
+            stream.write(f"{index / 100},{index % 10},{2 if index == 123 else 0},{-3 if index == 24567 else 0}\n")
+    if truncated_cache:
+        (directory / "display.json").write_text(json.dumps(
+            {"fields": DISPLAY_FIELDS, "trace": [record(0)], "truncated": True}))
+    result = fake_node(tmp_path).run_details(run)
+    assert result["trace_error"] == ""
+    assert result["display_fields"] == ("time", "position", "velocity", "torque")
+    assert 2 <= len(result["trace"]) <= 12000
+    assert result["trace"][0][1] == 0 and result["trace"][-1][1] == 299.99
+    assert max(row[3] for row in result["trace"]) == 2
+    assert min(row[4] for row in result["trace"]) == -3
+    assert result["report"]["error"] == "Operator stop"
+    source.write_text("time,position,velocity,torque\n0,0,nan,0\n")
+    with pytest.raises(CalibrationError, match="nonfinite"):
+        saved_motion(source)
+    broken = fake_node(tmp_path).run_details(run)
+    assert "nonfinite" in broken["trace_error"]
+    assert broken["report"] == report
+
+
+def test_unqualified_candidate_restores_in_the_single_model_result(tmp_path):
+    from dataclasses import asdict
+    run = "20261030T090000-01020304"
+    directory = tmp_path / run
+    directory.mkdir()
+    report = {"status": "completed_unqualified", "experiment": "fourier", "qualified": False,
+              "stop_confirmed": True, "identity": {"simulated": True, "motor_id": 1},
+              "fourier": {"candidate_model": asdict(calibration()), "quality_issues": ["High validation error"],
+                          "metrics": {"training_rmse": .01, "validation_rmse": .04, "maximum_validation_error": .1,
+                                      "rmse_limit": .02, "max_error_limit": .05},
+                          "validation": {"velocity_min": -.8, "velocity_max": .8}}}
+    path = directory / "report.json"
+    path.write_text(json.dumps(report))
+    original = path.read_bytes()
+    result = fake_node(tmp_path).run_details(run)
+    assert result["model_error"] == ""
+    assert result["fit"]["parameters"] == calibration().parameters
+    assert result["fit"]["diagnostics"]["validation_rmse"] == .04
+    assert result["report"]["status"] == "completed_unqualified"
+    assert "calibration.json" not in result["artifacts"]
+    assert path.read_bytes() == original

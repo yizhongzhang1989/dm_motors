@@ -72,6 +72,7 @@ def compose(context):
         actions.append(Node(package=PACKAGE, executable="dashboard.py", name="calibration_dashboard",
                             namespace=value("namespace"), output="screen",
                             parameters=[{**dashboard, "config_file": str(config.path), "host": value("dashboard_host"),
+                                         "output_directory": parameters["output_directory"], "motor_namespace": value("motor_namespace"),
                                          "port": port, "controller_namespace": "/" + value("namespace").strip("/")}]))
     return actions
 

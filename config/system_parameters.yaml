@@ -6,7 +6,7 @@ motors:
       calibrations:
         mechanical:
           schema: 3
-          qualified: false
+          qualified: true
           identity:
             motor_id: 1
             mode: 1
@@ -18,38 +18,34 @@ motors:
           fit:
             model: coulomb_viscous
             parameters:
-              inertia: 0.001817291286003409
-              bias: -0.00583493194362546
-              gravity_sin: -0.0008659847707264657
-              gravity_cos: 0.00017346963146845816
-              coulomb: 0.14473394024245537
-              viscous: 0.0068376949016166495
+              inertia: 0.0038742723463633427
+              bias: -0.0005889825793854415
+              coulomb: 0.1416881637628295
+              viscous: 1.1849527629928617e-23
             units:
               inertia: kg*m^2
               bias: Nm
-              gravity_sin: Nm
-              gravity_cos: Nm
               coulomb: Nm
               viscous: Nm/(rad/s)
             domain:
-              velocity_min: -22.792950993783574
-              velocity_max: 22.73916198296635
-              position_min: -3.117393106829547
-              position_max: 3.013538134151028
-              temperature_min: 25.99999999999909
-              temperature_max: 27.000000000003865
-          source: /home/robot/.ros/dm_motor_calibration/20261030T040447-ac161093/report.json
+              velocity_min: -0.41082839909298696
+              velocity_max: 0.3914534530874406
+              position_min: -0.39424412147926624
+              position_max: 0.30042285036783944
+              temperature_min: 27.0
+              temperature_max: 27.0
+          source: /home/robot/.ros/dm_motor_calibration/20261030T055853-8c3a2b81/calibration.json
           approval:
             user_accepted: true
-            saved_at: '2026-10-30T04:45:25.846698+00:00'
-            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T044508-253061f9/report.json
+            saved_at: '2026-10-30T06:11:19.287517+00:00'
+            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T061057-e5418e38/report.json
   /motor_2:
     description: Leader/follower axis 2
     hardware:
       calibrations:
         mechanical:
           schema: 3
-          qualified: false
+          qualified: true
           identity:
             motor_id: 2
             mode: 1
@@ -61,28 +57,24 @@ motors:
           fit:
             model: coulomb_viscous
             parameters:
-              inertia: 0.0018622973159662015
-              bias: -0.004679872936909665
-              gravity_sin: 0.0012023592424584462
-              gravity_cos: 0.0005447651095464813
-              coulomb: 0.10659702467876281
-              viscous: 0.0085633000488112
+              inertia: 0.0014637501871318296
+              bias: -0.0020214819187987522
+              coulomb: 0.10164556437387359
+              viscous: 1.302478596080289e-16
             units:
               inertia: kg*m^2
               bias: Nm
-              gravity_sin: Nm
-              gravity_cos: Nm
               coulomb: Nm
               viscous: Nm/(rad/s)
             domain:
-              velocity_min: -22.831125540859098
-              velocity_max: 22.802516365513636
-              position_min: -3.1462716889373965
-              position_max: 2.9932809120554014
-              temperature_min: 25.99999999999909
-              temperature_max: 26.000000000001933
-          source: /home/robot/.ros/dm_motor_calibration/20261030T041257-25c631d6/report.json
+              velocity_min: -0.32715376170404525
+              velocity_max: 0.3227948923915729
+              position_min: -0.4430571017880549
+              position_max: 0.3637636809997691
+              temperature_min: 26.0
+              temperature_max: 26.0
+          source: /home/robot/.ros/dm_motor_calibration/20261030T055934-dfaba92f/calibration.json
           approval:
             user_accepted: true
-            saved_at: '2026-10-30T04:44:48.108550+00:00'
-            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T044427-15a9e4fc/report.json
+            saved_at: '2026-10-30T06:11:12.121757+00:00'
+            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T061039-a64cb7f4/report.json

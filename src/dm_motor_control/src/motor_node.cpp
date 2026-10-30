@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -1653,6 +1654,8 @@ private:
 
 int main(int argc, char ** argv)
 {
+  // A disconnected console/log collector must not abort control or shutdown handling.
+  std::signal(SIGPIPE, SIG_IGN);
   rclcpp::init(argc, argv);
   std::shared_ptr<dm_motor::MotorNode> node;
   int result = 0;

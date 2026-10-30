@@ -93,10 +93,10 @@ class PrecisionSettings:
     approach: float = 0.03
     home_tolerance: float = 0.003
     neutral_time: float = 1.0
-    _steady_budget: InitVar[bool] = True
+    _steady_budget: InitVar[bool | None] = True
 
     @classmethod
-    def from_mapping(cls, values: Mapping[str, object], *, steady_budget: bool = True) -> "PrecisionSettings":
+    def from_mapping(cls, values: Mapping[str, object], *, steady_budget: bool | None = True) -> "PrecisionSettings":
         values = {**LEGACY_CONDITIONING_DEFAULTS, "static_conditioning_repetitions": 0, "baseline_settle_time": 0.0,
                   "warmup_repetitions": 0, "zero_position": 0.0, **values}
         defaults = asdict(cls())
@@ -124,7 +124,7 @@ class PrecisionSettings:
                 validated[name] = float(value)
         return cls(**validated, _steady_budget=steady_budget)
 
-    def __post_init__(self, _steady_budget: bool = True):
+    def __post_init__(self, _steady_budget: bool | None = True):
         for name, value in vars(self).items():
             if name in ("speeds", "static_angles", "static_conditioning_repetitions", "warmup_repetitions",
                         "warmup_profile", "warmup_speeds"):
@@ -178,9 +178,11 @@ class PrecisionSettings:
             raise CalibrationError("Invalid precision feedback deadlines")
         if self.time_budget > 14400 or self.max_travel <= self.required_travel:
             raise CalibrationError(f"Precision requires travel > {self.required_travel:.3f} rad and a finite <=4h budget")
-        minimum = self.minimum_duration if _steady_budget else self.preparation_minimum_duration
-        if self.time_budget < minimum:
-            raise CalibrationError("Precision time budget cannot cover the requested full-revolution measurements")
+        # None keeps all parameter checks while this acquisition plan is inactive.
+        if _steady_budget is not None:
+            minimum = self.minimum_duration if _steady_budget else self.preparation_minimum_duration
+            if self.time_budget < minimum:
+                raise CalibrationError("Precision time budget cannot cover the requested full-revolution measurements")
 
     def tolerance(self, speed: float) -> float:
         return max(self.speed_tolerance, abs(speed) * self.relative_speed_tolerance)

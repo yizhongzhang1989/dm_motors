@@ -68,12 +68,14 @@ def test_optional_port_and_namespace_are_consistent(monkeypatch, port, count):
 
 
 def test_standalone_dashboard_does_not_start_a_controller(monkeypatch):
-    module, context = load("dashboard.launch.py", controller_namespace="/bench/cal")
+    module, context = load("dashboard.launch.py", controller_namespace="/bench/cal", output_directory="/tmp/bench-results", motor_namespace="/bench/motor")
     monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
     monkeypatch.setattr(module, "check_endpoints", lambda *_: None)
     nodes = module.launch_dashboard(context)
     assert len(nodes) == 1 and nodes[0]["executable"] == "dashboard.py"
     assert nodes[0]["parameters"][0]["controller_namespace"] == "/bench/cal"
+    assert nodes[0]["parameters"][0]["output_directory"] == "/tmp/bench-results"
+    assert nodes[0]["parameters"][0]["motor_namespace"] == "/bench/motor"
     context.launch_configurations["dashboard_port"] = "''"
     assert module.launch_dashboard(context) == []
 
