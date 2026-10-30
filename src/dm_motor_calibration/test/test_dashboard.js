@@ -145,7 +145,7 @@ async function browserHarness(state, historical = null, rawRuns = [], stageSchem
   const requests = [], timers = [];
   const snapshot = {state, connected: true, services_ready: true, trace: [], display_fields: ["time", "position"],
     stream_id: "browser-test", display_count: 0, trace_complete: true, capabilities: {
-      reanalysis: true, drag_control: true, drag_manual_motion: true, drag_manual_stop: true,
+      reanalysis: true, manual_parameter_save: true, drag_control: true, drag_manual_motion: true, drag_manual_stop: true,
       drag_operator_speed: true, fault_reset: true, stage_parameters: Boolean(stageSchema)}};
   const context = {
     CalibrationView: view, document, window: {devicePixelRatio: 1, scrollY: 0}, Option: OptionElement,
@@ -164,6 +164,8 @@ async function browserHarness(state, historical = null, rawRuns = [], stageSchem
       else if (url === "/api/reanalyze") payload = {status: "running", run: "derived", sources: JSON.parse(options.body).runs};
       else if (url.startsWith("/api/run?") && historical) payload = historical;
       else if (url === "/api/stop") payload = {message: "requested"};
+      else if (url === "/api/parameters/save")
+        payload = {generation: state.generation + 1, saved: {system_parameters_file: "/test/system.yaml"}};
       else if (url === "/api/start" || url === "/api/configure" || url === "/api/drag/start" ||
         url === "/api/fault/reset") payload = {generation: state.generation + 1};
       else throw new Error(`Unexpected dashboard request ${url}`);
@@ -199,6 +201,29 @@ async function browserAssertions() {
         assert.match(app.nodes.get("calibration-summary").textContent, /计算与质量验收/);
       }
     }
+    const saveState = dashboardState();
+    saveState.system_parameters_file = "/test/system.yaml";
+    saveState.identity = {namespace: "/current_motor", simulated: true};
+    const saveRun = {id: "20261030T040000-12345678", eligible: true, automatic_qualified: false, calibration_file: "/test/report.json",
+      model: "coulomb_viscous", save_test_run: "20261030T041000-87654321"};
+    const saveApp = await browserHarness(saveState, null, [saveRun]);
+    assert.match(saveApp.nodes.get("drag-calibration-file").textContent, /自动指标未达标/);
+    assert.match(saveApp.nodes.get("parameter-save-model").textContent, /自动指标未达标/);
+    saveApp.nodes.get("parameter-save-model").value = saveRun.id;
+    saveApp.event("parameter-save-model", "change");
+    assert(saveApp.nodes.get("parameter-save-submit").disabled);
+    saveApp.nodes.get("parameter-save-confirm").checked = true;
+    saveApp.event("parameter-save-confirm", "change");
+    assert(!saveApp.nodes.get("parameter-save-submit").disabled);
+    assert(saveApp.requests.every(request => request.method === "GET"));
+    saveApp.event("parameter-save-form", "submit"); await saveApp.flush();
+    const saveRequest = saveApp.requests.find(request => request.url === "/api/parameters/save");
+    assert.deepEqual(saveRequest.body, {run: saveRun.id, test_run: saveRun.save_test_run, confirm: true,
+      controller_id: saveState.controller_id, generation: saveState.generation});
+    assert.match(saveApp.nodes.get("parameter-save-action").textContent, /已保存/);
+    assert(!saveApp.nodes.get("parameter-save-confirm").checked);
+    assert(saveApp.nodes.get("parameter-save-submit").disabled);
+    assert(markup.indexOf('id="parameter-save-panel"') > markup.indexOf('id="drag-panel"'));
     const state = dashboardState();
     Object.assign(state, {phase: "running", stage: "fourier_periodic", can_start: false, stop_confirmed: false, run_id: "current-run"});
     state.precision.phase = "periodic";

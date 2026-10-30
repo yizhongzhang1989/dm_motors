@@ -1,0 +1,88 @@
+version: 1
+motors:
+  /motor_1:
+    description: Leader/follower axis 1
+    hardware:
+      calibrations:
+        mechanical:
+          schema: 3
+          qualified: false
+          identity:
+            motor_id: 1
+            mode: 1
+            direction: 1.0
+            software_offset: 0.0
+            pmax: 12.5
+            vmax: 50.0
+            tmax: 10.0
+          fit:
+            model: coulomb_viscous
+            parameters:
+              inertia: 0.001817291286003409
+              bias: -0.00583493194362546
+              gravity_sin: -0.0008659847707264657
+              gravity_cos: 0.00017346963146845816
+              coulomb: 0.14473394024245537
+              viscous: 0.0068376949016166495
+            units:
+              inertia: kg*m^2
+              bias: Nm
+              gravity_sin: Nm
+              gravity_cos: Nm
+              coulomb: Nm
+              viscous: Nm/(rad/s)
+            domain:
+              velocity_min: -22.792950993783574
+              velocity_max: 22.73916198296635
+              position_min: -3.117393106829547
+              position_max: 3.013538134151028
+              temperature_min: 25.99999999999909
+              temperature_max: 27.000000000003865
+          source: /home/robot/.ros/dm_motor_calibration/20261030T040447-ac161093/report.json
+          approval:
+            user_accepted: true
+            saved_at: '2026-10-30T04:45:25.846698+00:00'
+            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T044508-253061f9/report.json
+  /motor_2:
+    description: Leader/follower axis 2
+    hardware:
+      calibrations:
+        mechanical:
+          schema: 3
+          qualified: false
+          identity:
+            motor_id: 2
+            mode: 1
+            direction: 1.0
+            software_offset: 0.0
+            pmax: 12.5
+            vmax: 50.0
+            tmax: 10.0
+          fit:
+            model: coulomb_viscous
+            parameters:
+              inertia: 0.0018622973159662015
+              bias: -0.004679872936909665
+              gravity_sin: 0.0012023592424584462
+              gravity_cos: 0.0005447651095464813
+              coulomb: 0.10659702467876281
+              viscous: 0.0085633000488112
+            units:
+              inertia: kg*m^2
+              bias: Nm
+              gravity_sin: Nm
+              gravity_cos: Nm
+              coulomb: Nm
+              viscous: Nm/(rad/s)
+            domain:
+              velocity_min: -22.831125540859098
+              velocity_max: 22.802516365513636
+              position_min: -3.1462716889373965
+              position_max: 2.9932809120554014
+              temperature_min: 25.99999999999909
+              temperature_max: 26.000000000001933
+          source: /home/robot/.ros/dm_motor_calibration/20261030T041257-25c631d6/report.json
+          approval:
+            user_accepted: true
+            saved_at: '2026-10-30T04:44:48.108550+00:00'
+            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T044427-15a9e4fc/report.json

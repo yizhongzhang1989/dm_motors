@@ -49,11 +49,30 @@ std::string default_config_path()
   return ament_index_cpp::get_package_share_directory("common") + "/config/runtime.yaml";
 }
 
+YAML::Node load_yaml(const std::string & path)
+{
+  auto root = YAML::LoadFile(path);
+  validate(root);
+  return root;
+}
+
+bool Config::has(const std::string & key) const
+{
+  std::istringstream parts(key);
+  std::string part;
+  YAML::Node node = root_;
+  while (std::getline(parts, part, '.')) {
+    const YAML::Node current = node;
+    if (!current.IsMap() || !current[part]) {return false;}
+    node.reset(current[part]);
+  }
+  return true;
+}
+
 Config::Config(const std::string & path) : path_(path)
 {
   try {
-    root_ = YAML::LoadFile(path_);
-    validate(root_);
+    root_ = load_yaml(path_);
     if (get<int>("version") != 2) {throw std::runtime_error("expected configuration version: 2");}
     if (!lookup("packages").IsMap()) {throw std::runtime_error("packages must be a mapping");}
   } catch (const std::exception & error) {

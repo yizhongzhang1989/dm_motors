@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .data import CalibrationError, FitResult, Trace
+from .data import CalibrationError, ModelResult, Trace
 from .identification import MechanicalCandidate, MechanicalOptions, mechanical_windows
 from .models import MODELS
 from .experiment import AcquisitionStages
@@ -98,14 +98,14 @@ def display_trace(trace: Trace, limit: int = 3000) -> list[list[float]]:
             for sequence, index in enumerate(indices)]
 
 
-def model_curves(result: FitResult | MechanicalCandidate) -> list[list[list[float]]]:
+def model_curves(result: ModelResult | MechanicalCandidate) -> list[list[list[float]]]:
     friction = result.friction()
     velocities = (np.linspace(result.domain["velocity_min"], -1e-6, 120),
                   np.linspace(1e-6, result.domain["velocity_max"], 120))
     return [np.column_stack((velocity, friction.torque(velocity))).tolist() for velocity in velocities]
 
 
-def friction_plot(trace: Trace, result: FitResult | MechanicalCandidate, *, limit: int | None = 3000) -> dict:
+def friction_plot(trace: Trace, result: ModelResult | MechanicalCandidate, *, limit: int | None = 3000) -> dict:
     required = ("integration_window", "min_speed", "max_gap")
     if not all(name in result.diagnostics for name in required):
         raise CalibrationError("This older calibration has no recorded window gates; corrected friction points are unavailable")

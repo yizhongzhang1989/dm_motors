@@ -68,6 +68,9 @@ packages:
 不能把 `preview.launch.py` 拆成三层路径。
 `system` 等业务数据可放在对应 launch 下，但 `common` 不解释它们。
 本工作空间由 `dm_motor_control.launch_utils` 解析 `system` 拓扑，而不是由公共包解析。
+顶层 `system_parameters_file` 也是业务引用，由 `dm_motor_control.system_parameters`
+解析为共享电机参数文件；`common` 本身不读取或写入其中的标定数据。
+该文件与运行配置一起安装到 `share/common/config`，具体结构见[工作空间说明](../../README.md#共享系统参数与标定结果)。
 
 ### 可选的启动变体
 

@@ -6,7 +6,7 @@ from typing import TypedDict
 
 import numpy as np
 
-from .data import CalibrationError, FitResult, Trace
+from .data import CalibrationError, ModelResult, Trace
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class CompensationSettings:
 
 
 class FrictionCompensator:
-    def __init__(self, result: FitResult, settings: CompensationSettings | None = None):
+    def __init__(self, result: ModelResult, settings: CompensationSettings | None = None):
         self.model = result.friction()
         self.settings = settings or CompensationSettings()
         self.positive_limit = result.domain["velocity_max"]

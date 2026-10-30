@@ -2,6 +2,7 @@
 # nodes: defaults for direct executables; launches: arguments and per-component overrides.
 # Omitted CLI arguments use this config; '' disables a dashboard and {} disables a port mapping.
 version: 2
+system_parameters_file: system_parameters.yaml
 packages:
   can_bus:
     nodes:

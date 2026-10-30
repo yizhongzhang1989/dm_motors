@@ -33,6 +33,10 @@ def mechanical_options(args: argparse.Namespace) -> MechanicalOptions:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
+    publish = commands.add_parser("publish", help="Publish an existing qualified, runtime-identified calibration; never moves a motor")
+    publish.add_argument("calibration", type=Path)
+    publish.add_argument("--system-parameters", type=Path, help="Override the registry selected by the runtime configuration")
+    publish.add_argument("--config-file", type=Path, help="Runtime configuration selecting system_parameters_file")
     merge = commands.add_parser("merge", help="Replay compatible old/new raw recordings into a new result; never connects to a motor")
     merge.add_argument("recordings", type=Path, nargs="+")
     merge.add_argument("--output", type=Path, required=True)
@@ -82,6 +86,18 @@ def parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict:
+    if args.command == "publish":
+        from common.config import ConfigManager
+        from dm_motor_control.system_parameters import SystemParameters, system_parameters_path
+        from .system_parameters import publish_calibration
+        path = args.system_parameters
+        if path is None:
+            path = system_parameters_path(ConfigManager(args.config_file))
+        if path is None:
+            raise CalibrationError("The runtime configuration does not select a system_parameters_file")
+        store = SystemParameters(path)
+        publish_calibration(store, args.calibration)
+        return {"status": "published", "system_parameters_file": str(store.path)}
     if args.command == "merge":
         from .merged_analysis import merge_recordings
         return merge_recordings(args.recordings, args.output)

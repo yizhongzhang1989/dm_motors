@@ -117,9 +117,9 @@
           <p class="muted">仅摩擦助力：无位置/速度保持，无重力补偿，不是外力闭环；静止不主动起动。</p>
           <form id="drag-settings">
             <fieldset id="drag-editable" disabled>
-              <label>使用已验证的摩擦模型<select id="drag-calibration-file" required><option value="">请选择匹配当前电机的合格模型</option></select></label>
-              <p id="drag-model-note" class="notice">不会使用未合格候选或流程测试结果。</p>
-              <a id="drag-model-report" target="_blank" rel="noopener noreferrer" hidden>查看所选模型原报告</a>
+              <label>选择摩擦模型进行测试<select id="drag-calibration-file" required><option value="">请选择匹配当前电机的模型</option></select></label>
+              <p id="drag-model-note" class="notice">自动质量指标仅供参考；请查看报告并通过拖动测试判断是否接受。参数有效性与运行保护仍强制检查。</p>
+              <a id="drag-model-report" target="_blank" rel="noopener noreferrer" hidden>查看所选模型原报告与质量提示</a>
               <div class="fields">
                 <label>补偿比例<input id="drag-fraction" type="number" min="0" max="1" step="0.05" value="0.8" required></label>
               </div>
@@ -151,6 +151,19 @@
           <details id="drag-model-details"><summary>模型适用范围与警告</summary><p id="drag-domain-note" class="warnings"></p></details>
           <details class="limits" open><summary>固定保护与实际运行值</summary><dl id="drag-limits"></dl></details>
           <p class="muted">与标定互斥，不定时结束，由用户开启和停止。两处停止和 Esc 均停止当前电机。关闭页面或断网不会停止拖动；离开前请停止并等待实际失能确认。</p>
+        </section>
+        <section id="parameter-save-panel" class="panel" aria-label="保存参数">
+          <div class="heading"><h2>保存参数</h2><span class="eyebrow">MANUAL APPROVAL</span></div>
+          <p class="muted">标定和测试只保存实验记录，不会自动覆盖系统参数。请完成对应模型的拖动测试，正常停止并确认失能，再决定是否供 lead-follow 等模块使用。</p>
+          <form id="parameter-save-form">
+            <label>要认可并保存的模型<select id="parameter-save-model"><option value="">请选择已测试的标定结果</option></select></label>
+            <dl id="parameter-save-details"></dl>
+            <p id="parameter-save-status" class="notice" role="status">等待控制器</p>
+            <label class="check"><input id="parameter-save-confirm" type="checkbox">我已检查模型与拖动体验，确认用此结果覆盖该电机的共享机械参数</label>
+            <button id="parameter-save-submit" type="submit" disabled>确认保存参数</button>
+          </form>
+          <p id="parameter-save-action" class="notice" role="alert" hidden></p>
+          <p class="muted">仅更新当前电机和当前真机 / 仿真环境，保留其它电机与参数。保存不使能、不写电机 Flash；其它模块下次显式开始时加载。</p>
         </section>
       </aside>
       <div class="observations" aria-label="结果图表与历史数据">

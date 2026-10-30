@@ -3,3 +3,4 @@ install/
 log/
 __pycache__/
 .pytest_cache/
+config/system_parameters.yaml.lock

@@ -12,6 +12,9 @@ import unittest
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+import yaml
+from common import ConfigManager
+from dm_motor_control.system_parameters import SystemParameters
 from ament_index_python.packages import get_package_prefix
 import rclpy
 from rclpy.node import Node
@@ -55,10 +58,13 @@ class FollowHarness(unittest.TestCase):
         self.logs.append((name, log))
         self.processes[name] = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
 
-    def launch_follow(self):
-        self.launch("follow", [
+    def launch_follow(self, config_file=None):
+        command = [
             self.executable("dm_motor_lead_follow", "lead_follow_node"),
-            "--ros-args", "-r", f"__ns:={self.namespace}"])
+            "--ros-args", "-r", f"__ns:={self.namespace}"]
+        if config_file is not None:
+            command += ["-p", f"config_file:={config_file}"]
+        self.launch("follow", command)
         self.wait(lambda: self.follow is not None and self.follow.stop_confirmed, timeout=10)
 
     def wait(self, predicate, timeout=5):
@@ -213,6 +219,67 @@ class TopicFollowTest(FollowHarness):
                 axis == name and request.kind == MotorRequest.OPERATION
                 and request.operation == MotorRequest.DISABLE for axis, request in self.requests))
             self.assertEqual(self.states[name].status, 0)
+
+    def restart_with_friction_calibrations(self):
+        process = self.processes.pop("follow")
+        process.send_signal(signal.SIGINT)
+        process.wait(timeout=5)
+        directory = tempfile.TemporaryDirectory(prefix="follow_shared_")
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "system.yaml"
+        path.write_text("version: 1\nmotors: {}\n")
+        store = SystemParameters(path)
+        for index, (name, state) in enumerate(self.states.items(), 1):
+            state.motor_id, state.direction = index, 1.0
+            identity = {key: getattr(state, key) for key in
+                        ("motor_id", "simulated", "mode", "direction", "software_offset", "pmax", "vmax", "tmax")}
+            identity["namespace"] = self.namespace + "/" + name
+            store.publish({
+                "schema": 2, "qualified": True, "identity": identity,
+                "fit": {"kind": "mechanical", "model": "coulomb_viscous",
+                        "parameters": {"inertia": 0.02, "bias": 0.0, "coulomb": 0.08 * index, "viscous": 0.03},
+                        "units": {"inertia": "kg m^2", "bias": "Nm", "coulomb": "Nm", "viscous": "Nm s/rad"},
+                        "diagnostics": {"samples": 100, "rmse": 0.001, "validation_rmse": 0.002,
+                                        "condition": 2.0, "rmse_limit": 0.02, "condition_limit": 100.0},
+                        "domain": {"velocity_min": -2.0, "velocity_max": 2.0},
+                        "warnings": [], "friction_table": []}}, source="isolated_topic_fixture")
+        config = yaml.safe_load(ConfigManager().path.read_text())
+        config["system_parameters_file"] = str(path)
+        config_path = Path(directory.name) / "runtime.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        self.follow = None
+        self.targets.clear()
+        self.launch_follow(config_path)
+        self.settle()
+
+    def test_shared_friction_targets_active_leader_and_switches_with_roles(self):
+        self.restart_with_friction_calibrations()
+        self.start_follow()
+        self.states["motor_1"].velocity = 1.0
+        self.wait(lambda: self.targets.get("motor_1") is not None and
+                  abs(self.targets["motor_1"].target.torque - 0.088) < 1e-6)
+        self.assertEqual(self.targets["motor_2"].target.torque, 0)
+        self.states["motor_1"].velocity = 0.0
+        self.wait(lambda: self.targets["motor_1"].target.torque == 0)
+        self.stop_follow()
+        self.configure("swap_roles", True)
+        self.start_follow()
+        self.states["motor_2"].velocity = -1.0
+        self.wait(lambda: self.targets.get("motor_2") is not None and
+                  abs(self.targets["motor_2"].target.torque + 0.152) < 1e-6)
+        self.assertEqual(self.targets["motor_1"].target.torque, 0)
+        self.states["motor_2"].direction = -1.0
+        self.wait(lambda: self.follow.phase == LeadFollowState.FAULT and self.follow.stop_confirmed)
+        self.assertIn("identity", self.follow.message)
+
+    def test_shared_calibration_mismatch_is_rejected_before_enable(self):
+        self.restart_with_friction_calibrations()
+        self.states["motor_1"].software_offset = 0.1
+        self.settle()
+        response = self.call(self.start_client, Trigger.Request(), success=False)
+        self.assertIn("identity", response.message)
+        self.assertFalse(any(request.kind == MotorRequest.OPERATION and request.operation == MotorRequest.ENABLE
+                             for _, request in self.requests))
 
     def test_idle_offsets_neutral_leader_renew_stop_and_recapture(self):
         self.settle()

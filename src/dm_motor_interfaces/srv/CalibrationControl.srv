@@ -3,6 +3,7 @@ uint8 CONFIGURE=1
 uint8 START=2
 uint8 STOP=3
 uint8 RESET_FAULT=4
+uint8 SAVE_PARAMETERS=5
 std_msgs/Header header
 float64 valid_for
 string controller_id

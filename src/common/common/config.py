@@ -85,6 +85,14 @@ class ConfigManager:
     def section(self, key):
         return self.get(key, dict)
 
+    def has(self, key):
+        value = self._data
+        for part in key.split(".") if isinstance(key, str) else key:
+            if not isinstance(value, dict) or part not in value:
+                return False
+            value = value[part]
+        return True
+
     def launch(self, package, filename, variant=None):
         profile = self.section(("packages", package, "launches", filename))
         if variant is not None:

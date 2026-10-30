@@ -17,6 +17,7 @@ install(TARGETS common_config EXPORT common_config_targets
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)
 install(FILES ../../config/dm_motors.yaml DESTINATION share/${PROJECT_NAME}/config RENAME runtime.yaml)
+install(FILES ../../config/system_parameters.yaml DESTINATION share/${PROJECT_NAME}/config)
 install(FILES README.md DESTINATION share/${PROJECT_NAME})
 ament_export_targets(common_config_targets HAS_LIBRARY_TARGET)
 ament_export_dependencies(ament_index_cpp yaml-cpp)

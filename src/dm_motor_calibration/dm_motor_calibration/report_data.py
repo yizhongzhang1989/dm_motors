@@ -9,7 +9,7 @@ from typing import Iterator
 
 import numpy as np
 
-from .data import CalibrationError, FitResult, read_json
+from .data import CalibrationError, FitResult, ModelResult, read_json
 from .data_usage import AcquisitionUsage
 from .dashboard_data import DISPLAY_FIELDS, DisplayBuffer, decode_object
 from .reidentify import file_sha256, load_recording
@@ -86,7 +86,7 @@ class ReportData:
     identity: dict
     precision: dict | None
     static: dict | None
-    fit: FitResult | None
+    fit: ModelResult | None
     trace_fields: tuple[str, ...] = ()
     trace: list[list[float]] = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
@@ -320,8 +320,10 @@ def load_report_data(directory: Path) -> ReportData:
         if not identity:
             document = read_json(input_path(root, "calibration.json"))
             identity = document.get("identity", {})
-    elif isinstance(report.get("fit") or report.get("source_fit"), dict):
-        fit = FitResult.from_mapping(report.get("fit") or report["source_fit"])
+    elif isinstance(report.get("fit"), dict):
+        fit = FitResult.from_mapping(report["fit"])
+    elif isinstance(report.get("source_fit"), dict):
+        fit = ModelResult.from_mapping(report["source_fit"])
     data = ReportData(root, report, metadata, identity, precision, static, fit)
     data.fourier = fourier
     data.warmup = optional_json(root, "warmup.json") or report.get("warmup") or (precision or fourier or {}).get("warmup")

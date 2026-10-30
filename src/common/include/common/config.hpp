@@ -11,6 +11,7 @@
 namespace common
 {
 std::string default_config_path();
+YAML::Node load_yaml(const std::string & path);
 
 class Config
 {
@@ -29,6 +30,7 @@ public:
     return convert<T>(lookup(keys), description);
   }
   const std::string & path() const {return path_;}
+  bool has(const std::string & key) const;
 private:
   template<typename T>
   T convert(const YAML::Node & value, const std::string & key) const

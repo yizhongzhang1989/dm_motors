@@ -24,12 +24,13 @@ from std_msgs.msg import String
 from dm_motor_control.paired_dashboard import ApiError, DashboardServer as SharedServer, Handler as SharedHandler
 from dm_motor_interfaces.srv import CalibrationControl
 
-from .data import CalibrationError, FitResult, Trace, read_json
+from .data import CalibrationError, FitResult, ModelResult, Trace, read_json
 from .html_report import REPORT_CSP, REPORT_META, REPORT_NAME
 from .report_data import TERMINAL_STATES
 from .report_jobs import ReportJobs
 from .merged_analysis import ReanalysisJobs
 from .stage_parameters import parameter_schema, workflow_test_profile
+from .system_parameters import load_model, tested_calibration
 from .dashboard_data import (
     ACTIVE_PHASES, DISPLAY_FIELDS, MAX_SNAPSHOT_ROWS, DisplayBuffer, decode_object, display_trace, friction_plot,
     model_curves, normalize_drag_settings, normalize_settings,
@@ -173,6 +174,7 @@ class Dashboard(Node):
                     "trace_complete": self.buffer.complete, "display_fields": DISPLAY_FIELDS,
                     "display_count": len(self.buffer.rows),
                     "capabilities": {"reanalysis": True,
+                                     "manual_parameter_save": bool(self.state and "system_parameters_file" in self.state),
                                      "drag_control": bool(self.state and "calibration_configuration" in self.state),
                                      "drag_manual_motion": bool(self.state and self.state.get("drag_motion_policy") == "driver_only"),
                                      "drag_manual_stop": bool(self.state and self.state.get("drag_stop_policy") == "operator"),
@@ -223,6 +225,36 @@ class Dashboard(Node):
         self.get_logger().info("Dashboard STOP accepted; waiting for confirmed disable")
         return {"message": response.message}
 
+    def save_parameters(self, body: dict) -> dict:
+        if (set(body) != {"run", "test_run", "confirm", "controller_id", "generation"} or
+                body["confirm"] is not True or not isinstance(body["controller_id"], str) or
+                type(body["generation"]) is not int or not 0 <= body["generation"] < 2**64 or
+                any(not isinstance(body[key], str) or not RUN_NAME.fullmatch(body[key])
+                    for key in ("run", "test_run"))):
+            raise ApiError(400, "请选择标定和拖动记录，并明确确认保存")
+        if not self.operation_lock.acquire(blocking=False):
+            raise ApiError(409, "另一个控制请求尚未完成；请等待")
+        try:
+            snapshot = self.snapshot()
+            state = snapshot["state"]
+            if not snapshot["connected"] or state is None:
+                raise ApiError(503, "标定器状态陈旧，不能保存")
+            if (state["phase"] in ACTIVE_PHASES or not state["stop_confirmed"] or
+                    (state["controller_id"], state["generation"]) != (body["controller_id"], body["generation"])):
+                raise ApiError(409, "请等待确认失能并刷新页面状态后保存")
+            if not state.get("system_parameters_file"):
+                raise ApiError(409, "控制器未配置共享参数文件，或尚未升级手动保存接口")
+            request = CalibrationControl.Request(
+                operation=CalibrationControl.Request.SAVE_PARAMETERS,
+                controller_id=body["controller_id"], generation=body["generation"], valid_for=1.0,
+                settings_json=json.dumps({key: body[key] for key in ("run", "test_run", "confirm")}))
+            request.header.stamp = self.get_clock().now().to_msg()
+            response = self.rpc(request)
+            return {"message": response.message, "generation": response.generation,
+                    "saved": decode_object(response.snapshot_json)}
+        finally:
+            self.operation_lock.release()
+
     def operate(self, body: dict, *, start: bool, drag: bool = False, reset_fault: bool = False) -> dict:
         expected = {"settings", "controller_id", "generation"} | ({"confirm_hardware"} if start or reset_fault else set())
         if set(body) != expected:
@@ -257,13 +289,16 @@ class Dashboard(Node):
             if calibration:
                 path = Path(calibration).expanduser().resolve()
                 if path.is_relative_to(self.root()):
-                    allowed = self.artifact(path.parent.name, "calibration.json")
+                    if path.name not in ("calibration.json", "report.json"):
+                        raise ApiError(400, "模型必须来自标定文件或完整候选报告")
+                    allowed = self.artifact(path.parent.name, path.name)
                     if path != allowed:
                         raise ApiError(400, "无效的标定文件路径")
                     report = read_json(self.artifact(path.parent.name, "report.json"))
-                    if not isinstance(report, dict) or report.get("status") != "completed" or report.get("stop_confirmed") is not True:
+                    if (not isinstance(report, dict) or report.get("status") not in ("completed", "completed_unqualified") or
+                            report.get("stop_confirmed") is not True or report.get("error")):
                         raise ApiError(409, "只有完成实验并确认失能的记录才能从网页用于补偿")
-                    if FitResult.load(allowed, state["identity"]).kind != "mechanical":
+                    if load_model(allowed, state["identity"]).result.kind != "mechanical":
                         raise ApiError(409, "补偿需要机械 / 摩擦标定结果")
                 elif calibration != state["configuration"]["calibration_file"]:
                     raise ApiError(400, "网页只能选择报告目录中的标定文件或配置中已指定的文件")
@@ -328,17 +363,24 @@ class Dashboard(Node):
                              stop_limits={key: report.get("configuration", {}).get(key)
                                           for key in ("max_speed", "max_travel", "max_torque", "max_temperature")},
                              identity=report.get("identity"), operation=report.get("operation", ""),
+                             tested_calibration=report.get("tested_calibration"),
                              raw_recording=(directory / "recording.json").is_file() and
                              report.get("status") in TERMINAL_STATES)
                 if report.get("status") == "checking" and self.state and self.state["run_id"] == directory.name:
                     entry.update(status=self.state["phase"], experiment=self.state["experiment"],
                                  samples=self.state["samples"])
-                if (directory / "calibration.json").exists():
-                    path = self.artifact(directory.name, "calibration.json")
-                    fit = FitResult.load(path, self.state["identity"] if self.state else None)
-                    entry.update(eligible=fit.kind == "mechanical" and report.get("status") == "completed"
+                analysis = report.get(report.get("experiment"))
+                candidate = analysis.get("candidate_model") if isinstance(analysis, dict) else None
+                if (directory / "calibration.json").exists() or isinstance(candidate, dict):
+                    filename = "calibration.json" if (directory / "calibration.json").exists() else "report.json"
+                    path = self.artifact(directory.name, filename)
+                    artifact = load_model(path, self.state["identity"] if self.state else None,
+                                          report=report if filename == "report.json" else None)
+                    fit = artifact.result
+                    entry.update(eligible=fit.kind == "mechanical" and report.get("status") in ("completed", "completed_unqualified")
                                  and report.get("stop_confirmed") is True,
                                  calibration_file=str(path), model=fit.model, domain=fit.domain,
+                                 automatic_qualified=artifact.qualified, quality_issues=list(artifact.quality_issues),
                                  model_warnings=list(fit.warnings),
                                  quality={"validation_rmse": fit.diagnostics.get("validation_rmse"),
                                           "rmse_limit": fit.diagnostics.get("rmse_limit")})
@@ -347,6 +389,22 @@ class Dashboard(Node):
             entries.append(entry)
             if len(entries) >= 100:
                 break
+        if self.state and self.state.get("identity"):
+            for entry in entries:
+                if not entry["eligible"]:
+                    continue
+                entry["save_test_run"] = ""
+                entry["save_blocked_reason"] = "需要对应模型的拖动测试正常结束并确认失能"
+                for test in entries:
+                    evidence = test.get("tested_calibration")
+                    if not isinstance(evidence, dict) or evidence.get("path") != entry["calibration_file"]:
+                        continue
+                    try:
+                        tested_calibration(root, entry["id"], test["id"], self.state["identity"])
+                        entry.update(save_test_run=test["id"], save_blocked_reason="")
+                        break
+                    except (CalibrationError, OSError, ValueError) as error:
+                        entry["save_blocked_reason"] = str(error)
         return entries
 
     def run_details(self, run: str) -> dict:
@@ -364,7 +422,7 @@ class Dashboard(Node):
             fit = FitResult.load(self.artifact(run, "calibration.json"))
         elif isinstance(report.get("source_fit"), dict):
             source = report["source_fit"]
-            fit = FitResult.from_mapping(source)
+            fit = ModelResult.from_mapping(source)
         precision = report.get("experiment") in ("precision", "fourier")
         usage = None
         if precision and "recording.json" in artifacts:
@@ -540,6 +598,8 @@ class Handler(SharedHandler):
                 result = self.dashboard_server.node.reanalyze(body)
             elif path == "/api/drag/start":
                 result = self.dashboard_server.node.operate(body, start=True, drag=True)
+            elif path == "/api/parameters/save":
+                result = self.dashboard_server.node.save_parameters(body)
             elif path == "/api/fault/reset":
                 result = self.dashboard_server.node.operate(body, start=False, reset_fault=True)
             elif path in ("/api/start", "/api/configure"):

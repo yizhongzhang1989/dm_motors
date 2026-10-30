@@ -7,7 +7,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TypeVar
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -76,8 +76,12 @@ class Trace:
         return cls.from_rows(rows)
 
 
+ResultT = TypeVar("ResultT", bound="ModelResult")
+
+
 @dataclass(frozen=True)
-class FitResult:
+class ModelResult:
+    """Numerically valid model; automatic statistical qualification is separate."""
     kind: str
     model: str
     parameters: dict[str, float]
@@ -100,6 +104,55 @@ class FitResult:
         if not isinstance(self.units, dict) or set(self.parameters) != set(self.units) or any(
                 not isinstance(unit, str) or not unit for unit in self.units.values()):
             raise CalibrationError("Every fitted parameter must declare its SI unit")
+        if "samples" in self.diagnostics and self.diagnostics["samples"] < 3:
+            raise CalibrationError("Insufficient model samples")
+        if self.diagnostics.get("condition", 1) < 1:
+            raise CalibrationError("Invalid model condition number")
+        for name in ("rmse", "validation_rmse", "external_max_error", "max_bin_error"):
+            if self.diagnostics.get(name, 0) < 0:
+                raise CalibrationError("Model errors must be nonnegative")
+        if self.kind == "mechanical":
+            self.friction()
+            if ("bias" not in self.parameters or self.parameters.get("inertia", -1) < 0 or
+                    self.parameters.get("stiffness", 0) < 0):
+                raise CalibrationError("Invalid mechanical parameters")
+            if self.domain.get("velocity_min", 0) >= 0 or self.domain.get("velocity_max", 0) <= 0:
+                raise CalibrationError("Mechanical result requires a measured bidirectional velocity domain")
+            if self.model == TABLE_MODEL and (
+                    self.domain["velocity_max"] != self.friction_table[-1][0] or
+                    -self.domain["velocity_min"] != self.friction_table[-1][2]):
+                raise CalibrationError("Friction table domain does not match its measured endpoints")
+        elif self.friction_table:
+            raise CalibrationError("Friction knots require a mechanical result")
+
+    def friction(self) -> FrictionModel:
+        if self.kind != "mechanical":
+            raise CalibrationError("Only a mechanical calibration contains a friction model")
+        names = friction_names(self.model)
+        if not set(names) <= self.parameters.keys():
+            raise CalibrationError("Calibration is missing friction parameters")
+        return FrictionModel(self.model, {name: self.parameters[name] for name in names}, self.friction_table)
+
+    @classmethod
+    def from_mapping(cls: type[ResultT], fit: object) -> ResultT:
+        expected = {"kind", "model", "parameters", "units", "diagnostics", "domain", "warnings"}
+        if not isinstance(fit, dict) or not expected <= fit.keys() or set(fit) - expected - {"friction_table"}:
+            raise CalibrationError("Invalid fitted result schema")
+        if not isinstance(fit["warnings"], (list, tuple)) or any(not isinstance(w, str) for w in fit["warnings"]):
+            raise CalibrationError("Invalid calibration warnings")
+        table = fit.get("friction_table", ())
+        if not isinstance(table, (list, tuple)) or any(not isinstance(row, (list, tuple)) or len(row) != 4 for row in table):
+            raise CalibrationError("Invalid friction table")
+        return cls(**{**fit, "warnings": tuple(fit["warnings"]),
+                      "friction_table": tuple(tuple(row) for row in table)})
+
+
+@dataclass(frozen=True)
+class FitResult(ModelResult):
+    """Automatically qualified result; candidate use must not manufacture this label."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
         if self.diagnostics.get("samples", 0) < 3:
             raise CalibrationError("Insufficient qualified samples")
         if self.kind == "breakaway":
@@ -139,46 +192,13 @@ class FitResult:
                     not 1 <= d["condition"] <= d["condition_limit"] or d["rmse_limit"] <= 0):
                 raise CalibrationError("Result exceeds its qualification limits")
         if self.kind == "mechanical":
-            self.friction()
-            if ("bias" not in self.parameters or self.parameters.get("inertia", -1) < 0 or
-                    self.parameters.get("stiffness", 0) < 0):
-                raise CalibrationError("Invalid mechanical parameters")
-            if self.domain.get("velocity_min", 0) >= 0 or self.domain.get("velocity_max", 0) <= 0:
-                raise CalibrationError("Mechanical result requires a measured bidirectional velocity domain")
-            if self.model == TABLE_MODEL and (
-                    self.domain["velocity_max"] != self.friction_table[-1][0] or
-                    -self.domain["velocity_min"] != self.friction_table[-1][2]):
-                raise CalibrationError("Friction table domain does not match its measured endpoints")
             if self.model == TABLE_MODEL and not math.isclose(
                     self.diagnostics["validated_max_speed"],
                     min(self.friction_table[-1][0], self.friction_table[-1][2]), abs_tol=1e-10):
                 raise CalibrationError("Declared speed coverage does not match the friction table")
-        elif self.friction_table:
-            raise CalibrationError("Friction knots require a mechanical result")
-
-    def friction(self) -> FrictionModel:
-        if self.kind != "mechanical":
-            raise CalibrationError("Only a mechanical calibration contains a friction model")
-        names = friction_names(self.model)
-        if not set(names) <= self.parameters.keys():
-            raise CalibrationError("Calibration is missing friction parameters")
-        return FrictionModel(self.model, {name: self.parameters[name] for name in names}, self.friction_table)
 
     def save(self, path: Path, identity: Mapping[str, Any]) -> None:
         atomic_json(path, {"schema": 2, "qualified": True, "identity": dict(identity), "fit": asdict(self)})
-
-    @classmethod
-    def from_mapping(cls, fit: object) -> "FitResult":
-        expected = {"kind", "model", "parameters", "units", "diagnostics", "domain", "warnings"}
-        if not isinstance(fit, dict) or not expected <= fit.keys() or set(fit) - expected - {"friction_table"}:
-            raise CalibrationError("Invalid fitted result schema")
-        if not isinstance(fit["warnings"], (list, tuple)) or any(not isinstance(w, str) for w in fit["warnings"]):
-            raise CalibrationError("Invalid calibration warnings")
-        table = fit.get("friction_table", ())
-        if not isinstance(table, (list, tuple)) or any(not isinstance(row, (list, tuple)) or len(row) != 4 for row in table):
-            raise CalibrationError("Invalid friction table")
-        return cls(**{**fit, "warnings": tuple(fit["warnings"]),
-                      "friction_table": tuple(tuple(row) for row in table)})
 
     @classmethod
     def load(cls, path: Path, identity: Mapping[str, Any] | None = None) -> "FitResult":

@@ -108,6 +108,69 @@ Dashboard 已分别并入 `can_bus`、`dm_motor_control`、`dm_motor_lead_follow
 不传时读取 `COMMON_CONFIG`，未设置该变量时读取安装的默认配置，对应 [config/dm_motors.yaml](config/dm_motors.yaml)。
 显式 launch / ROS 参数可覆盖文件中的值，修改文件后需重新启动对应节点。
 
+### 共享系统参数与标定结果
+
+[config/dm_motors.yaml](config/dm_motors.yaml) 保留启动拓扑和节点默认值；
+新增 [config/system_parameters.yaml](config/system_parameters.yaml) 保存全项目共享的电机描述、
+合格标定参数及模块扩展数据。前者的顶层 `system_parameters_file` 选择后者，
+相对路径相对于运行配置的真实文件目录解析（支持 symlink-install），也可填写绝对路径。
+部署自定义运行配置时须同时部署共享文件并保证标定进程可写其父目录。
+
+共享结构为 `version: 1`、`motors.<绝对电机命名空间>`：
+
+```yaml
+version: 1
+motors:
+  /motor_1:
+    description: Leader/follower axis 1
+    hardware:
+      calibrations: {}
+```
+
+- 电机用完整命名空间精确关联，不按列表顺序或名称后缀猜测；带部署前缀时例如 `/robot/motor_1`。
+  `description` 和 `extensions` 可由其它模块扩展；空的仿真/扩展段可以省略。
+- 真机与仿真分别存储，`calibrations` 再按 `mechanical`、`breakaway`、`electrical`、
+  `thermal` 等种类分组，互不覆盖。新保存采用精简条目 `schema: 3`，兼容读取旧 `schema: 2`。
+  只保存自动评价标记、独立物理参数/SI 单位、实测适用域、非空表格节点、电机坐标身份、
+  来源路径和简短人工接受记录。命名空间、真机/仿真和标定种类由外层键确定，不在条目中重复。
+  重力幅值/相位可由 `gravity_sin` / `gravity_cos` 推导，因此只保存后者。
+  误差、样本数、拟合设置、警告和质量问题保留在来源实验报告，不复制到共享配置；
+  `bias_is_sensor_offset` 会影响偏置的运行解释，因此存在时仍保留。
+- ROS 标定确认失能后保存实验报告，自动达标时另保存合格模型，不自动修改共享参数。
+  自动质量指标仅供参考：参数完整有效的傅里叶/精密候选即使未达标，也会出现在模型列表，
+  用户查看报告并通过拖动测试判断是否接受，不需要降低门限或修改原始报告。
+  Dashboard 的“保存参数”面板位于拖动测试下方：完成该模型的实际补偿拖动并正常停止、
+  确认失能后，人工选择模型、勾选确认并保存，才合并共享记录。
+  共享文件保留人工接受标记、时间、拖动报告路径；完整哈希、测试比例和接受明细
+  存在该拖动记录旁的 `parameter_approval.json`。空转等待、故障中断、
+  身份不匹配或测试后被修改的模型不能从该面板保存。
+  未经人工保存的候选不会自动发布；中止、身份不匹配、参数无效或不存在模型的记录仍不可用。
+  人工认可后保存的候选保留 `qualified: false`，`quality_issues` 留在来源报告，
+  另写入 `approval.user_accepted: true`，不改标成自动合格。
+  进程锁及原子替换防止多电机并发标定丢更新，保留其它电机与未知扩展字段。
+  更新会重新序列化 YAML，因此注释和原始排版不保留；锁文件应保留，不要在写入期间删除。
+- lead-follow 每次显式开始时读取最新共享参数，不在控制周期访问磁盘。
+  当前 lead 有匹配的自动合格或已人工认可的摩擦模型时自动补偿，交换主从后随角色切换；
+  没有模型时明确记录日志并保持零前馈。身份/坐标/量程不匹配或文件损坏则拒绝启动，
+  控制期间身份变化触发停止。修改共享参数不会自动使能。
+  精简条目的运行加载只检查模型有效性、身份及接受状态，不需要打开报告或审批明细文件。
+- Python 通用读取 API 为 `dm_motor_control.system_parameters.SystemParameters.motor()` /
+  `.calibration()`；C++ 为 `dm_motor_control/system_parameters.hpp` 中
+  `dm_motor::SystemParameters::motor()` / `compensator()`。业务结构不进入通用 `common` 包。
+
+已有**合格且包含完整运行身份**的标定结果可以显式导入，不连接电机：
+
+```bash
+ros2 run dm_motor_calibration calibrate.py publish /path/to/calibration.json
+# 自定义部署：
+ros2 run dm_motor_calibration calibrate.py publish /path/to/calibration.json \
+  --config-file /path/to/runtime.yaml
+```
+
+离线 CSV/物理模拟/重分析命令仍只生成实验文件，不隐式改变运行配置；需要使用时经上述命令显式发布。
+不含电机身份的演示结果不可发布。旧的自定义运行配置若未声明 `system_parameters_file`，
+节点会警告并保留原来的不共享行为；已声明的文件缺失或无效不会静默回退。
+
 ### 3. 打开面板
 
 按配置开启的 Dashboard 默认监听 `0.0.0.0`，**无需指定 host**。

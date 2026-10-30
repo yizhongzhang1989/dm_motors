@@ -21,6 +21,7 @@ from dm_motor_interfaces.srv import CalibrationControl
 from test_dashboard_integration import start_dashboard
 from test_ros_calibration import scene
 from test_workflow import calibration
+from test_system_parameters import candidate_report
 
 
 @pytest.mark.parametrize("values", [
@@ -299,6 +300,10 @@ def test_independent_drag_runs_past_calibration_duration_until_user_stop(scene):
         assert code == 200 and details["raw_samples"] == report["samples"]
         assert report["source_fit"]["parameters"]["bias"] == 0.2
         assert not (output / "calibration.json").exists(), "Drag must not publish a new calibration"
+        web.update()
+        save_body = {"run": model.parent.name, "test_run": output.name, "confirm": True,
+                     "controller_id": web.current["state"]["controller_id"], "generation": web.current["state"]["generation"]}
+        assert web.request("/api/parameters/save", save_body)[0] == 409, "Idle-only drag is not an assisted-motion test"
         code, result = web.request("/api/configure", web.body({"model": "viscous"}))
         assert code == 200, result
         web.wait(lambda data: data["state"]["generation"] >= result["generation"])
@@ -316,10 +321,10 @@ def test_independent_drag_runs_past_calibration_duration_until_user_stop(scene):
         scene.node.destroy_subscription(subscription)
 
 
-def test_drag_rejects_unqualified_wrong_identity_and_malformed_requests_without_motion(scene):
+def test_drag_rejects_failed_wrong_identity_and_malformed_requests_without_motion(scene):
     web = start_dashboard(scene)
     original = web.current["state"]["calibration_configuration"]
-    model = saved_model(scene, status="completed_unqualified")
+    model = saved_model(scene, status="failed")
     values = {"calibration_file": str(model), "compensation_fraction": 0.8}
     assert web.request("/api/drag/start", web.body(values, start=True))[0] == 409
     saved_model(scene, identity={**motor_identity(scene.state, scene.motor), "motor_id": 99})
@@ -356,16 +361,23 @@ def test_manual_drag_rejects_disabled_driver_protection(scene):
     assert web.current["state"]["calibration_configuration"] == original
 
 
+@pytest.mark.parametrize("candidate", [False, True], ids=["qualified-model", "user-reviewed-candidate"])
 @pytest.mark.parametrize("scene", [{
     "calibration": {"max_speed": 1.0, "max_travel": 0.7, "max_torque": 0.4,
                     "amplitude": 0.4, "frequency": 0.06},
     "driver": {"host_protection_enabled": True, "position_min": -100.0, "position_max": 100.0,
                "position_limit": 0.0, "velocity_limit": 13.0, "measured_velocity_limit": 13.0},
 }], indirect=True)
-def test_simulated_manual_drag_crosses_old_limits_without_overriding_driver_or_calibration(scene):
+def test_simulated_manual_drag_crosses_old_limits_without_overriding_driver_or_calibration(scene, candidate):
     web = start_dashboard(scene)
     model = saved_model(scene)
+    if candidate:
+        model.unlink()
+        model = model.parent / "report.json"
+        atomic_json(model, candidate_report(motor_identity(scene.state, scene.motor)))
     original = web.current["state"]["calibration_configuration"]
+    entry = next(item for item in web.request("/api/runs")[1]["runs"] if item["id"] == model.parent.name)
+    assert entry["eligible"] and entry["automatic_qualified"] is not candidate
     assert web.current["capabilities"]["drag_manual_motion"]
     values = {"calibration_file": str(model), "compensation_fraction": 0.5}
     code, response = web.request("/api/drag/start", web.body({**values, "max_speed": 6.0}, start=True))
@@ -410,6 +422,30 @@ def test_simulated_manual_drag_crosses_old_limits_without_overriding_driver_or_c
         assert report["configuration"]["driver_motion_limits"]["manual_drag_speed_exempt"]
         assert report["configuration"]["drag_speed_policy"] == "operator"
         assert web.current["state"]["calibration_configuration"] == original
+        registry = Path(scene.config["system_parameters_file"])
+        before_save = registry.read_bytes()
+        run_entry = next(item for item in web.request("/api/runs")[1]["runs"] if item["id"] == model.parent.name)
+        assert run_entry["save_test_run"] == web.current["state"]["run_id"]
+        web.wait(lambda data: abs(data["state"]["motor"]["velocity"]) <= 0.05, timeout=8)
+        save_body = {"run": model.parent.name, "test_run": run_entry["save_test_run"], "confirm": False,
+                     "controller_id": web.current["state"]["controller_id"], "generation": web.current["state"]["generation"]}
+        assert web.request("/api/parameters/save", save_body)[0] == 400
+        assert registry.read_bytes() == before_save
+        code, result = web.request("/api/parameters/save", {**save_body, "confirm": True})
+        assert code == 200, result
+        assert result["saved"]["drag_run"] == run_entry["save_test_run"]
+        assert registry.read_bytes() != before_save
+        if candidate:
+            from dm_motor_control.system_parameters import SystemParameters
+            from dm_motor_calibration.system_parameters import load_calibration
+            store = SystemParameters(registry)
+            entry = store.calibration(scene.motor, True, "mechanical")
+            assert entry["qualified"] is False and entry["approval"]["user_accepted"] is True
+            assert load_calibration(store, motor_identity(scene.state, scene.motor)).parameters["coulomb"] == 0.08
+            assert "diagnostics" not in entry["fit"]
+            assert read_json(model)["fourier"]["metrics"]["validation_rmse"] == 0.04
+        assert scene.state.status == 0
+        assert web.request("/api/parameters/save", {**save_body, "confirm": True})[0] == 409
         run = web.current["state"]["run_id"]
         web.wait(lambda _data: web.request("/api/report-status?run=" + run)[1]["status"] == "ready", timeout=15)
         with urlopen(web.url + "/api/report?run=" + run, timeout=5) as response:

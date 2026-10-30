@@ -26,12 +26,13 @@ from std_srvs.srv import Trigger
 from common import ConfigManager
 from common.config import default_config_path
 from dm_motor_control.topic_client import motor_topics
+from dm_motor_control.system_parameters import SystemParameters, system_parameters_path
 from dm_motor_interfaces.msg import MotorConfiguration, MotorFeedback, MotorRequest, MotorSetpoint, MotorState, MotorTarget
 from dm_motor_interfaces.srv import CalibrationControl
 
 from .auxiliary import BreakawayDetector, fit_breakaway
 from .compensation import CompensationSettings, FrictionCompensator, compare_scores, tracking_metrics
-from .data import CalibrationError, FitResult, Trace, atomic_json, read_json
+from .data import CalibrationError, ModelResult, Trace, atomic_json, read_json
 from .experiment import AcquisitionStages, ExperimentSettings, MotionLimits, bounded_mit_pd, feedback_torque, guard, reference
 from .identification import MechanicalOptions, fit_mechanical
 from .precision import PrecisionExperiment, PrecisionRecorder, PrecisionSettings, Sample
@@ -40,6 +41,7 @@ from .fourier_trajectory import FourierSettings
 from .recording import PrecisionRecording, flatten_message, sample_membership, snapshot_parent, source_snapshot
 from .reidentify import file_sha256, make_checkpoint, replay_recording
 from .stage_parameters import EDITABLE_STAGE_TYPES, EDITABLE_CONSTRAINT_TYPES, TEST_PROFILE_NOTE
+from .system_parameters import load_calibration, load_model, save_tested_calibration
 from .dashboard_data import (
     ACTIVE_PHASES, DISPLAY_FIELDS, EDITABLE_TYPES, MAX_SNAPSHOT_ROWS, decode_object, display_record,
     normalize_drag_settings, normalize_settings,
@@ -113,6 +115,12 @@ class CalibrationNode(Node):
         descriptor = ParameterDescriptor(read_only=True)
         config_path = self.declare_parameter("config_file", default_config_path(), descriptor).value
         config = ConfigManager(config_path)
+        shared_path = system_parameters_path(config)
+        self.system_parameters = None if shared_path is None else SystemParameters(shared_path)
+        self.last_parameter_save = None
+        self.tested_calibration = None
+        if self.system_parameters is None:
+            self.get_logger().warning("No system_parameters_file configured; shared calibration publication is disabled")
         values = config.node_parameters("dm_motor_calibration", "calibration_node")
         if not isinstance(values, dict):
             raise CalibrationError("Calibration node defaults must be a parameter mapping")
@@ -303,7 +311,7 @@ class CalibrationNode(Node):
         self.rows: list[dict[str, float]] = []
         self.identity: dict = {}
         self.output: Path | None = None
-        self.result: FitResult | None = None
+        self.result: ModelResult | None = None
         self.compensator: FrictionCompensator | None = None
         self.drag_settings: dict | None = None
         self.leg = 0
@@ -552,13 +560,33 @@ class CalibrationNode(Node):
                 if request.controller_id != self.controller_id or request.generation != self.generation:
                     raise CalibrationError("Controller changed or STOP canceled this request; refresh state before retrying")
                 if request.operation not in (CalibrationControl.Request.CONFIGURE, CalibrationControl.Request.START,
-                                             CalibrationControl.Request.RESET_FAULT):
+                                             CalibrationControl.Request.RESET_FAULT, CalibrationControl.Request.SAVE_PARAMETERS):
                     raise CalibrationError("Unknown dashboard operation")
                 if self.phase in ACTIVE_PHASES or self.stopping or self.motion_requested:
                     raise CalibrationError("Experiment active; configuration and START are locked")
                 if len(request.settings_json.encode("utf-8")) > 16384:
                     raise CalibrationError("Settings payload exceeds 16384 bytes")
                 document = decode_object(request.settings_json)
+                if request.operation == CalibrationControl.Request.SAVE_PARAMETERS:
+                    if set(document) != {"run", "test_run", "confirm"} or document["confirm"] is not True:
+                        raise CalibrationError("Saving requires explicit manual confirmation and calibration/drag run IDs")
+                    state = self.fresh_state()
+                    if (not disabled_feedback(state) or not self.stop_confirmed or self.run_open or
+                            abs(state.velocity) > 0.05 or state.host_fault or state.device_fault):
+                        raise CalibrationError("Save parameters requires fresh, stationary, fault-free disabled feedback")
+                    if self.system_parameters is None:
+                        raise CalibrationError("No system_parameters_file configured")
+                    self.last_parameter_save = save_tested_calibration(
+                        self.system_parameters, self.output_root, document["run"], document["test_run"],
+                        motor_identity(state, self.motor_namespace))
+                    self.generation += 1
+                    self.get_logger().info(f"Manually saved tested parameters: {self.last_parameter_save}")
+                    self.publish_status()
+                    response.success = True
+                    response.message = "Tested parameters saved; motor remains disabled"
+                    response.snapshot_json = json.dumps(self.last_parameter_save, allow_nan=False)
+                    response.generation = self.generation
+                    return response
                 if request.operation == CalibrationControl.Request.RESET_FAULT:
                     if document:
                         raise CalibrationError("Fault reset does not accept settings")
@@ -807,6 +835,9 @@ class CalibrationNode(Node):
                     raise CalibrationError("Manual drag recorder is unavailable")
                 self.drag_recorder.append(row)
                 self.drag_samples += 1
+                if (self.tested_calibration is not None and
+                        abs(message.velocity) > self.compensation_settings.deadband and abs(command["feedforward"]) > 0):
+                    self.tested_calibration["assisted_samples"] += 1
             else:
                 self.rows.append(row)
         except (CalibrationError, ValueError) as error:
@@ -843,8 +874,21 @@ class CalibrationNode(Node):
             self.identity = motor_identity(state, self.motor_namespace)
             self.result = None
             if self.experiment not in ("calibrate", "precision", "fourier"):
-                self.result = FitResult.load(self.calibration_file, self.identity)
+                if self.calibration_file == Path(".") and self.system_parameters is not None:
+                    self.result = load_calibration(self.system_parameters, self.identity)
+                else:
+                    artifact = load_model(self.calibration_file, self.identity)
+                    self.result = artifact.result
+                    if not artifact.qualified:
+                        self.get_logger().warning(
+                            "Using a candidate for operator review; automatic quality targets were not met: " +
+                            "; ".join(artifact.quality_issues))
                 self.compensator = FrictionCompensator(self.result, self.compensation_settings)
+            self.tested_calibration = None
+            if self.drag_settings is not None:
+                self.tested_calibration = {
+                    "path": str(self.calibration_file.resolve()),
+                    "sha256": file_sha256(self.calibration_file), "assisted_samples": 0}
             self.output_root.mkdir(parents=True, exist_ok=True)
             name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
             self.output = self.output_root / name
@@ -1730,6 +1774,8 @@ class CalibrationNode(Node):
                   "configuration": self.run_configuration, "trajectory_control": self.active_trajectory_control}
         if self.result is not None:
             report["source_fit"] = asdict(self.result)
+        if self.drag_settings is not None:
+            report["tested_calibration"] = self.tested_calibration
         saved_result: Path | None = None
         try:
             if self.drag_settings is not None:
@@ -1751,8 +1797,9 @@ class CalibrationNode(Node):
                 if self.experiment == "calibrate":
                     if np.mean(trace.columns["saturated"]) > 0.05:
                         raise CalibrationError("More than 5% of calibration commands saturated")
-                    self.result = fit_mechanical(trace, self.options)
-                    self.result.save(self.output / "calibration.json", self.identity)
+                    result = fit_mechanical(trace, self.options)
+                    self.result = result
+                    result.save(self.output / "calibration.json", self.identity)
                     saved_result = self.output / "calibration.json"
                     report["model"] = self.result.model
                     report["calibration"] = str(self.output / "calibration.json")
@@ -1903,6 +1950,8 @@ class CalibrationNode(Node):
                    "configuration": self.configuration(),
                    "calibration_configuration": self.configuration(calibration=True),
                    "drag_settings": self.drag_settings,
+                   "system_parameters_file": str(self.system_parameters.path) if self.system_parameters is not None else "",
+                   "last_parameter_save": self.last_parameter_save,
                    "drag_motion_policy": "driver_only",
                    "drag_stop_policy": "operator",
                    "drag_speed_policy": "operator",

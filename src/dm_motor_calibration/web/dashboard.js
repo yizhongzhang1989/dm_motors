@@ -17,6 +17,7 @@ if (typeof document !== "undefined") (() => {
   let dragWasRunning = false;
   let dragController = "";
   let lastConstraintRows = "";
+  let saveContext = "";
   const stageIds = ["checking", "warmup", "baseline", "static", "training", "validation", "stopping", "saving", "analysis"];
   const elements = Object.fromEntries(V.editable.map(name => [name, $(name)]));
   const dragElements = {model: $("drag-calibration-file"), fraction: $("drag-fraction")};
@@ -24,6 +25,7 @@ if (typeof document !== "undefined") (() => {
   const version = state => `${state.controller_id}:${state.generation}`;
   const rowValue = (row, field) => row[fields.indexOf(field) + 1];
   const calibrationConfig = state => state.calibration_configuration || state.configuration;
+  const qualityLabel = run => run.automatic_qualified === false ? "自动指标未达标 · 待人工评估" : "自动指标达标";
 
   async function api(path, body) {
     const abort = new AbortController(), timer = setTimeout(() => abort.abort(), 5000);
@@ -46,7 +48,7 @@ if (typeof document !== "undefined") (() => {
     $("calibration_file").replaceChildren(new Option("请选择匹配电机的标定结果", ""));
     for (const run of runs) {
       if (!run.calibration_file) continue;
-      const option = new Option(`${run.id} · ${V.models[run.model] || run.model}${run.eligible ? "" : " · 不匹配"}`, run.calibration_file);
+      const option = new Option(`${run.id} · ${V.models[run.model] || run.model} · ${qualityLabel(run)}${run.eligible ? "" : " · 不匹配"}`, run.calibration_file);
       option.disabled = !run.eligible;
       $("calibration_file").add(option);
     }
@@ -54,9 +56,9 @@ if (typeof document !== "undefined") (() => {
       $("calibration_file").add(new Option(`配置指定：${current.split("/").pop()}`, current));
     $("calibration_file").value = current;
     const dragModel = dragElements.model.value;
-    dragElements.model.replaceChildren(new Option("请选择匹配当前电机的合格模型", ""));
+    dragElements.model.replaceChildren(new Option("请选择匹配当前电机的模型", ""));
     for (const run of runs.filter(run => run.eligible))
-      dragElements.model.add(new Option(`${run.id} · ${V.models[run.model] || run.model}`, run.calibration_file));
+      dragElements.model.add(new Option(`${run.id} · ${V.models[run.model] || run.model} · ${qualityLabel(run)}`, run.calibration_file));
     dragElements.model.value = runs.some(run => run.eligible && run.calibration_file === dragModel) ? dragModel : "";
     if (!dragInitialized && snapshot?.state?.drag_settings) {
       const saved = snapshot.state.drag_settings;
@@ -66,7 +68,70 @@ if (typeof document !== "undefined") (() => {
         dragInitialized = true;
       }
     }
+    const savedModel = $("parameter-save-model").value;
+    $("parameter-save-model").replaceChildren(new Option("请选择已测试的标定结果", ""));
+    for (const run of runs.filter(run => run.eligible))
+      $("parameter-save-model").add(new Option(
+        `${run.id} · ${V.models[run.model] || run.model} · ${qualityLabel(run)} · ${run.save_test_run ? "拖动已完成" : "待拖动测试"}`, run.id));
+    $("parameter-save-model").value = runs.some(run => run.eligible && run.id === savedModel) ? savedModel : "";
   }
+  function renderParameterSave() {
+    const state = snapshot?.state, connected = snapshot?.connected && !connectionFailed;
+    const run = runs.find(item => item.id === $("parameter-save-model").value && item.eligible);
+    const context = JSON.stringify([state?.controller_id, state?.generation, run?.id, run?.save_test_run]);
+    if (context !== saveContext || !connected || !state?.stop_confirmed) {
+      $("parameter-save-confirm").checked = false;
+      saveContext = context;
+    }
+    const locked = !connected || busy || Boolean(pendingVersion) || !snapshot?.services_ready ||
+      !snapshot?.capabilities?.manual_parameter_save || !state?.system_parameters_file ||
+      !state?.stop_confirmed || V.active.has(state?.phase) || state?.stage === "stopping";
+    $("parameter-save-model").disabled = locked;
+    $("parameter-save-confirm").disabled = locked || !run?.save_test_run;
+    $("parameter-save-submit").disabled = locked || !run?.save_test_run || !$("parameter-save-confirm").checked;
+    populateDL("parameter-save-details", [
+      ["目标电机", state?.identity?.namespace || "—"],
+      ["环境", state?.identity ? state.identity.simulated ? "仿真" : "真机" : "—"],
+      ["共享文件", state?.system_parameters_file || "未配置"],
+      ["对应拖动记录", run?.save_test_run || "尚未完成"],
+      ["自动质量评价", run ? qualityLabel(run) : "—"],
+      ["验证 RMS / 门限", run ? `${V.number(run.quality?.validation_rmse, 4)} / ${V.number(run.quality?.rmse_limit, 4)} Nm` : "—"],
+      ["本控制器最近保存", state?.last_parameter_save
+        ? `${state.last_parameter_save.calibration_run} · ${state.last_parameter_save.saved_at}` : "尚无"],
+    ]);
+    text("parameter-save-status", !connected ? "连接中断，禁止保存。"
+      : !snapshot?.capabilities?.manual_parameter_save ? "请在失能后更新控制器以启用手动保存。"
+      : !state?.system_parameters_file ? "未配置共享参数文件，不能保存。"
+      : !state.stop_confirmed || V.active.has(state.phase) ? "请先停止并等待新鲜失能反馈。"
+      : !run ? "请选择模型并查看报告；自动指标不替代用户判断，仅生成报告不会改变系统参数。"
+      : !run.save_test_run ? run.save_blocked_reason || "请先完成对应模型的拖动测试。"
+      : "标定与拖动测试记录已匹配；是否接受由你决定。确认后保存，保留自动指标原始结果，不改标为自动合格。");
+  }
+  $("parameter-save-model").addEventListener("change", () => {
+    $("parameter-save-action").hidden = true; renderParameterSave();
+  });
+  $("parameter-save-confirm").addEventListener("change", renderParameterSave);
+  $("parameter-save-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const state = snapshot?.state;
+    const run = runs.find(item => item.id === $("parameter-save-model").value && item.eligible);
+    if ($("parameter-save-submit").disabled || !state || !run?.save_test_run) return;
+    busy = true; render();
+    try {
+      const result = await api("/api/parameters/save", {run: run.id, test_run: run.save_test_run, confirm: true,
+        controller_id: state.controller_id, generation: state.generation});
+      pendingVersion = {controller_id: state.controller_id, generation: result.generation, kind: "save"};
+      text("parameter-save-action", `已保存 ${run.id} 至 ${result.saved.system_parameters_file}。电机保持失能。`);
+      $("parameter-save-action").className = "notice";
+    } catch (error) {
+      text("parameter-save-action", `保存未确认：${error.message}。请检查共享参数和状态，不要当作已成功保存。`);
+      $("parameter-save-action").className = "notice error";
+    } finally {
+      $("parameter-save-action").hidden = false;
+      $("parameter-save-confirm").checked = false;
+      busy = false; render();
+    }
+  });
   function fillForm(state) {
     const config = calibrationConfig(state);
     options();
@@ -312,12 +377,14 @@ if (typeof document !== "undefined") (() => {
       state?.motor_ready === false || state?.motor?.host_fault || state?.motor?.device_fault || hardwareBlocked ||
       (state?.motor?.simulated === false && !$("drag-confirm-hardware").checked);
     text("drag-model-note", model
-      ? `辨识速度包络 ${V.number(model.domain?.velocity_min, 3)}～${V.number(model.domain?.velocity_max, 3)} rad/s；原报告残差门限 ${V.number(model.quality?.rmse_limit, 4)} Nm。`
-      : runs.some(run => run.eligible) ? "请选择合格模型；不会自动使用最新的未合格候选或流程测试结果。"
-        : "当前没有身份匹配的合格摩擦模型，不能开始补偿拖动。");
+      ? `${qualityLabel(model)}。辨识速度包络 ${V.number(model.domain?.velocity_min, 3)}～${V.number(model.domain?.velocity_max, 3)} rad/s；` +
+        `验证 RMS ${V.number(model.quality?.validation_rmse, 4)} / 参考门限 ${V.number(model.quality?.rmse_limit, 4)} Nm。` +
+        (model.quality_issues?.length ? ` 有 ${model.quality_issues.length} 项质量提示，请查看原报告后决定是否测试。` : "")
+      : runs.some(run => run.eligible) ? "请选择模型并查看报告；自动未达标的候选也可由用户测试和评估。"
+        : "当前没有身份匹配、参数完整有效的摩擦模型，不能开始补偿拖动。");
     const outside = model && state?.motor && (state.motor.velocity < model.domain?.velocity_min ||
       state.motor.velocity > model.domain?.velocity_max);
-    dragElements.model.title = model ? `${model.id} · ${V.models[model.model] || model.model}` : "请选择合格模型";
+    dragElements.model.title = model ? `${model.id} · ${V.models[model.model] || model.model}` : "请选择模型";
     $("drag-domain-alert").hidden = !(connected && outside && dragRun && running);
     text("drag-domain-note", model
       ? `${outside ? "当前速度已超出辨识包络。 " : ""}静止 / 死区内不主动补偿；域外模型查询会夹断，不代表域外精度已验证。` +
@@ -796,6 +863,7 @@ if (typeof document !== "undefined") (() => {
   }
   function render() {
     const state = snapshot?.state, connected = Boolean(snapshot?.connected && !connectionFailed);
+    renderParameterSave();
     text("connection", connected ? "实时连接" : "连接中断 / 等待");
     $("connection").className = `badge ${connected ? "good" : "bad"}`;
     document.querySelector(".metrics").classList.toggle("stale", !connected || !state?.motor);
@@ -897,7 +965,7 @@ if (typeof document !== "undefined") (() => {
       : state.experiment === "compensate" ? "仅根据实测速度提供有界摩擦助力，不施加位置伺服、不猜测静止起步方向；到时或停止后失能。"
       : state.stage === "fitting" ? "已确认电机失能，正在辨识 / 校验并持久化；此时不发送运动目标。"
       : state.experiment === "precision" ? "采集与质量评价分开：精度偏差、温漂和未稳速数据照常记录，不阻断后续档位；硬件故障和安全保护仍会停止。"
-      : state.experiment === "fourier" ? "先预运行、测零偏和独立静摩擦，再执行傅里叶训练与验证周期；原始反馈完整记录，未合格候选不作为可用补偿。"
+      : state.experiment === "fourier" ? "先预运行、测零偏和独立静摩擦，再执行傅里叶训练与验证周期；原始反馈完整记录，模型是否接受由用户查看报告和拖动测试后决定。"
       : "纯力矩驱动多频轨迹；判据未通过时保留现场数据，不发布可用标定。");
     text("position-value", V.number(motor?.position)); text("velocity-value", V.number(motor?.velocity));
     text("torque-value", V.number(motor?.torque)); text("temperature-value", motor ? `${motor.rotor_temperature} / ${motor.mos_temperature}` : "—");

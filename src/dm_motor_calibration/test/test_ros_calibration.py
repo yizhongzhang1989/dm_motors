@@ -23,6 +23,7 @@ from dm_motor_calibration.ros_node import disabled_feedback, motor_identity, req
 from dm_motor_calibration.simulation import collect_simulation
 from dm_motor_interfaces.msg import MotorSetpoint, MotorState, MotorTarget
 from dm_motor_interfaces.srv import SimulationControl
+from dm_motor_control.system_parameters import SystemParameters
 
 
 class Scene:
@@ -43,6 +44,8 @@ class Scene:
         self.stop = self.node.create_client(Trigger, self.prefix + "/calibration/stop")
         self.simulation = self.node.create_client(SimulationControl, self.motor + "/simulation/control")
         self.config = yaml.safe_load(ConfigManager().path.read_text())
+        self.config["system_parameters_file"] = str(directory / "system_parameters.yaml")
+        (directory / "system_parameters.yaml").write_text("version: 1\nmotors: {}\n")
         self.config["packages"]["dm_motor_control"]["nodes"]["sim_motor_node"].update(
             inertia=0.018, coulomb_friction=0.065, viscous_friction=0.037, static_friction=0.1)
         self.options = self.config["packages"]["dm_motor_calibration"]["nodes"]["calibration_node"]
@@ -124,6 +127,12 @@ class Scene:
         assert self.status["phase"] in allowed, json.dumps(self.status, ensure_ascii=False)
         assert self.status["stop_confirmed"], self.status
         self.wait(lambda: self.state.phase == MotorState.DISABLED and self.state.status == 0)
+        if self.status["experiment"] in ("calibrate", "precision", "fourier", "breakaway"):
+            kind = "breakaway" if self.status["experiment"] == "breakaway" else "mechanical"
+            entry = SystemParameters(Path(self.config["system_parameters_file"])).calibration(
+                self.motor, True, kind)
+            if entry is not None:
+                assert Path(entry["source"]).parent != Path(self.status["output_directory"])
         return Path(self.status["output_directory"])
 
     def close(self):
@@ -208,6 +217,7 @@ def test_production_calibration_ab_compensation_and_feedback_failure(scene):
     static_fit = FitResult.load(breakaway / "breakaway.json")
     assert static_fit.parameters["breakaway_positive"] == pytest.approx(0.1, abs=0.025)
     assert static_fit.parameters["breakaway_negative"] == pytest.approx(0.1, abs=0.025)
+    shared_bytes = Path(scene.config["system_parameters_file"]).read_bytes()
     scene.options.update(experiment="compensate", duration=16.0)
     scene.launch_collector()
     initial = scene.state.position
@@ -224,6 +234,7 @@ def test_production_calibration_ab_compensation_and_feedback_failure(scene):
     failed = Path(scene.status["output_directory"])
     assert not (failed / "calibration.json").exists()
     assert json.loads((failed / "report.json").read_text())["status"] == "failed"
+    assert Path(scene.config["system_parameters_file"]).read_bytes() == shared_bytes
     future = scene.start.call_async(Trigger.Request())
     scene.wait(future.done)
     assert not future.result().success

@@ -1,6 +1,7 @@
 #include "dm_motor_lead_follow/follow.hpp"
 #include "common/config.hpp"
 #include "dm_motor_control/motor_session.hpp"
+#include "dm_motor_control/system_parameters.hpp"
 
 #include <array>
 #include <chrono>
@@ -46,6 +47,12 @@ public:
   {
     const common::Config defaults(
       declare_parameter<std::string>("config_file", common::default_config_path()));
+    system_parameters_file_ = dm_motor::system_parameters_path(defaults);
+    if (system_parameters_file_.empty()) {
+      RCLCPP_WARN(get_logger(), "No system_parameters_file configured; leader friction compensation is disabled");
+    } else {
+      dm_motor::SystemParameters validate(system_parameters_file_);
+    }
     rcl_interfaces::msg::ParameterDescriptor fixed;
     fixed.read_only = true;
     axes_[0].name = declare_parameter<std::string>("leader", defaults.get<std::string>("packages.dm_motor_lead_follow.nodes.lead_follow_node.leader"), fixed);
@@ -131,6 +138,9 @@ public:
             swap_roles_ = swap_roles;
             for (auto & axis : axes_) {axis.origin = axis.state->position;}
             ideal_ = target_ = follower().origin;
+            for (auto & compensation : compensators_) {
+              if (compensation) {compensation->reset();}
+            }
           }
           result.successful = true;
         } catch (const std::exception & error) {
@@ -224,6 +234,10 @@ private:
     {
       throw std::runtime_error(axis.name + ": requires ready, fault-free MIT mode without an active task");
     }
+    const auto index = &axis - axes_.data();
+    if (calibration_identities_[index].IsMap()) {
+      dm_motor::check_calibration_identity(calibration_identities_[index], axis.name, state);
+    }
     check_motion(state.position, axis.origin, state.velocity, state.torque,
       std::max(state.mos_temperature, state.rotor_temperature), settings_);
     if (!std::isfinite(state.position_min) || !std::isfinite(state.position_max) ||
@@ -239,6 +253,8 @@ private:
     if (phase_ != State::IDLE && phase_ != State::FAULT) {
       throw std::runtime_error("Controller busy; stop before starting again");
     }
+    compensators_ = {};
+    for (auto & identity : calibration_identities_) {identity.reset();}
     for (auto & axis : axes_) {
       if (!disabled(axis) || axis.pending || !axis.token.empty())
       {
@@ -254,6 +270,26 @@ private:
       }
       axis.rejected = axis.state->rejected_commands;
       axis.configuration_checked = false;
+    }
+    if (!system_parameters_file_.empty()) {
+      const dm_motor::SystemParameters shared(system_parameters_file_);
+      for (size_t i = 0; i < axes_.size(); ++i) {
+        compensators_[i] = shared.compensator(axes_[i].name, *axes_[i].state);
+        if (compensators_[i]) {
+          const auto & state = *axes_[i].state;
+          auto & identity = calibration_identities_[i];
+          identity["namespace"] = axes_[i].name;
+          identity["motor_id"] = static_cast<int>(state.motor_id);
+          identity["simulated"] = state.simulated;
+          identity["mode"] = static_cast<int>(state.mode);
+          identity["direction"] = state.direction;
+          identity["software_offset"] = state.software_offset;
+          identity["pmax"] = state.pmax; identity["vmax"] = state.vmax; identity["tmax"] = state.tmax;
+        }
+        RCLCPP_INFO(get_logger(), "%s: %s", axes_[i].name.c_str(), compensators_[i] ?
+          "shared friction model loaded (automatic qualification or recorded user acceptance)" :
+          "no friction calibration; zero feedforward");
+      }
     }
     const auto & follower_state = *follower().state;
     if (!std::isfinite(follower_state.kp_limit) || !std::isfinite(follower_state.kd_limit) ||
@@ -323,6 +359,9 @@ private:
 
   void begin_stop(const std::string & reason, bool fault)
   {
+    for (auto & compensation : compensators_) {
+      if (compensation) {compensation->reset();}
+    }
     operator_session_.clear();
     if (phase_ == State::STOPPING) {return;}
     fault_stop_ = fault;
@@ -360,10 +399,11 @@ private:
     }
   }
 
-  void publish_target(Axis & axis, double position, double kp, double kd)
+  void publish_target(Axis & axis, double position, double kp, double kd, double torque = 0)
   {
     dm_motor_interfaces::msg::MotorTarget target;
     target.mode = 1; target.position = position; target.kp = kp; target.kd = kd;
+    target.torque = torque;
     dm_motor::send_motor_target(axis, target, client_, validity_, now());
   }
 
@@ -444,7 +484,16 @@ private:
         throw std::runtime_error("Following error exceeds limit");
       }
       target_ = limited_target(ideal_, target_, dt, settings_);
-      publish_target(leader(), leader().state->position, 0, 0);
+      double assistance = 0;
+      auto & compensation = compensators_[swap_roles_ ? 1 : 0];
+      if (compensation) {
+        const auto & state = *leader().state;
+        double budget = state.tmax;
+        if (state.torque_limit > 0) {budget = std::min(budget, state.torque_limit);}
+        if (settings_.motion_limits_enabled) {budget = std::min(budget, settings_.max_torque);}
+        assistance = compensation->step(state.velocity, dt, budget);
+      }
+      publish_target(leader(), leader().state->position, 0, 0, assistance);
       publish_target(follower(), target_, settings_.kp, settings_.kd);
       ++command_count_;
     } catch (const std::exception & error) {
@@ -471,6 +520,9 @@ private:
   }
 
   std::array<Axis, 2> axes_;
+  std::array<std::optional<dm_motor::FrictionCompensator>, 2> compensators_;
+  std::array<YAML::Node, 2> calibration_identities_;
+  std::string system_parameters_file_;
   Settings settings_;
   std::string client_, message_{"Idle; explicit start required"};
   uint8_t phase_{State::IDLE};
