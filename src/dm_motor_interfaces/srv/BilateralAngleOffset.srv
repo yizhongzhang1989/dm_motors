@@ -1,0 +1,19 @@
+# One explicit virtual relative-angle offset in the current guarded ACTIVE session.
+# e_virtual = (qA-originA) - direction*(qB-originB) + applied_offset.
+# Encoder/software zero and the raw position_error are unchanged.
+std_msgs/Header header
+# 0 < valid_for <= 0.5 seconds; accepted request stamps must increase.
+float64 valid_for
+string session
+# Finite, nonzero radians, abs(offset) <= pi/6. Target A -= offset, B += direction*offset.
+float64 offset
+# Quintic transition from zero, 0..5 seconds. Physical motors require at least 2 seconds.
+float64 transition_time
+# Hold after the transition, 0 < hold_duration <= 10 seconds.
+# Expiry or feedback/session loss stops both motors before clearing the offset.
+float64 hold_duration
+---
+bool success
+string message
+# Monotonically increasing within this controller process; zero on rejection.
+uint64 offset_id

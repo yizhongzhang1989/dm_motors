@@ -39,7 +39,7 @@ class PhysicalMotorScene(unittest.TestCase):
         pass
 
     def setUp(self):
-        os.environ["ROS_DOMAIN_ID"] = str(145 + os.getpid() % 20)
+        os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(145 + os.getpid() % 20))
         rclpy.init()
         self.namespace = f"/physics_test_{os.getpid()}_{time.monotonic_ns()}"
         self.node = Node("physics_probe", namespace=self.namespace)
@@ -72,6 +72,9 @@ class PhysicalMotorScene(unittest.TestCase):
         self.parameter_client = self.node.create_client(
             SetParametersAtomically, self.controller_name + "/set_parameters_atomically")
         document = yaml.safe_load(ConfigManager().path.read_text())
+        registry = Path(self.directory.name) / "system_parameters.yaml"
+        registry.write_text("version: 1\nmotors: {}\n")
+        document["system_parameters_file"] = str(registry)
         launch_profile = document["packages"]["dm_motor_bringup"]["launches"][self.controller_name + ".launch.py"]
         launch_profile["parameters"].update(can_dashboard_ports={}, motor_dashboard_ports={}, dashboard_port="")
         profile = launch_profile["variants"]["simulation"]

@@ -4,9 +4,72 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <vector>
 #include <unistd.h>
 
 using namespace dm_motor::simulation;
+
+TEST(FeedbackDynamics, PreservesInitialStateAndQueriesDoNotAdvanceTheMeasurementChain)
+{
+  FeedbackParameters p;
+  p.velocity_time_constant = .02;
+  p.feedback_velocity_source = "physical";
+  p.feedback_velocity_time_constant = .01;
+  p.feedback_velocity_delay = .0015;
+  p.feedback_torque_time_constant = .02;
+  p.feedback_torque_delay = .0015;
+  FeedbackDynamics chain(p, .2, 10.0);
+  EXPECT_DOUBLE_EQ(chain.velocity(10), .2);
+  EXPECT_DOUBLE_EQ(chain.torque(10), 0);
+  chain.advance(.001, 10.001, 1.2, 1);
+  chain.advance(.001, 10.002, 1.2, 1);
+  const double v = .2 + .5 * -std::expm1(-.001 / .01);
+  const double torque = .5 * -std::expm1(-.001 / .02);
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_NEAR(chain.velocity(10.002), v, 1e-12);
+    EXPECT_NEAR(chain.torque(10.002), torque, 1e-12);
+    EXPECT_NEAR(chain.internal_velocity(), .2 + -std::expm1(-.002 / .02), 1e-14);
+  }
+}
+
+TEST(Device, LuGreMemorySurvivesStopEnableAndVirtualPowerCycle)
+{
+  DeviceParameters p;
+  p.physics.friction_model = "lugre";
+  p.physics.inertia = .01; p.physics.coulomb_friction = .12; p.physics.static_friction = .2;
+  p.physics.friction_displacement_scale = .005; p.physics.stribeck_velocity = .04;
+  p.physics.torque_time_constant = 0; p.integration_step = .0001;
+  VirtualMotor switched(p), continuous(p);
+  const auto values = [](const PhysicsState & s) {
+      return std::vector<double>{s.position, s.velocity, s.motor_torque, s.mechanical_energy,
+        s.bristle_displacement, s.bristle_torque, s.bristle_energy, s.total_storage,
+        s.bristle_drive_work, s.bristle_dissipation, s.viscous_dissipation};
+    };
+  for (auto * motor : {&switched, &continuous}) {
+    motor->receive(dm_motor::special_frame(1, 0xfc), 0);
+    motor->external_torque(.05, .01, 0);
+    motor->advance(.01);
+    motor->external_torque(0, .1, .01);
+  }
+  const auto before = values(switched.state());
+  const double before_z = switched.state().bristle_displacement;
+  ASSERT_NE(before_z, 0);
+  switched.receive(dm_motor::special_frame(1, 0xfd), .01);
+  EXPECT_EQ(values(switched.state()), before);
+  switched.power_cycle();
+  EXPECT_EQ(values(switched.state()), before);
+  switched.advance(.02); continuous.advance(.02);
+  EXPECT_EQ(values(switched.state()), values(continuous.state()));
+  EXPECT_NE(switched.state().bristle_displacement, before_z);
+  const auto after_release = values(switched.state());
+  switched.receive(dm_motor::special_frame(1, 0xfc), .02);
+  EXPECT_EQ(values(switched.state()), after_release);
+  switched.advance(.03); continuous.advance(.03);
+  EXPECT_EQ(values(switched.state()), values(continuous.state()));
+  // A new physical instance, unlike a virtual firmware power cycle, initializes z.
+  VirtualMotor reconstructed(p);
+  EXPECT_DOUBLE_EQ(reconstructed.state().bristle_displacement, p.physics.initial_bristle_displacement);
+}
 
 dm_motor::Frame reg(uint8_t opcode, uint8_t rid, uint32_t raw = 0)
 {
@@ -33,6 +96,280 @@ TEST(Device, QueryTrafficDoesNotAcceleratePhysicsAndForceExpires)
   EXPECT_NEAR(slow.state().position, 0.75, 0.002);
   EXPECT_NEAR(slow.state().velocity, 1, 0.002);
   EXPECT_DOUBLE_EQ(slow.external_remaining(), 0);
+}
+
+TEST(Device, IdealVelocityEstimatePreservesPhysicalFeedback)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.initial_velocity = 0.2;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  ASSERT_DOUBLE_EQ(p.velocity_time_constant, 0);
+  VirtualMotor motor(p);
+  EXPECT_DOUBLE_EQ(motor.feedback().v, p.physics.initial_velocity);
+  motor.external_torque(1, 0.1, 0);
+  for (int i = 1; i <= 20; ++i) {
+    motor.advance(i * p.integration_step);
+    EXPECT_DOUBLE_EQ(motor.feedback().v, motor.state().velocity);
+  }
+  EXPECT_NEAR(motor.state().velocity, 0.21, 1e-12);
+}
+
+TEST(Device, VelocityEstimatorLagsAtEachPhysicsSubstepAndFeedsWireFeedback)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.initial_velocity = 0.2;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.velocity_time_constant = 0.01;
+  VirtualMotor motor(p);
+  EXPECT_DOUBLE_EQ(motor.feedback().v, p.physics.initial_velocity);
+  motor.external_torque(1, 0.1, 0);
+  motor.advance(2 * p.integration_step);
+  const double response = -std::expm1(-p.integration_step / p.velocity_time_constant);
+  double expected = p.physics.initial_velocity;
+  for (int i = 1; i <= 2; ++i) {
+    expected += response * (p.physics.initial_velocity + i * p.integration_step - expected);
+  }
+  EXPECT_NEAR(motor.feedback().v, expected, 1e-14);
+  EXPECT_NEAR(motor.state().velocity, 0.201, 1e-14);
+  EXPECT_LT(motor.feedback().v, motor.state().velocity);
+  const auto replies = motor.receive(dm_motor::query_frame(1), motor.time());
+  ASSERT_EQ(replies.size(), 1u);
+  const auto decoded = dm_motor::decode_feedback(replies.front(), 1, 0, p.motor.mapping);
+  ASSERT_TRUE(decoded);
+  EXPECT_NEAR(decoded->v, expected, 2 * p.motor.mapping.v / 4095.0);
+}
+
+TEST(Device, MitDampingUsesTheSameLaggedVelocityAsFeedback)
+{
+  DeviceParameters p;
+  p.physics.inertia = 0.1;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.physics.torque_time_constant = 0;
+  p.velocity_time_constant = 0.01;
+  VirtualMotor motor(p);
+  motor.external_torque(1, 0.1, 0);
+  motor.advance(p.integration_step);
+  const double measured = motor.feedback().v, physical = motor.state().velocity;
+  const auto frame = dm_motor::mit_frame(1, {0, 0, 0, 1, 0}, p.motor.mapping);
+  const auto command = dm_motor::decode_mit(frame, p.motor.mapping);
+  motor.receive(dm_motor::special_frame(1, 0xfc), motor.time());
+  motor.receive(frame, motor.time());
+  motor.advance(2 * p.integration_step);
+  EXPECT_NEAR(motor.state().motor_torque, command.kd * (command.v - measured) + command.t, 1e-12);
+  EXPECT_GT(std::abs(motor.state().motor_torque -
+    (command.kd * (command.v - physical) + command.t)), 0.004);
+}
+
+TEST(Device, VelocityEstimateStaysContinuousAcrossDisableZeroAndPowerCycle)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.velocity_time_constant = 0.01;
+  VirtualMotor motor(p);
+  motor.external_torque(1, 0.1, 0);
+  motor.advance(0.01);
+  const double measured = motor.feedback().v, physical = motor.state().velocity;
+  ASSERT_LT(measured, physical);
+  motor.receive(dm_motor::special_frame(1, 0xfd), motor.time());
+  EXPECT_DOUBLE_EQ(motor.feedback().v, measured);
+  motor.receive(dm_motor::special_frame(1, 0xfe), motor.time());
+  EXPECT_DOUBLE_EQ(motor.feedback().v, measured);
+  motor.power_cycle();
+  EXPECT_DOUBLE_EQ(motor.feedback().v, measured);
+  EXPECT_DOUBLE_EQ(motor.state().velocity, physical);
+  motor.advance(0.02);
+  EXPECT_GT(motor.feedback().v, measured);
+  EXPECT_LT(motor.feedback().v, physical);
+}
+
+TEST(Device, VelocityEstimatorRejectsInvalidTimeConstants)
+{
+  DeviceParameters p;
+  for (double value : {-0.001, 0.100001, std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::quiet_NaN()})
+  {
+    p.velocity_time_constant = value;
+    EXPECT_THROW(VirtualMotor{p}, std::invalid_argument);
+  }
+  for (double value : {0.0, 0.1}) {
+    p.velocity_time_constant = value;
+    EXPECT_NO_THROW(VirtualMotor{p});
+  }
+}
+
+TEST(Device, PhysicalFeedbackVelocityCanBypassTheInternalEstimator)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.initial_velocity = 0.2;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.velocity_time_constant = 0.01;
+  VirtualMotor legacy(p);
+  p.feedback_velocity_source = "physical";
+  VirtualMotor physical(p);
+  legacy.external_torque(1, 0.1, 0); physical.external_torque(1, 0.1, 0);
+  legacy.advance(0.01); physical.advance(0.01);
+  EXPECT_DOUBLE_EQ(physical.feedback().v, physical.state().velocity);
+  EXPECT_LT(legacy.feedback().v, physical.feedback().v);
+  EXPECT_DOUBLE_EQ(legacy.state().velocity, physical.state().velocity);
+}
+
+TEST(Device, ReportingDynamicsDoNotChangeMitInternalDampingOrPhysicalState)
+{
+  DeviceParameters p;
+  p.physics.inertia = 0.01;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.velocity_time_constant = 0.01;
+  VirtualMotor legacy(p);
+  p.feedback_velocity_source = "physical";
+  p.feedback_velocity_time_constant = 0.02;
+  p.feedback_velocity_delay = 0.0015;
+  p.feedback_torque_time_constant = 0.012;
+  p.feedback_torque_delay = 0.003;
+  VirtualMotor reported(p);
+  const auto command = dm_motor::mit_frame(1, {0.01, 0.2, 20, 1, 0.1}, p.motor.mapping);
+  for (auto * motor : {&legacy, &reported}) {
+    motor->receive(dm_motor::special_frame(1, 0xfc), 0);
+    motor->receive(command, 0);
+  }
+  double velocity_difference = 0, torque_difference = 0;
+  for (int i = 1; i <= 100; ++i) {
+    legacy.advance(i * p.integration_step); reported.advance(i * p.integration_step);
+    EXPECT_DOUBLE_EQ(legacy.state().position, reported.state().position);
+    EXPECT_DOUBLE_EQ(legacy.state().velocity, reported.state().velocity);
+    EXPECT_DOUBLE_EQ(legacy.state().motor_torque, reported.state().motor_torque);
+    EXPECT_DOUBLE_EQ(legacy.feedback().t, legacy.state().motor_torque);
+    velocity_difference = std::max(velocity_difference, std::abs(legacy.feedback().v - reported.feedback().v));
+    torque_difference = std::max(torque_difference, std::abs(legacy.feedback().t - reported.feedback().t));
+  }
+  EXPECT_GT(velocity_difference, 0.01);
+  EXPECT_GT(torque_difference, 0.01);
+}
+
+TEST(Device, FeedbackVelocityFilterUsesSubstepsAndInterpolatesFractionalDelay)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.initial_velocity = 0.2;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.velocity_time_constant = 0.01;
+  p.feedback_velocity_source = "physical";
+  p.feedback_velocity_time_constant = 0.0045;
+  p.feedback_velocity_delay = 0.00075;
+  VirtualMotor motor(p);
+  motor.external_torque(1, 0.1, 0);
+  motor.advance(0.0005);
+  EXPECT_DOUBLE_EQ(motor.feedback().v, p.physics.initial_velocity);
+  motor.advance(0.005);
+  std::vector<double> samples{p.physics.initial_velocity};
+  const double response = -std::expm1(-p.integration_step / p.feedback_velocity_time_constant);
+  for (int i = 1; i <= 10; ++i) {
+    const double velocity = p.physics.initial_velocity + i * p.integration_step;
+    samples.push_back((1 - response) * samples.back() + response * velocity);
+  }
+  // 5 ms - 0.75 ms falls halfway between the 4 and 4.5 ms samples.
+  const double expected = (samples[8] + samples[9]) / 2;
+  EXPECT_NEAR(motor.feedback().v, expected, 1e-13);
+  EXPECT_NEAR(motor.state().velocity, 0.205, 1e-13);
+  const auto wire = motor.receive(dm_motor::query_frame(1), motor.time()).front();
+  const auto decoded = dm_motor::decode_feedback(wire, 1, 0, p.motor.mapping);
+  ASSERT_TRUE(decoded);
+  EXPECT_NEAR(decoded->v, expected, 2 * p.motor.mapping.v / 4095.0);
+}
+
+TEST(Device, FeedbackTorqueDelayDoesNotDelayTheActualActuator)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.physics.torque_time_constant = 0;
+  p.feedback_torque_time_constant = 0.012;
+  p.feedback_torque_delay = 0.00075;
+  VirtualMotor motor(p);
+  const auto frame = dm_motor::mit_frame(1, {0, 0, 0, 0, 1}, p.motor.mapping);
+  const double torque = dm_motor::decode_mit(frame, p.motor.mapping).t;
+  motor.receive(dm_motor::special_frame(1, 0xfc), 0);
+  motor.receive(frame, 0);
+  motor.advance(p.integration_step);
+  EXPECT_DOUBLE_EQ(motor.state().motor_torque, torque);
+  EXPECT_DOUBLE_EQ(motor.feedback().t, 0);
+  motor.advance(2 * p.integration_step);
+  EXPECT_DOUBLE_EQ(motor.state().motor_torque, torque);
+  const double response = -std::expm1(-p.integration_step / p.feedback_torque_time_constant);
+  EXPECT_NEAR(motor.feedback().t, torque * response / 2, 1e-13);
+  EXPECT_GT(motor.state().velocity, 0);
+  const auto wire = motor.receive(dm_motor::query_frame(1), motor.time()).front();
+  const auto decoded = dm_motor::decode_feedback(wire, 1, 0, p.motor.mapping);
+  ASSERT_TRUE(decoded);
+  EXPECT_NEAR(decoded->t, motor.feedback().t, 2 * p.motor.mapping.t / 4095.0);
+}
+
+TEST(Device, ReportingHistoryRemainsContinuousAcrossDisableZeroAndPowerCycle)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.feedback_velocity_time_constant = p.feedback_torque_time_constant = 0.01;
+  p.feedback_velocity_delay = p.feedback_torque_delay = 0.003;
+  VirtualMotor motor(p);
+  motor.receive(dm_motor::special_frame(1, 0xfc), 0);
+  motor.receive(dm_motor::mit_frame(1, {0, 0, 0, 0, 0.5}, p.motor.mapping), 0);
+  motor.advance(0.01);
+  const auto feedback = motor.feedback();
+  const double physical_velocity = motor.state().velocity;
+  ASSERT_GT(feedback.t, 0);
+  for (const auto opcode : {0xfd, 0xfe}) {
+    motor.receive(dm_motor::special_frame(1, opcode), motor.time());
+    EXPECT_DOUBLE_EQ(motor.feedback().v, feedback.v);
+    EXPECT_DOUBLE_EQ(motor.feedback().t, feedback.t);
+  }
+  motor.power_cycle();
+  EXPECT_DOUBLE_EQ(motor.feedback().v, feedback.v);
+  EXPECT_DOUBLE_EQ(motor.feedback().t, feedback.t);
+  EXPECT_DOUBLE_EQ(motor.state().velocity, physical_velocity);
+  motor.advance(0.02);
+  EXPECT_DOUBLE_EQ(motor.state().motor_torque, 0);
+  EXPECT_GT(motor.feedback().t, 0);
+  EXPECT_LT(motor.feedback().t, feedback.t);
+}
+
+TEST(Device, FeedbackHistorySupportsTheFullDelayAtMinimumIntegrationStep)
+{
+  DeviceParameters p;
+  p.physics.inertia = 1;
+  p.physics.viscous_friction = p.physics.coulomb_friction = p.physics.static_friction = 0;
+  p.integration_step = 1e-5;
+  p.feedback_velocity_delay = p.feedback_torque_delay = 0.1;
+  VirtualMotor motor(p);
+  motor.external_torque(1, 1.5, 0);
+  motor.advance(1);
+  EXPECT_NEAR(motor.feedback().v, 0.9, 1e-8);
+  EXPECT_NEAR(motor.state().velocity, 1, 1e-8);
+}
+
+TEST(Device, ReportingChannelsRejectInvalidSourcesAndLatencies)
+{
+  DeviceParameters p;
+  p.feedback_velocity_source = "unknown";
+  EXPECT_THROW(VirtualMotor{p}, std::invalid_argument);
+  p.feedback_velocity_source = "internal";
+  for (auto member : {&DeviceParameters::feedback_velocity_time_constant, &DeviceParameters::feedback_velocity_delay,
+      &DeviceParameters::feedback_torque_time_constant, &DeviceParameters::feedback_torque_delay})
+  {
+    for (double value : {-0.001, 0.100001, std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN()})
+    {
+      p.*member = value;
+      EXPECT_THROW(VirtualMotor{p}, std::invalid_argument);
+    }
+    p.*member = 0.1;
+    EXPECT_NO_THROW(VirtualMotor{p});
+    p.*member = 0;
+    EXPECT_NO_THROW(VirtualMotor{p});
+  }
 }
 
 TEST(Device, FirmwareWatchdogExpiresWithoutCanCommands)

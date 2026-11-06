@@ -103,7 +103,7 @@ def test_rate_restoration_finishes_before_committing_results():
     future = Future()
     endpoint = SimpleNamespace(call_async=Mock(return_value=future))
     controller = SimpleNamespace(
-        experiment="fourier", run_open=True, stop_confirmed=True, fourier_rate_changed=True,
+        experiment="fourier", run_open=True, stopping=False, stop_confirmed=True, fourier_rate_changed=True,
         fourier_restoring_rate=False, fourier_original_rate=200.0, fourier_setting_rate=False,
         fourier_rate_restored=False, pending=None, phase="fitting", error="", failure_stage="",
         topics=SimpleNamespace(endpoint=lambda _name: endpoint), record_event=Mock(), publish_status=Mock(),
@@ -124,7 +124,7 @@ def test_stop_cannot_resume_a_pending_fourier_static_review():
     future = Future()
     future.set_running_or_notify_cancel()
     controller = SimpleNamespace(
-        experiment="fourier", generation=3, precision_resume=True, fourier_static_future=future,
+        experiment="fourier", generation=3, precision_resume=True, fourier_static_future=future, drag_settings=None,
         fourier_restoring_rate=False, phase="fitting", run_open=True, failure_stage="", error="",
         finish_pending=False, record_event=Mock(), begin_stop=Mock())
     result = CalibrationNode.on_stop(controller, None, SimpleNamespace())
@@ -138,7 +138,7 @@ def test_stop_cannot_resume_a_pending_fourier_static_review():
 def test_stop_during_rate_restore_does_not_overwrite_its_future():
     future = Future()
     controller = SimpleNamespace(
-        experiment="fourier", generation=3, precision_resume=False, fourier_static_future=None,
+        experiment="fourier", generation=3, precision_resume=False, fourier_static_future=None, drag_settings=None,
         fourier_restoring_rate=True, stop_confirmed=True, motion_requested=False,
         phase="fitting", run_open=True, failure_stage="", error="", finish_pending=False,
         pending=future, record_event=Mock(), begin_stop=Mock())

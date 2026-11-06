@@ -43,8 +43,8 @@ ros2 launch dm_motor_bringup lead_follow.launch.py simulation:=true
 默认惯量/摩擦/负载参数不是工厂标定值；模型与实物的定量一致性需要现场辨识，
 不能以软件测试代替真实硬件安全或负载验收。
 
-**标准双边力控仿真**：使用相对起点、方向映射、共同增益预算和反馈配对/降级恢复，
-不是简易版的绝对位置互换。专用面板使用 8084：
+**标准双边力控仿真**：默认使用共享参考，将两轴相对位置的平均值作为自由移动的共同参考，
+保留方向映射、可选共同增益预算和反馈配对/降级恢复。专用面板使用 8084：
 
 ```bash
 ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true
@@ -53,16 +53,28 @@ ros2 launch dm_motor_bringup bilateral_control.launch.py simulation:=true
 与主从场景择一运行；不要同时开始两个控制器。算法、接口和硬件门禁见
 [标准双边力控](src/dm_motor_bilateral_control/README.md)。
 
+已有真机记录对应的[双轴仿真候选配置](config/bilateral_identification_20261104.md)，
+包含逐轴机械先验、反馈/报告动态和实测饱和平台；
+[辨识报告](src/dm_motor_bilateral_control/docs/2026-11-04-manual-identification.md)
+列出了验证误差、时序及热模型的剩余偏差。
+基于该模型的[低阻力双边仿真配置](config/bilateral_optimized_simulation_20261104.md)
+使用差模力矩消除共同位置参考的滞后阻力，保留两轴间刚度和原生阻尼；默认用于仿真，真机试验须显式设置只读启动许可。
+
+在其他计算机或电机系统上复现当前方案，参见[双边力控实现与迁移教程](docs/bilateral-control-tutorial.md)，包含控制推导、完整配置的编辑位置、标定接入、调试顺序及验收方法。
+当前A/C联轴台架的32轮新旧补偿对照及适用范围见[减阻报告](docs/2026-11-06-reconnected-friction-comparison.md)。13.2 rad/s时，C平均驱动力矩单边降低21%、双边降低24%；该指标包含C自身损耗。运行配置见[三轴配置](config/bilateral_physical_rig.md)，精简后的构建和真机验收见[清理记录](docs/cleanup-validation.md)，历史阶段证据见[索引](docs/experiment-history.md)。
+
 **电机参数自动标定与摩擦补偿**：新增独立
 [dm_motor_calibration](src/dm_motor_calibration/README.md)，支持五种可选摩擦模型、
 惯量/负载联合辨识、静摩擦起动试验、结果保存和补偿 A/B 测试。
-先用不连接任何硬件的生产物理模型完成整套流程：
+先用不连接硬件的生产物理模型执行与真机一致的快速训练、实测回位和独立验证：
 
 ```bash
-ros2 run dm_motor_calibration calibrate.py simulate --model auto --output /tmp/calibration-example
+ros2 run dm_motor_calibration calibrate.py quick-simulate --output /tmp/calibration-example
 ```
 
 ROS 自动采样入口默认停止且拒绝真机运动；显式开始后才运行有限激励。
+快速仿真输出完整采样、参数与方法快照、独立评分和HTML报告，输出目录不能已存在；
+旧`simulate`仍保留单段拟合与补偿演示语义。快速预测通过不代表惯量等物理参数已独立验证。
 电气、力矩常数和热学辨识需相应传感器数据，不能从现有运动反馈凭空恢复。
 独立电机启动后，可运行 `ros2 launch dm_motor_calibration calibration.launch.py`
 打开专用标定面板 **<http://127.0.0.1:8085/>**：模型选择、阶段进度、实时曲线、
@@ -292,11 +304,12 @@ source install/setup.bash
 空的 `CMAKE_BUILD_TYPE` 通常不启用优化；不能把未优化构建的测量当成部署性能。
 已有构建目录也可用上面的命令切换；不要在真实控制进程运行时替换其二进制或共享库。
 
-**每个新终端都要加载 ROS 和本工作空间：**
+**每个新终端都要加载 ROS 和本次构建实际生成的安装前缀：** 下方路径是占位符；只有刚按上例在当前源码目录成功构建时，该前缀才对应本目录的`install/`。已有旧`install/`不能代表当前版本或现场已验收的二进制。
 
 ```bash
+dm_install_prefix="/absolute/path/to/this-build/install"
 source /opt/ros/humble/setup.bash
-source ~/Documents/dm_motors/install/setup.bash
+source "$dm_install_prefix/setup.bash"
 ```
 
 修改 C++、接口或构建配置后需要重新 build；`--symlink-install` 不意味着 C++ 修改会自动生效。
@@ -334,6 +347,8 @@ source install/setup.bash
 影响其他电机。它不修改 ROS Topic QoS、CAN 后端或系统网络设置；显式 DDS 配置文件和其他
 `RMW_IMPLEMENTATION` 选择会被保留。所有驱动、客户端和记录器应从加载过工作区环境的终端启动。
 已有进程不会热切换配置，应先确认失能并停止旧系统，再重新加载环境和启动。
+Humble `rmw_fastrtps` 6.2.10 在 `ROS_LOCALHOST_ONLY=1` 时会在读取 XML 后主动追加
+本机 UDP 和 SHM 传输，因此该模式出现共享内存映射不代表工作区配置失效。
 
 ## 2. 系统启动与配置
 
@@ -874,33 +889,91 @@ CAN dashboard 允许配置的绑定主机名、本机系统主机名 / 短主机
 
 ### 4.5 标准双边力控面板
 
-独立包 `dm_motor_bilateral_control` 使用相对起点的对称 MIT PD 耦合，两侧前馈请求始终为零。
-两侧实时反馈按采集时间配对；同一比例缩放增益，量化后的 PD 估算不超过配置预算。
+独立包 `dm_motor_bilateral_control` 默认使用 `shared_reference` 共享参考模式，并从共享参数读取两轴摩擦模型。
+两轴最新相对位置的平均值形成可自由移动的共同位置参考；共同速度取各轴经 8 ms 滤波后的平均值，
+滤波按各自采集时间推进，不做位置预测。旧的对端参考 `native` 模式仍可显式选择，运行中不能切换模式。
+正式默认有效耦合参数为 `Kc=50, Dc=0.4975, B=0.005`，共享模式映射为实际 MIT 请求
+`Kp=2Kc=100, Kd=2Dc+B=1`。当前驱动策略要求 `Kc≤250`、`2Dc+B≤1`，并受两台驱动更小的能力限制；
+协议可编码 Kd 到 5，但本项目保留 Kd≤1 的请求限制，不能直接把放宽上限当作抑振方案。
+`max_torque=0` 表示不额外施加应用层总力矩预算：正常通信时保留设定的 MIT Kp/Kd，
+不因角差增大而缩小增益。正值保留共同预算模式，将 PD 与摩擦前馈计入总估算，再同步缩放两轴增益。
+共享参考采用 12 位速度反馈区间的中点估计；零预算时另外修正 MIT 位置/速度指令的已知编码残差；
+原始反馈与保护检查不变。编码修正与摩擦模型独立，关闭摩擦补偿后仍可能有小额前馈。
+补偿只使用各轴实测速度，含死区、滤波、斜率限制和标定速度域限幅；静止、降级及停止时清零。
 配对短时过期时双方零增益，三组新鲜配对后渐进恢复；持续失联、设备故障及操作心跳失联请求失能。
-没有两侧角差停机阈值，也不自动保持共同位置。
+没有两侧角差停机阈值，也不自动保持共同位置。摩擦补偿不消除电机或负载惯量，不能保证零惯量或零拖动阻力。
 
-面板右上只有开始/停止；配置仅在停止且两台新鲜失能时可编辑。
-显示两侧位置、速度、反馈/估算力矩、最近目标，以及配对时差、降级和恢复进度。
+面板右上提供开始/停止，配置区可单独应用设置而不使能；仅在停止且两台新鲜失能时可编辑。
+配置区显示有效耦合 Kc/Dc，主区显示量化后的原生 MIT Kp/Kd、已应用预算、预算缩放与通信恢复原因；
+控制模式和速度带宽核验状态只读显示，不提供带宽写入旋钮。每轴显示未缩放需求、量化总估算、
+反馈力矩、模型及补偿。需求超过协议力矩量程时单独提示，这不是设备实际饱和或实际输出的测量。
+驱动配置未知时显示“未读取”；读取后显示前馈指令边界、主机保护和力矩停机阈值。
 若要在仿真单机面板拖动外力圆盘，请将两个页面并排显示，不要隐藏运行中的双边控制页。
 网页恢复连接不会恢复运动，STOP 会撤销旧操作会话。
 
 ```bash
-# 两台电机已经运行时，仅附加控制器和专用面板
+# 真机完整双边 profile：初始化后保持失能，等待明确开始
+ros2 launch dm_motor_bringup bilateral_control.launch.py
+
+# 已有驱动的频率、保护和实际带宽均满足要求时，仅附加控制器和专用面板
 ros2 launch dm_motor_bilateral_control bilateral_control.launch.py
 ```
 
-真机默认 PD 预算 0.5 Nm，仿真默认预算 8 Nm，预算用于共同增益缩放，不是反馈力矩停机阈值。
+驱动全局 `startup_velocity_bandwidth=0`，仅完整双边 bringup 的 bilateral profile 将其设为 100 Hz。
+驱动在失能初始化阶段先读取电机 `V_BW`，必要时写入 RAM 并独立读回，不使能、不写 Flash，也不设零。
+控制器另有只读要求 `required_velocity_bandwidth=100`：每次 START 都重新读取两轴 V_BW，
+确认结果匹配、取得读回之后的新鲜失能反馈且双方已退出维护并可接受运动，才继续使能。
+带宽不符、读回超时或反馈失鲜会拒绝开始，
+START 不自动写寄存器、修正不匹配或清故障。
+STOP 清除本次核验状态，但保留电机 RAM 的 100 Hz，不恢复旧 40 Hz。
+其他入口的 `startup_velocity_bandwidth=0` 也只是不访问该参数，不会把已设置的 100 Hz 恢复为 40 Hz。
+电源复位可能恢复 Flash 中的值；应保持失能，按正确双边 profile 重启驱动并等待初始化读回。
+只刷新网页或重新附加控制器不会设置带宽，反复 START 也不会修复不匹配；正常使用无需保存 Flash。
+
+控制率、增益、补偿比例与应用预算由统一配置定义，运行时以面板中的已应用参数为准。
+正式默认控制器及双边驱动频率为 500 Hz、`max_torque=0`，
+模型摩擦补偿比例为 0.6、每轴模型摩擦上限为 0.2 Nm；总前馈另受驱动/协议字段上限约束。
+共同参考的采样、传输和速度滤波仍会增加拖动及共同加速的阻力，较小的 B 不等于无惯量或无阻力。
+补偿保留模型误差余量，避免拟合摩擦偏大时持续助推；不能据此保证任意内环延迟或负载下稳定。
+开启补偿需两轴身份匹配的模型，缺失则在使能前拒绝。仿真默认关闭补偿，
+测试补偿时需单独提供 simulation 模型。摩擦前馈始终受每轴上限约束；正预算模式下还受总预算一半限制。
+`max_torque=0` 不代表无限物理力矩，不关闭协议字段范围、机械边界或驱动保护。
 附加运动限制默认关闭；双边 bringup 不再给驱动叠加固定 1 Nm 的反馈/估算力矩停机门限，
-也不默认启用 0.3 rad 相对行程限制。真机驱动仍保留 55°C 温度保护、设备故障与通信看门狗，
+也不默认启用 0.3 rad 相对行程限制。标准 bilateral profile 保留 55°C 温度保护、设备故障与通信看门狗，
 显式配置的机械关节范围及驱动保护也仍然有效；这不是安全认证。
-2026-10-21 的 0.2 Nm 保守预试验未达到运动指标；随后在现有 0.5 Nm 预算下，
+早先 100% 补偿版本的匀速拖动仿真没有覆盖轻推后持续振荡，不能用其拖动阻力结果证明接触稳定。
+轻触回归需要包含内部速度估计延迟、摩擦参数失配及外力归零后数秒的观察，区分来回振荡和单向漂移。
+仿真设备提供默认关闭的 `velocity_time_constant` 用于验证此类非理想响应；该值尚未由实机辨识。
+旧 native 轻触修复曾通过 37 项 ROS 物理回归及 6 次真机 ±0.2 Nm、100 ms 短脉冲检查，
+均停稳并确认双轴失能，最大位移约 0.0038 rad。这是旧模式的小扰动记录，不作为共享模式的验收。
+随后共享模式在临时 V_BW=100 Hz 下完成正、负 30° 及各 5 秒保持，两轴均有可见位移；
+全过程及独立原始数据复核未检出旧有持续窄带振动，但仍记录了短暂残余，不能称为零振动。
+负向运动通过后，外层参数恢复事务曾因只读握手超时失败；该失败与后续独立恢复证据均保留。
+同一共享控制器在 V_BW=40 Hz 对照中虽最终停稳，运动中约 33–35 Hz 的持续反相纹波仍使整程判失败。
+因此正式默认将 100 Hz 初始化及每次 START 核验纳入运行条件。原始实测、恢复记录和物理压力矩阵入口见
+[双边控制说明](src/dm_motor_bilateral_control/README.md#自动检测回零角差注入与停稳观察)。
+正式配置部署后，直接通过生产控制器再次执行 ±30° 自动检测均通过：每次静置 5 秒、2 秒加入偏置、
+满偏置观察 5 秒，约 2.067/2.018 秒停稳，最终残余角差约 +0.063°/−0.122°，全过程未检出持续可分辨振动。
+每次 START 均核验两轴实际 100 Hz，结束后确认新鲜双停。总报告位于
+`~/.ros/dm_motor_bilateral_control/stability-20261030/REPORT.md`。
+现场就绪后的轻推、往返验收可用 `ros2 run dm_motor_bilateral_control manual_test --hardware --axis a --scenario touch`。
+它固定执行 5 秒静置、5 秒人工窗口、5 秒松手观察并双停；有效自动记录仅标为待人工确认，
+操作者的振动感受和阻力评价另行留证，不把仿真人手或无人触碰的静止记录算作人工通过。
+新增增益边界及人工流程验证见 `~/.ros/dm_motor_bilateral_control/stability-20261030/FOLLOWUP.md`。
+这些结果不覆盖所有负载或接触条件；人工拖动手感和大力接触仍需现场复核。
+下述旧参数的真机结果也不作为当前配置高输出工况的验收。
+2026-10-21 的 0.2 Nm 保守预试验未达到运动指标；随后在当时的 0.5 Nm 预算下，
 采用 `Kc=16, Dc=0.35, B=0.35` 和 6 秒周期的 ±0.03 rad 激励，四个双向/方向运动场景、
 中性使能、低增益耦合及三项进程失联保护均通过受限真机验收。
-2026-10-22 抖动排查后，默认增益已对齐为上述带本地阻尼的组合，默认 PD 预算仍为 0.5 Nm。
+2026-10-22 抖动排查后，当时的默认增益对齐为上述带本地阻尼的组合，默认 PD 预算为 0.5 Nm。
 `B=0` 没有本地阻尼，显著增大预算不能代替稳定性调参；10 Nm 不属于上述实机验收条件。
 这不等于所有工况或真实接触力标定通过。
 从旧的固定 1 Nm 保护配置升级时，须退出并重启整套双边 bringup，而不是只刷新 dashboard；
-驱动门限不能热更新，启动后仍需显式开始。
+使用 `dm_motor_bringup bilateral_control.launch.py` 的 bilateral profile，驱动门限不能热更新，启动后仍需显式开始。
+单独附加控制器不会修改已有驱动；若旧驱动仍启用正值估算力矩门限，`max_torque=0` 会在使能前拒绝。
+也可保留旧保护并显式选择兼容的正应用预算；关闭附加运动限制不能绕过驱动保护。
+启动核验还要求两台驱动的 `control_rate` 不低于双边控制器频率；默认 500 Hz 控制器不能附加旧 200 Hz 驱动直接运行，
+应先停止并按 bilateral profile 将驱动重启到 500 Hz，而不只是更换力矩门限。
 完整算法、仿真验收和真机注意事项见[双边控制说明](src/dm_motor_bilateral_control/README.md)。
 
 ## 5. 命令行控制与参数访问
@@ -1439,22 +1512,31 @@ USB 断开、CAN 服务故障等共享资源异常仍可能影响全部设备。
 
 ### 软件验证
 
+完成当前源码构建后，明确选择该次构建的build和install目录；以下为待替换的路径占位符，不能把另一套旧安装或旧XML当作本次验证。
+
 ```bash
+dm_build_base="/absolute/path/to/this-build/build"
+dm_install_prefix="/absolute/path/to/this-build/install"
 source /opt/ros/humble/setup.bash
-source install/setup.bash
-colcon test --executor sequential --return-code-on-test-failure
-colcon test-result --verbose
+source "$dm_install_prefix/setup.bash"
+colcon test --build-base "$dm_build_base" --executor sequential --return-code-on-test-failure
+colcon test-result --test-result-base "$dm_build_base" --verbose
 ```
 
-测试数量以本次 `colcon test-result` 输出为准，不以历史计数代替重新运行。
+本轮固定软件清单已按证据作用域完成核对：100个CTest条目＝47个当前输入下完整条目PASS＋1个precision用例级组合＋52个源码/依赖等价保留条目；当前整模块运行、历史依赖等价保留和precision用例级组合分别列明，不能称全部条目均在最终树上新跑。完整结论、1个可选历史回放SKIP及独立serial-negative补测见[软件和交付验证](docs/experiment-history.md#three-motor-bilateral-baseline-2026-11-05)。
+
+此前两次生产驱动在虚拟初始化、未使能阶段出现约331/333 ms控制间隔并触发绝对位置连续性保护，原因尚未归因；后续正式dashboard回归通过不改写这些失败。独立域186的test-only诊断驱动完成20次启动就绪观察且未复现，其中一次退出时的时序文件不完整；这既不是生产修复，也不替代生产二进制回归。范围及原始证据见[虚拟启动间隙诊断](/home/robot/.ros/dm_motor_bilateral_control/three-motor-optimization-20261105/startup-gap-diagnostic-186/REPORT.md)。
+
+新运行的用例数以其独立XML和执行记录为准；历史等价保留项单独列明来源与依赖核对，不把汇总条目数当作全新运行数。
 自动测试采用独立 ROS domain 和模拟后端，不打开真机、不自动进行实物运动。
 涵盖协议、参数事务、路由冲突、第三种 CAN-FD 设备、进程退出/重启、
 独立控制、故障注入/清除、dashboard API 和推流，以及公共 RX 单次转发、
 接收排队年龄/看门狗、反馈目标与序号一致性、FD 电机的精确 STOP 和组合配置预检。
 CAN 注册还覆盖延迟发现、首心跳激活、未激活资源回收及进程退出后的显式重新启动；
 预注册不授予活动权限，激活后仍按原配置租期失效，不延长运动期间的超时。
-DDS 配置回归同时验证安装路径、保留用户配置、其他 RMW 不被修改，
-以及真实 Fast DDS 参与者不再建立共享内存映射。
+DDS 配置回归同时验证安装路径、保留用户配置、其他 RMW 不被修改，以及真实参与者消息收发。
+普通 profile 模式要求无 SHM；Humble 仅本机模式则按 RMW 行为检查其追加的 SHM。
+仅本机隔离运行不代表普通模式的实际参与者分支也已执行。
 当前还覆盖无 token 多发布者、各发布者序号、非活跃会话释放不影响其它输出、
 手动目标替换任务、主从与单机面板并存、主从网页心跳和面板崩溃停机。
 物理仿真回归另覆盖四模式、全部七类任务、49 项寄存器、读写/保存/掉电恢复、

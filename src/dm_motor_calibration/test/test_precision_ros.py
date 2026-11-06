@@ -43,7 +43,7 @@ def settings_controller():
         **{"fourier_" + name: value for name, value in asdict(FourierSettings()).items()},
         **asdict(AcquisitionStages()),
         **ConfigManager().node_parameters("dm_motor_calibration", "calibration_node"),
-        "experiment": "fourier", "precision_time_budget": 1200.0,
+        "experiment": "fourier", "quick_excitation": "fixed", "precision_time_budget": 1200.0,
         "precision_warmup_repetitions": 0, "precision_baseline_time": 20.0,
     }
     controller = SimpleNamespace(
@@ -99,7 +99,7 @@ def test_inactive_precision_budget_is_accepted_during_node_initialization(tmp_pa
     from rclpy.context import Context
     from rclpy.parameter import Parameter
     context = Context()
-    context.init(domain_id=229)
+    context.init(domain_id=int(os.environ.get("DM_MOTOR_TEST_DOMAIN", "229")))
     controller = None
     try:
         controller = CalibrationNode(
@@ -120,7 +120,7 @@ def test_inactive_precision_budget_is_accepted_during_node_initialization(tmp_pa
 
 
 def test_precision_launch_starts_only_a_disabled_protected_virtual_scene(tmp_path, monkeypatch):
-    monkeypatch.setenv("ROS_DOMAIN_ID", str(216 + os.getpid() % 12))
+    monkeypatch.setenv("ROS_DOMAIN_ID", os.environ.get("DM_MOTOR_TEST_DOMAIN", str(216 + os.getpid() % 12)))
     monkeypatch.setenv("ROS_LOCALHOST_ONLY", "1")
     rclpy.init()
     prefix = f"/precision_launch_{os.getpid()}_{time.monotonic_ns()}"
@@ -147,8 +147,8 @@ def test_precision_launch_starts_only_a_disabled_protected_virtual_scene(tmp_pat
             assert received["status"]["experiment"] == "precision"
             assert received["motor"].simulated and received["motor"].phase == MotorState.DISABLED
             assert received["motor"].host_protection_enabled
-            assert received["motor"].position_min == -64.0
-            assert received["motor"].position_max == 64.0
+            assert received["motor"].position_min == -350.0
+            assert received["motor"].position_max == 350.0
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGINT)
@@ -304,6 +304,7 @@ def test_precision_control_budgets_using_newest_feedback_not_delayed_state():
 
 def test_stop_cancels_pending_quality_independent_continuation():
     controller = SimpleNamespace(experiment="precision", generation=4, precision_resume=True, phase="stopping", run_open=True,
+                                 drag_settings=None,
                                  failure_stage="", error="", finish_pending=True, begin_stop=lambda: None, record_event=Mock())
     response = CalibrationNode.on_stop(controller, None, SimpleNamespace())
     assert response.success and not controller.precision_resume
@@ -373,7 +374,7 @@ def test_warmup_preflight_archives_old_feedback_without_starting_a_stale_window(
 def test_disabled_baseline_waits_out_release_motion_before_the_enable_stationarity_gate(phase, should_wait):
     now = time.monotonic()
     pending = Future()
-    pending.set_result(SimpleNamespace(success=True, ready=True, configuration=SimpleNamespace()))
+    pending.set_result(SimpleNamespace(success=True, ready=True, configuration=MotorConfiguration()))
     state = MotorState(motor_id=2, simulated=True, ready=True, feedback_fresh=True, absolute_position_valid=True,
                        phase=MotorState.DISABLED, status=0, mode=MotorTarget.MIT, control_rate=200.0,
                        velocity=-0.08547008547008517, torque=0.0, torque_limit=0.8, tmax=10.0,
@@ -381,7 +382,8 @@ def test_disabled_baseline_waits_out_release_motion_before_the_enable_stationari
     settings = PrecisionSettings(warmup_repetitions=0, baseline_settle_time=10.0, baseline_time=10.0)
     failure = Mock()
     controller = SimpleNamespace(
-        stopping=False, run_open=True, precision_recorder=None, phase="checking", experiment="precision",
+        stopping=False, run_open=True, precision_recorder=None, drag_recorder=None,
+        phase="checking", experiment="precision",
         precision_settings=settings, precision_engine=SimpleNamespace(phase=phase),
         pending=pending, pending_since=now - 0.02, state=state, fresh_state=lambda: state,
         allow_hardware=False, motion_limits=lambda: settings, rate=200.0,
@@ -411,9 +413,10 @@ def test_baseline_settling_keeps_actual_safety_checks(field, value, reason):
 def test_review_continuation_waits_for_fresh_raw_feedback_as_well_as_state():
     now = time.monotonic()
     pending = Future()
-    pending.set_result(SimpleNamespace(success=True, ready=True))
+    pending.set_result(SimpleNamespace(success=True, ready=True, configuration=MotorConfiguration()))
     controller = SimpleNamespace(
         stopping=False, phase="checking", experiment="precision", run_open=True, precision_recorder=None,
+        drag_recorder=None,
         precision_settings=PrecisionSettings(), pending_since=now - 0.05, pending=pending,
         state=MotorState(feedback_receive_time=now),
         precision_engine=SimpleNamespace(phase="review_static", latest=Sample(now - 0.2, 0.0, 0.0, 0.0, 25.0)),

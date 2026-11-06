@@ -21,7 +21,7 @@ EDITABLE_TYPES = {
     **{name: bool for name in AcquisitionStages.__dataclass_fields__},
     **EDITABLE_STAGE_TYPES,
     **EDITABLE_CONSTRAINT_TYPES,
-    "protocol_mode": str,
+    "protocol_mode": str, "quick_excitation": str,
 }
 DISPLAY_FIELDS = ("time", "position", "velocity", "torque", "target_position", "target_velocity",
                   "command_torque", "feedforward", "leg", "trial", "elapsed")
@@ -67,10 +67,12 @@ def normalize_settings(values: object) -> dict[str, Any]:
             result[name] = value
     if "model" in result and result["model"] not in (*MODELS, "auto"):
         raise CalibrationError("Unknown friction model")
-    if "experiment" in result and result["experiment"] not in ("calibrate", "validate", "compensate", "breakaway", "precision", "fourier"):
+    if "experiment" in result and result["experiment"] not in ("calibrate", "validate", "compensate", "breakaway", "precision", "fourier", "low_speed"):
         raise CalibrationError("Unknown experiment")
     if "protocol_mode" in result and result["protocol_mode"] not in ("full", "workflow_test"):
         raise CalibrationError("Unknown calibration protocol mode")
+    if "quick_excitation" in result and result["quick_excitation"] not in ("fixed", "auto"):
+        raise CalibrationError("Unknown quick excitation mode")
     return result
 
 
@@ -98,10 +100,40 @@ def display_trace(trace: Trace, limit: int = 3000) -> list[list[float]]:
             for sequence, index in enumerate(indices)]
 
 
-def model_curves(result: ModelResult | MechanicalCandidate) -> list[list[list[float]]]:
+def quick_shared_ranges(quick: Mapping | None) -> dict:
+    """Display saved shared sliding ranges; never infer them from overall extrema."""
+    coverage = quick.get("coverage") if isinstance(quick, Mapping) else None
+    directions = coverage.get("directions") if isinstance(coverage, Mapping) else None
+    result = {}
+    for direction in ("negative", "positive"):
+        branch = directions.get(direction) if isinstance(directions, Mapping) else None
+        if not isinstance(branch, Mapping):
+            continue
+        lower, upper = branch.get("velocity_min"), branch.get("velocity_max")
+        counts = branch.get("windows")
+        if (not all(type(value) in (int, float) and math.isfinite(value) for value in (lower, upper)) or
+                not lower < upper or not (upper < 0 if direction == "negative" else lower > 0) or
+                not isinstance(counts, Mapping) or
+                not all(type(counts.get(role)) is int and counts[role] > 0
+                        for role in ("training", "external_validation"))):
+            continue
+        result[direction] = {"velocity_min": lower, "velocity_max": upper,
+                             "windows": {role: counts[role] for role in ("training", "external_validation")}}
+    return result
+
+
+def model_curves(result: ModelResult | MechanicalCandidate, *, shared_ranges: Mapping | None = None) -> list[list[list[float]]]:
     friction = result.friction()
-    velocities = (np.linspace(result.domain["velocity_min"], -1e-6, 120),
-                  np.linspace(1e-6, result.domain["velocity_max"], 120))
+    if shared_ranges is None:
+        velocities = (np.linspace(result.domain["velocity_min"], -1e-6, 120),
+                      np.linspace(1e-6, result.domain["velocity_max"], 120))
+    else:
+        velocities = []
+        for direction in ("negative", "positive"):
+            branch = shared_ranges.get(direction)
+            lower = max(branch["velocity_min"], result.domain["velocity_min"]) if branch else 0
+            upper = min(branch["velocity_max"], result.domain["velocity_max"]) if branch else 0
+            velocities.append(np.linspace(lower, upper, 120) if lower < upper else np.array([]))
     return [np.column_stack((velocity, friction.torque(velocity))).tolist() for velocity in velocities]
 
 

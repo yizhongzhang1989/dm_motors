@@ -22,6 +22,20 @@ from .precision import PrecisionExperiment, PrecisionRecorder
 
 
 DATA_STREAMS = ("samples.csv", "feedback.csv", "state.csv", "commands.csv")
+POSITION_OBSERVATION_STREAM = "position_observation.csv"
+
+
+def position_observation_metadata(enabled: bool, identity: dict, configuration: dict) -> dict:
+    namespace = configuration.get("motor_namespace", identity.get("namespace"))
+    return {
+        "enabled": enabled, "file": POSITION_OBSERVATION_STREAM if enabled else None,
+        "topic": namespace.rstrip("/") + "/position_observation" if namespace else None,
+        "message_type": "dm_motor_interfaces/msg/MotorPositionObservation",
+        "enqueued_callbacks": 0, "status": "not_received" if enabled else "disabled",
+        "scope": "Optional raw register-80 observations; not used for control, velocity estimation, fitting, qualification or STOP.",
+        "clock": "Original message times and device_sample_time_known are unchanged; host_receive_time is observer callback monotonic time.",
+        "notes": "Callbacks and source/task/epoch/counters do not establish device execution acknowledgement, valid samples or lossless acquisition.",
+    }
 
 
 def snapshot_parent(source: Path, destination: Path) -> None:
@@ -103,13 +117,124 @@ def sample_membership(engine: PrecisionExperiment, tag: Mapping[str, float] | No
             "analysis_warmup_sine": int(sine), **engine.additional_membership(tag, sample_time)}
 
 
+class MotorRecording:
+    """Raw journals for short calibration, validation, breakaway and drag runs.
+
+    These journals retain pre-fit exclusions and failed preparation. They do not
+    replace samples.csv or certify that every physical CAN frame was received.
+    """
+
+    streams = ("feedback.csv", "state.csv", "commands.csv", "events.csv")
+
+    def __init__(self, root: Path, identity: dict, configuration: dict, *,
+                 sources: Mapping[str, bytes], initial_state: dict, message_schemas: dict,
+                 record_position_observation: bool = False):
+        self.root = root
+        self.failure: Exception | None = None
+        self.finalized = False
+        if record_position_observation:
+            self.streams = (*self.streams, POSITION_OBSERVATION_STREAM)
+        self.enqueued = {name: 0 for name in self.streams}
+        self.recorders: dict[str, PrecisionRecorder] = {}
+        # Quick acquisition already archived the same startup source snapshot.
+        code = root / "code" / "dm_motor_calibration"
+        if code.exists():
+            archived = []
+            for name, content in sources.items():
+                path = code / name
+                if path.read_bytes() != content:
+                    raise CalibrationError("Raw recording source snapshot differs from the experiment")
+                archived.append({"path": str(path.relative_to(root)),
+                                 "sha256": hashlib.sha256(content).hexdigest()})
+        else:
+            archived = save_sources(root, sources)
+        self.metadata = {
+            "schema": 1, "kind": "motor_message_journals", "recording_complete": False,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "identity": identity, "configuration": configuration, "initial_state": initial_state,
+            "message_schemas": message_schemas, "sources": archived, "files": {},
+            "position_observation": position_observation_metadata(record_position_observation, identity, configuration),
+            "clock": "Original message times are unchanged; host_receive/publish_time is monotonic callback time",
+            "notes": [
+                "feedback.csv retains every received callback, before duplicates, guards or fitting exclusions.",
+                "state.csv retains received snapshots; its subscription has latest-state depth 1.",
+                "commands.csv retains published software targets, not device acknowledgements.",
+                "samples.csv remains the separate analysis partition; preparation is not fitted.",
+                "Recording completeness means all enqueued callbacks were written, not zero bus/DDS loss."],
+        }
+        atomic_json(root / "raw_recording.json", self.metadata)
+        try:
+            for name in self.streams:
+                self.recorders[name] = PrecisionRecorder(root / name)
+        except (OSError, RuntimeError):
+            for recorder in self.recorders.values():
+                try:
+                    recorder.close()
+                except CalibrationError:
+                    pass
+            raise
+
+    @property
+    def error(self) -> Exception | None:
+        return self.failure or next((r.error for r in self.recorders.values() if r.error is not None), None)
+
+    def record(self, stream: str, row: dict) -> None:
+        if self.finalized:
+            raise CalibrationError("Raw motor recording is closed")
+        try:
+            self.recorders[stream].append(row)
+            self.enqueued[stream] += 1
+            if stream == POSITION_OBSERVATION_STREAM:
+                self.metadata["position_observation"].update(
+                    status="received", enqueued_callbacks=self.enqueued[stream])
+        except CalibrationError as error:
+            self.failure = error
+            raise
+
+    def message(self, stream: str, message: Any, **annotations: Any) -> None:
+        clock = "host_publish_time" if stream == "commands.csv" else "host_receive_time"
+        self.record(stream, {clock: time.monotonic(), **flatten_message(message), **annotations})
+
+    def event(self, event: dict) -> None:
+        self.record("events.csv", {"index": self.enqueued["events.csv"],
+                                  "host_receive_time": time.monotonic(),
+                                  "payload": json.dumps(event, ensure_ascii=False, allow_nan=False)})
+
+    def finalize(self, *, stop_confirmed: bool, acquisition_error: str) -> dict:
+        if self.finalized:
+            if not self.metadata["recording_complete"]:
+                raise CalibrationError("Raw motor recording was finalized with errors")
+            return self.metadata
+        errors = [str(self.error)] if self.error is not None else []
+        for name, recorder in self.recorders.items():
+            try:
+                count = recorder.close()
+                if count != self.enqueued[name]:
+                    raise CalibrationError(f"{name}: recorded {count}, expected {self.enqueued[name]}")
+                self.metadata["files"][name] = {
+                    "rows": count, "fields": list(recorder.columns),
+                    "sha256": recorder.digest.hexdigest(), "bytes": recorder.bytes_written}
+            except CalibrationError as error:
+                errors.append(str(error))
+        self.finalized = True
+        self.metadata.update(recording_complete=not errors, stop_confirmed=stop_confirmed,
+                             acquisition_error=acquisition_error, recording_errors=errors)
+        atomic_json(self.root / "raw_recording.json", self.metadata)
+        if errors:
+            raise CalibrationError("Raw motor recording incomplete: " + "; ".join(errors))
+        return self.metadata
+
+
 class PrecisionRecording:
     def __init__(self, root: Path, engine: PrecisionExperiment, identity: dict, configuration: dict,
                  *, sources: Mapping[str, bytes] | None = None, source: str = "ros",
                  initial_state: dict | None = None, message_schemas: dict | None = None,
-                 resume: dict | None = None):
+                 resume: dict | None = None, record_position_observation: bool = False):
         self.root = root
-        self.enqueued = {name: 0 for name in (*DATA_STREAMS, "events.csv")}
+        # DATA_STREAMS remains the required historical bundle schema. Optional
+        # observations participate in this instance's close/integrity handling.
+        self.data_streams = (*DATA_STREAMS, POSITION_OBSERVATION_STREAM) if record_position_observation else DATA_STREAMS
+        self.enqueued = {name: 0 for name in (*self.data_streams, "events.csv")}
         self.recorders: dict[str, PrecisionRecorder] = {}
         self.closed_data = False
         self.finalized = False
@@ -121,6 +246,7 @@ class PrecisionRecording:
             "identity": identity, "configuration": configuration,
             "resume": resume,
             "initial_state": initial_state, "message_schemas": message_schemas or {},
+            "position_observation": position_observation_metadata(record_position_observation, identity, configuration),
             "precision_settings": asdict(engine.settings), "origin": engine.origin,
             "position_resolution": engine.position_resolution, "torque_resolution": engine.torque_resolution,
             "acquisition_epoch": None,
@@ -168,6 +294,9 @@ class PrecisionRecording:
         try:
             self.recorders[stream].append(row)
             self.enqueued[stream] += 1
+            if stream == POSITION_OBSERVATION_STREAM:
+                self.metadata["position_observation"].update(
+                    status="received", enqueued_callbacks=self.enqueued[stream])
         except CalibrationError as error:
             self.failure = error
             raise
@@ -237,7 +366,7 @@ class PrecisionRecording:
     def close(self) -> int:
         if not self.closed_data:
             self.closed_data = True
-            self._close(DATA_STREAMS)
+            self._close(self.data_streams)
         if self.error is not None:
             raise CalibrationError(f"Recording bundle is incomplete: {self.error}")
         return self.enqueued["samples.csv"]

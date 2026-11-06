@@ -35,29 +35,18 @@
     <div class="workspace">
       <aside class="control-column" aria-label="实验设置与操作">
         <section class="panel process">
-          <div class="heading"><h2 id="control-title">实验设置</h2><button id="new-experiment" class="secondary small" type="button">新实验</button></div>
+          <div class="heading"><h2 id="control-title">实验过程</h2><button id="new-experiment" class="secondary small" type="button">新建快速标定</button></div>
           <p id="experiment-mode" class="muted">正在恢复最近一次实验…</p>
+          <div id="draft-summary" class="draft-summary" hidden>
+            <div class="heading"><strong id="draft-method">快速机械标定</strong><span id="draft-timing" class="badge">约 60 秒</span></div>
+            <p id="draft-plan" class="muted">40 秒训练 + 20 秒独立验证；另计启动和停止确认。</p>
+            <p id="draft-scope" class="muted">仅覆盖本次实际速度域。静摩擦、全速与热参数需相应高级流程。</p>
+          </div>
           <form id="settings">
             <fieldset id="editable" disabled>
-              <label>实验方法<select id="experiment" name="experiment">
-                <option value="precision">精密全速摩擦</option><option value="fourier">傅里叶摩擦与动力学</option>
-                <option value="calibrate">快速机械辨识</option><option value="breakaway">静摩擦起动</option>
-                <option value="validate">补偿 A/B 验证</option><option value="compensate" disabled>拖动测试</option>
+              <label id="quick-excitation-choice" hidden>激励方式<select id="quick_excitation" name="quick_excitation">
+                <option value="fixed">固定参数</option><option id="quick-excitation-auto" value="auto">自动选择</option>
               </select></label>
-              <p id="calibration-summary" class="muted"></p>
-              <label id="calibration-choice" hidden>使用的模型<select id="calibration_file" name="calibration_file"><option value="">选择模型</option></select></label>
-              <div id="calibration-values" hidden>
-                <select id="model" name="model">
-                  <option value="auto">自动选择</option><option value="viscous">黏性</option>
-                  <option value="coulomb_viscous">库仑 + 黏性</option><option value="stribeck">Stribeck</option>
-                  <option value="asymmetric_coulomb_viscous">非对称库仑 + 黏性</option><option value="asymmetric_stribeck">非对称 Stribeck</option>
-                </select>
-                <input id="duration" name="duration" type="hidden"><input id="amplitude" name="amplitude" type="hidden">
-                <input id="frequency" name="frequency" type="hidden"><input id="kp" name="kp" type="hidden"><input id="kd" name="kd" type="hidden">
-                <input id="compensation_fraction" name="compensation_fraction" type="hidden">
-                <input id="fit_bias" name="fit_bias" type="checkbox"><input id="known_bias" name="known_bias" type="hidden">
-                <input id="fit_gravity" name="fit_gravity" type="checkbox"><input id="fit_stiffness" name="fit_stiffness" type="checkbox">
-              </div>
               <label id="hardware-confirmation" class="check hardware" hidden><input id="confirm_hardware" type="checkbox"><span id="hardware-confirmation-text">已确认真机运动条件与物理停止措施</span></label>
             </fieldset>
           </form>
@@ -65,8 +54,34 @@
           <p id="dirty" class="muted" hidden></p>
           <div class="heading progress-heading"><h3 id="stage-label">实验进度</h3><span id="progress-text" class="muted"></span></div>
           <div class="progress-track" role="progressbar" id="progress" aria-label="实验进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-fill"></div></div>
+          <p id="current-step" class="current-step" role="status"></p>
+          <p id="sample-count" class="muted"></p>
+          <details id="experiment-tools" class="control-help"><summary>高级设置与阶段明细</summary>
+            <fieldset id="advanced-editable" disabled>
+              <label>实验方法<select id="experiment" name="experiment" form="settings">
+                <option value="calibrate">快速机械标定</option><option value="precision">精密全速摩擦</option>
+                <option value="fourier">傅里叶摩擦与动力学</option><option value="breakaway">静摩擦起动</option>
+                <option id="low-speed-choice" value="low_speed" disabled>短行程低速摩擦</option>
+                <option value="validate">补偿 A/B 验证</option><option value="compensate" disabled>拖动测试</option>
+              </select></label>
+              <p id="calibration-summary" class="muted"></p>
+              <label id="calibration-choice" hidden>使用的模型<select id="calibration_file" name="calibration_file" form="settings"><option value="">选择模型</option></select></label>
+              <div id="calibration-values" hidden>
+                <select id="model" name="model" form="settings">
+                  <option value="auto">自动选择</option><option value="viscous">黏性</option>
+                  <option value="coulomb_viscous">库仑 + 黏性</option><option value="stribeck">Stribeck</option>
+                  <option value="asymmetric_coulomb_viscous">非对称库仑 + 黏性</option><option value="asymmetric_stribeck">非对称 Stribeck</option>
+                </select>
+                <input id="duration" name="duration" form="settings" type="hidden"><input id="amplitude" name="amplitude" form="settings" type="hidden">
+                <input id="frequency" name="frequency" form="settings" type="hidden"><input id="kp" name="kp" form="settings" type="hidden"><input id="kd" name="kd" form="settings" type="hidden">
+                <input id="compensation_fraction" name="compensation_fraction" form="settings" type="hidden">
+                <input id="fit_bias" name="fit_bias" form="settings" type="checkbox"><input id="known_bias" name="known_bias" form="settings" type="hidden">
+                <input id="fit_gravity" name="fit_gravity" form="settings" type="checkbox"><input id="fit_stiffness" name="fit_stiffness" form="settings" type="checkbox">
+              </div>
+            </fieldset>
           <ol id="steps" class="steps">
             <li id="step-checking"><label><input type="checkbox" checked disabled><span id="step-name-checking">启动检查</span></label><button id="parameters-checking" type="button" class="secondary step-parameters" aria-label="启动检查参数">参数</button><span id="step-state-checking" class="step-state">等待</span><small id="step-detail-checking"></small></li>
+            <li id="step-pilot" hidden><label><span id="step-name-pilot">自动选择激励</span></label><button id="parameters-pilot" type="button" hidden disabled>参数</button><span id="step-state-pilot" class="step-state">等待</span><small id="step-detail-pilot"></small></li>
             <li id="step-warmup"><label><input id="collect_warmup" name="collect_warmup" form="settings" type="checkbox" checked disabled><span id="step-name-warmup">预运行</span></label><button id="parameters-warmup" type="button" class="secondary step-parameters" aria-label="预运行参数">参数</button><span id="step-state-warmup" class="step-state">等待</span><small id="step-detail-warmup"></small></li>
             <li id="step-baseline"><label><input type="checkbox" checked disabled><span id="step-name-baseline">零偏测量</span></label><button id="parameters-baseline" type="button" class="secondary step-parameters" aria-label="失能零偏参数">参数</button><span id="step-state-baseline" class="step-state">等待</span><small id="step-detail-baseline"></small></li>
             <li id="step-static"><label><input id="collect_static" name="collect_static" form="settings" type="checkbox" checked disabled><span id="step-name-static">独立静摩擦</span></label><button id="parameters-static" type="button" class="secondary step-parameters" aria-label="静摩擦参数">参数</button><span id="step-state-static" class="step-state">等待</span><small id="step-detail-static"></small></li>
@@ -76,10 +91,8 @@
             <li id="step-saving"><label><input type="checkbox" checked disabled><span id="step-name-saving">保存记录</span></label><button id="parameters-saving" type="button" class="secondary step-parameters" aria-label="数据保存参数">参数</button><span id="step-state-saving" class="step-state">等待</span><small id="step-detail-saving"></small></li>
             <li id="step-analysis"><label><input type="checkbox" checked disabled><span id="step-name-analysis">模型计算</span></label><button id="parameters-analysis" type="button" class="secondary step-parameters" aria-label="计算与验收参数">参数</button><span id="step-state-analysis" class="step-state">等待</span><small id="step-detail-analysis"></small></li>
           </ol>
-          <p id="sample-count" class="muted"></p>
-          <details id="experiment-tools" class="control-help"><summary>更多设置</summary>
             <div class="form-actions"><button id="apply" type="button" class="secondary small">应用设置</button><button id="reload-settings" type="button" class="text-button">恢复配置</button><button id="constraint-edit" type="button" class="secondary small" disabled>运行保护</button></div>
-            <div class="form-actions"><button id="stage-profile-full" type="button" class="secondary small" disabled>完整标定</button><button id="stage-profile-test" type="button" class="secondary small" disabled>短流程测试</button></div>
+            <div class="form-actions"><button id="quick-profile" type="button" class="secondary small" disabled>恢复快速方案</button><button id="stage-profile-full" type="button" class="secondary small" disabled>节点预设</button><button id="stage-profile-test" type="button" class="secondary small" disabled>流程诊断预设</button></div>
             <p id="protocol-mode" class="muted"></p>
           </details>
         </section>
@@ -119,6 +132,7 @@
           <div class="experiment-picker"><label>查看实验<select id="history"><option value="">当前实验</option></select></label><button id="live-view" class="secondary small" type="button">最新实验</button></div>
           <p id="view-notice" class="muted"></p>
           <dl id="experiment-facts" class="experiment-facts"></dl>
+          <p id="quick-adaptation-summary" class="muted" hidden></p>
           <p id="result-error" class="notice error" hidden></p>
           <div class="result-actions"><a id="html-report-link" target="_blank" rel="noopener noreferrer" hidden>完整报告 ↗</a><button id="test-viewed-model" type="button" class="secondary small" hidden>测试此模型</button></div>
         </section>
@@ -130,8 +144,11 @@
         </section>
         <section id="model-panel" class="panel">
           <div class="heading"><h2>模型结果</h2><span id="fit-model" class="badge">等待结果</span></div>
-          <div class="fit-grid"><div><canvas id="friction-chart" role="img" aria-label="摩擦观测与模型曲线"></canvas><p id="friction-caption" class="muted"></p></div><div><table><thead><tr><th>参数</th><th>值</th><th>单位</th></tr></thead><tbody id="parameter-table"></tbody></table><p id="fit-empty" class="muted">尚无模型结果</p></div></div>
+          <div class="fit-grid"><div><canvas id="friction-chart" role="img" aria-label="摩擦观测与模型曲线"></canvas><p id="friction-caption" class="muted"></p></div><div><table><thead><tr><th>参数</th><th>拟合估计</th><th>单位</th></tr></thead><tbody id="parameter-table"></tbody></table><p id="fit-empty" class="muted">尚无模型结果</p></div></div>
           <dl id="fit-quality" class="quality"></dl>
+          <p id="fit-scope" class="muted" hidden></p>
+          <details id="speed-sweep-details" hidden><summary>独立高速实验 · 逐段训练与验证</summary><div class="precision-scroll"><table><thead><tr><th>轮次 / 用途</th><th>目标 rad/s</th><th>实测 rad/s</th><th>报告力矩 Nm</th><th>验证误差 Nm</th><th>质量</th></tr></thead><tbody id="speed-sweep-cells"></tbody></table></div></details>
+          <details id="speed-sweep-diagnostics" hidden><summary id="speed-sweep-diagnostics-summary">准备 / 启动诊断</summary><p class="muted">未进入正式速度轨迹，不计作正式运动失败或模型样本。ENABLE 请求和起点保持目标按原记录显示。</p><div class="precision-scroll"><table><thead><tr><th>记录</th><th>ENABLE 请求</th><th>目标</th><th>STOP</th><th>原始原因</th></tr></thead><tbody id="speed-sweep-diagnostic-rows"></tbody></table></div></details>
           <details id="quality-details"><summary id="quality-summary">质量说明</summary><ul id="fit-warnings" class="warnings"></ul></details>
         </section>
         <section id="precision-panel" class="panel" hidden><details><summary>逐档测量与静摩擦</summary>
@@ -139,9 +156,20 @@
           <h3>静摩擦</h3><div class="precision-scroll"><table><thead><tr><th>角度 rad</th><th>方向</th><th>起动力矩 Nm</th><th>标准差</th><th>95%界限</th></tr></thead><tbody id="static-bins"></tbody></table></div>
           <p id="precision-quality" class="muted"></p><ul id="precision-issues" class="warnings"></ul>
         </details></section>
+        <section id="low-speed-panel" class="panel" hidden>
+          <div class="heading"><h2>低速配对测量</h2><span id="low-speed-progress" class="badge"></span></div>
+          <p id="low-speed-summary" class="muted"></p>
+          <div class="precision-scroll"><table><thead><tr><th>用途</th><th>速度 rad/s</th><th>重复</th><th>角度加权半差 Nm</th><th>共同区间 Nm</th><th>检查</th></tr></thead><tbody id="low-speed-pairs"></tbody></table></div>
+          <details id="low-speed-estimator-comparison" hidden><summary>时间与角度加权对照</summary>
+            <p class="muted">同一固定区间的报告值对照。两种权重都可能受运动和测量通道影响，差值不用于自动修正摩擦。</p>
+            <div class="precision-scroll"><table><thead><tr><th>用途</th><th>速度 rad/s</th><th>重复</th><th>时间加权半差 Nm</th><th>角度减时间 Nm</th></tr></thead><tbody id="low-speed-estimator-rows"></tbody></table></div>
+          </details>
+          <details><summary>逐段质量与未完成项目</summary><ul id="low-speed-issues" class="warnings"></ul></details>
+        </section>
         <section class="panel" id="comparison-panel" hidden><div class="heading"><h2>补偿效果</h2></div><p id="comparison-empty" class="muted">等待 A/B 验证结果</p><div id="comparison"></div></section>
         <section class="panel"><details id="experiment-details"><summary>实验详情与文件</summary>
-          <h3>本次配置</h3><dl id="experiment-configuration"></dl>
+          <h3>本次实际配置</h3><dl id="experiment-configuration"></dl>
+          <details id="requested-configuration-details" hidden><summary>自动激励前的请求配置</summary><dl id="requested-configuration"></dl></details>
           <h3 class="detail-heading">过程事件</h3><p id="events-note" class="muted"></p><ol id="events" class="events"></ol>
           <p id="recording-status" class="muted"></p><div id="downloads" class="downloads"></div>
         </details></section>

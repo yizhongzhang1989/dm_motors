@@ -1,6 +1,7 @@
 """Additional identifiable parameters, requiring explicitly measured auxiliary channels."""
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import least_squares
@@ -32,6 +33,215 @@ class BreakawayDetector:
         self.consecutive = self.consecutive + 1 if self.direction * velocity >= self.speed_threshold else 0
         return (self.consecutive >= self.confirmation_samples and
                 self.direction * (position - self.origin) >= self.position_threshold)
+
+
+def neutral_command_attribution(commands, sequence: int, receive_time: float,
+                                epoch: float) -> int | None:
+    """Find an issued, equivalent neutral target without inventing a device ACK.
+
+    Feedback may be annotated with a newer software dispatch than its source
+    time. Only consecutive, identical P0/D0 targets within this exact neutral
+    epoch are interchangeable. A transition, missing command or bad clock breaks
+    that evidence; raw feedback and its original sequence are never rewritten.
+    """
+    if (type(sequence) is not int or sequence < 1 or
+            not all(math.isfinite(v) and v >= 0 for v in (receive_time, epoch))):
+        return None
+    keys = tuple("breakaway_target_" + name for name in (
+        "mode", "position", "velocity", "kp", "kd", "torque", "velocity_limit", "current_ratio"))
+    signature, later_time = None, math.inf
+    while sequence > 0:
+        command = commands.get(sequence)
+        if (command is None or command.get("mit_pd") != 0 or
+                command.get("breakaway_target_mode") != 1 or
+                command.get("breakaway_target_kp") != 0 or command.get("breakaway_target_kd") != 0 or
+                command.get("breakaway_neutral_epoch") != epoch):
+            return None
+        values = tuple(command.get(key, math.nan) for key in keys)
+        issued = command.get("breakaway_command_time", math.nan)
+        validity = command.get("breakaway_command_valid_for", math.nan)
+        if (not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (*values, issued, validity)) or
+                validity <= 0 or
+                issued < epoch or issued >= later_time or
+                (signature is not None and values != signature)):
+            return None
+        if issued <= receive_time:
+            return sequence if receive_time < issued + validity else None
+        signature, later_time = values, issued
+        sequence -= 1
+    return None
+
+
+class NeutralDwell:
+    """Resolution-bounded neutral evidence, not a velocity estimate or hard guard.
+
+    Queries never advance observation credit. The caller owns source/command
+    attribution and checks ``complete`` once at its existing deadline: either
+    accept ``ready`` or stop. This helper never extends a dwell or sends a target.
+    """
+
+    WINDOW = .12
+    MIN_SPAN = .1
+    MIN_SAMPLES = 20
+    VELOCITY_RMS = .04
+    VELOCITY_PEAK = .15
+
+    def __init__(self, *, started: float, dwell: float, origin: float,
+                 position_resolution: float, return_tolerance: float,
+                 feedback_timeout: float, initial_count: int | None = None):
+        values = (started, dwell, origin, position_resolution, return_tolerance, feedback_timeout)
+        if (not all(math.isfinite(v) for v in values) or started < 0 or
+                not .15 <= dwell <= 2 or position_resolution <= 0 or
+                return_tolerance <= 0 or feedback_timeout <= 0 or
+                (initial_count is not None and (type(initial_count) is not int or initial_count < 0))):
+            raise CalibrationError("Invalid neutral-dwell clock, resolution or budget")
+        self.started, self.dwell, self.origin = started, dwell, origin
+        self.position_resolution = position_resolution
+        self.return_tolerance, self.feedback_timeout = return_tolerance, feedback_timeout
+        self.max_gap = min(.02, feedback_timeout)
+        # A legal .15s dwell can provide a >=.1s window plus .03s confirmation.
+        self.required_quiet_duration = min(.3, max(0., dwell - self.WINDOW))
+        self.samples = deque()
+        self.first_time = self.last_time = None
+        self.first_count = self.last_count = None
+        self.raw_count, self.raw_time = initial_count, None
+        self.position_min = self.position_max = None
+        self.quiet_since = None
+        self.unique_samples = self.duplicate_counts = self.duplicate_times = 0
+        self.excluded_prestart = self.excluded_ineligible = 0
+        self.equivalent_command_samples = 0
+        self.post_deadline = 0
+        self.gaps = self.missing_counts = 0
+        self.observed_max_gap = 0.
+        self.last_reset_reason = None
+
+    def _reset_credit(self, reason):
+        self.samples.clear()
+        self.quiet_since = None
+        self.last_reset_reason = reason
+
+    def _position_span(self):
+        return None if self.position_min is None else self.position_max - self.position_min
+
+    def _window(self):
+        count = len(self.samples)
+        if not count:
+            return dict(samples=0, duration=0., position_span=None, velocity_rms=None,
+                        velocity_peak=None, return_error=None, quiet=False)
+        span = self.samples[-1][0] - self.samples[0][0]
+        positions = [s[1] for s in self.samples]
+        velocity = [s[2] for s in self.samples]
+        rms = math.hypot(*velocity) / math.sqrt(count)
+        peak = max(map(abs, velocity))
+        error = abs(positions[-1] - self.origin)
+        quiet = (count >= self.MIN_SAMPLES and span >= self.MIN_SPAN - 1e-9 and
+                 self._position_span() <= 2 * self.position_resolution + 1e-12 and
+                 error <= self.return_tolerance and rms <= self.VELOCITY_RMS and
+                 peak <= self.VELOCITY_PEAK)
+        return dict(samples=count, duration=span, position_span=max(positions) - min(positions),
+                    velocity_rms=rms, velocity_peak=peak, return_error=error, quiet=quiet)
+
+    def update(self, receive_time: float, position: float, velocity: float,
+               feedback_count: int, *, eligible: bool = True,
+               command_reassociated: bool = False) -> None:
+        if (not all(math.isfinite(v) for v in (receive_time, position, velocity)) or
+                receive_time < 0 or type(feedback_count) is not int or feedback_count < 0):
+            raise CalibrationError("Nonfinite or invalid neutral-dwell feedback")
+        if self.raw_count is not None and feedback_count < self.raw_count:
+            raise CalibrationError("Neutral-dwell feedback count reversed")
+        if self.raw_time is not None and receive_time < self.raw_time:
+            raise CalibrationError("Neutral-dwell acquisition clock reversed")
+        if feedback_count == self.raw_count:
+            self.duplicate_counts += 1
+            return
+        if receive_time > self.started + self.dwell:
+            self.raw_count, self.raw_time = feedback_count, receive_time
+            self.post_deadline += 1
+            return  # A delayed control tick cannot extend the evidence interval.
+        gap = self.raw_count is not None and feedback_count > self.raw_count + 1
+        if gap:
+            self.missing_counts += feedback_count - self.raw_count - 1
+        if self.raw_time is not None:
+            elapsed = receive_time - self.raw_time
+            self.observed_max_gap = max(self.observed_max_gap, elapsed)
+            gap = gap or elapsed > self.max_gap + 1e-9
+        same_time = receive_time == self.raw_time
+        self.raw_count, self.raw_time = feedback_count, receive_time
+        if gap:
+            self.gaps += 1
+            self._reset_credit("feedback_gap")
+        if receive_time < self.started:
+            self.excluded_prestart += 1
+            self._reset_credit("prestart_feedback")
+            return
+        if not eligible:
+            self.excluded_ineligible += 1
+            self._reset_credit("ineligible_command_epoch")
+            return
+        if command_reassociated:
+            self.equivalent_command_samples += 1
+        # Retain every eligible position bound even if its timestamp is aliased.
+        self.position_min = position if self.position_min is None else min(self.position_min, position)
+        self.position_max = position if self.position_max is None else max(self.position_max, position)
+        if same_time:
+            self.duplicate_times += 1
+            self._reset_credit("aliased_acquisition_time")
+            return
+        self.first_time = receive_time if self.first_time is None else self.first_time
+        self.first_count = feedback_count if self.first_count is None else self.first_count
+        self.last_time, self.last_count = receive_time, feedback_count
+        self.unique_samples += 1
+        self.samples.append((receive_time, position, velocity, feedback_count))
+        while self.samples and self.samples[0][0] < receive_time - self.WINDOW - 1e-9:
+            self.samples.popleft()
+        if self._window()["quiet"]:
+            if self.quiet_since is None:
+                self.quiet_since = receive_time
+        else:
+            self.quiet_since = None
+
+    def summary(self, now: float) -> dict:
+        if not math.isfinite(now) or now < self.started:
+            raise CalibrationError("Invalid neutral-dwell query clock")
+        window = self._window()
+        age = None if self.last_time is None else now - self.last_time
+        quiet_duration = 0. if self.quiet_since is None else self.last_time - self.quiet_since
+        complete = now >= self.started + self.dwell - 1e-9
+        if not complete:
+            reason = "dwell_pending"
+        elif age is None:
+            reason = "no_eligible_feedback"
+        elif age < 0 or age > self.feedback_timeout:
+            reason = "feedback_not_fresh"
+        elif self._position_span() > 2 * self.position_resolution + 1e-12:
+            reason = "position_span"
+        elif window["return_error"] is not None and window["return_error"] > self.return_tolerance:
+            reason = "outside_return_tolerance"
+        elif window["samples"] < self.MIN_SAMPLES or window["duration"] < self.MIN_SPAN - 1e-9:
+            reason = "insufficient_source_coverage"
+        elif window["velocity_rms"] > self.VELOCITY_RMS:
+            reason = "velocity_rms"
+        elif window["velocity_peak"] > self.VELOCITY_PEAK:
+            reason = "velocity_peak"
+        elif quiet_duration < self.required_quiet_duration - 1e-9:
+            reason = "insufficient_quiet_confirmation"
+        else:
+            reason = "ready"
+        return dict(scope="Neutral position/velocity evidence at recorded resolution; not exact rest or a safety guard",
+            complete=complete, ready=reason == "ready", reason=reason, started=self.started,
+            deadline=self.started + self.dwell, dwell=self.dwell,
+            first_receive_time=self.first_time, last_receive_time=self.last_time,
+            first_count=self.first_count, last_count=self.last_count, age=age,
+            samples=self.unique_samples, epoch_position_span=self._position_span(),
+            position_span_limit=2 * self.position_resolution, return_tolerance=self.return_tolerance,
+            window=window, quiet_since=self.quiet_since, quiet_duration=quiet_duration,
+            required_quiet_duration=self.required_quiet_duration, max_gap=self.max_gap,
+            observed_max_gap=self.observed_max_gap, gaps=self.gaps, missing_counts=self.missing_counts,
+            duplicate_counts=self.duplicate_counts, duplicate_times=self.duplicate_times,
+            excluded_prestart=self.excluded_prestart, excluded_ineligible=self.excluded_ineligible,
+            equivalent_command_samples=self.equivalent_command_samples,
+            post_deadline=self.post_deadline,
+            last_reset_reason=self.last_reset_reason)
 
 
 def fit_electrical(trace: Trace, *, window: float = 0.01, max_gap: float = 0.005,
@@ -127,7 +337,11 @@ def fit_breakaway(trace: Trace, *, speed_threshold: float = 0.01,
         v = velocity[indices]
         effort = torque[indices] - support[indices]
         moving = np.flatnonzero(np.abs(v) >= speed_threshold)
-        if not len(moving) or moving[0] < 2 or abs(v[0]) >= speed_threshold:
+        # An isolated early velocity code is not a confirmed onset when the
+        # experiment also requires sustained directional motion/displacement.
+        # The confirmed segment below must still have a stationary lead-in.
+        confirmed_motion = position_threshold > 0 and confirmation_samples > 1
+        if not len(moving) or (not confirmed_motion and moving[0] < 2):
             raise CalibrationError("Each breakaway ramp must start stationary and actually break away")
         index = int(moving[0])
         direction = 1 if v[index] > 0 else -1

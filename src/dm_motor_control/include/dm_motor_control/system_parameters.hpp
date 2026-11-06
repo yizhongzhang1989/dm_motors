@@ -150,14 +150,27 @@ public:
 
   void reset() {filtered_ = output_ = 0;}
 
-  double step(double velocity, double dt, double torque_cap)
+  const std::string & model() const {return model_;}
+  double velocity_min() const {return minimum_;}
+  double velocity_max() const {return maximum_;}
+
+  // Extra viscosity is an explicit controller gain, not an extension of the
+  // calibration's qualified domain. Zero preserves the original law. Both
+  // terms share the velocity filter, reversal reset, torque cap and slew.
+  double step(double velocity, double dt, double torque_cap, double fraction = 0.8,
+    double extra_viscous = 0, double extra_velocity_limit = 0)
   {
     if (!std::isfinite(velocity) || !std::isfinite(dt) || dt <= 0 || dt > 0.1 ||
-      !std::isfinite(torque_cap) || torque_cap <= 0)
+      !std::isfinite(torque_cap) || torque_cap <= 0 ||
+      !std::isfinite(fraction) || fraction < 0 || fraction > 1 ||
+      !std::isfinite(extra_viscous) || extra_viscous < 0 ||
+      !std::isfinite(extra_velocity_limit) || extra_velocity_limit < 0 ||
+      (extra_viscous > 0 && extra_velocity_limit == 0))
     {
       throw std::runtime_error("Invalid friction compensation input/budget");
     }
-    if ((!table_.empty() && std::abs(velocity) < table_.front()[velocity >= 0 ? 0 : 2]) ||
+    if (fraction == 0 ||
+      (!table_.empty() && std::abs(velocity) < table_.front()[velocity >= 0 ? 0 : 2]) ||
       std::abs(velocity) <= 0.02 || output_ * velocity < 0)
     {
       reset();
@@ -168,7 +181,14 @@ public:
     const double v = std::clamp(filtered_, minimum_, maximum_);
     const double weight = std::tanh(std::max(0.0, std::abs(v) - 0.02) / 0.03);
     const double cap = std::min(0.5, torque_cap);
-    const double requested = std::clamp(0.8 * weight * friction(v), -cap, cap);
+    double demand = fraction * weight * friction(v);
+    if (extra_viscous > 0) {
+      const double extra_v = std::clamp(filtered_, -extra_velocity_limit, extra_velocity_limit);
+      const double extra_weight = std::tanh(std::max(0.0, std::abs(extra_v) - 0.02) / 0.03);
+      demand += extra_viscous * extra_v * extra_weight;
+      if (!std::isfinite(demand)) {throw std::runtime_error("Viscous assistance overflow");}
+    }
+    const double requested = std::clamp(demand, -cap, cap);
     output_ = std::clamp(output_ + std::clamp(requested - output_, -5 * dt, 5 * dt), -cap, cap);
     return output_;
   }

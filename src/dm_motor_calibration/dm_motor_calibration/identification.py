@@ -1,15 +1,18 @@
 """Integral mechanical identification: no numerical acceleration of noisy feedback."""
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import math
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import least_squares, lsq_linear
 
 from .data import CalibrationError, FitResult, Trace
+from .experiment import QUICK_CALIBRATION_PROTOCOL
 from .models import MODELS, FrictionModel, friction_names
 
+if TYPE_CHECKING:
+    from .parameter_diagnostics import MeasurementAssumptions
 
 Array: TypeAlias = NDArray[np.float64]
 
@@ -249,6 +252,211 @@ def identify_mechanical_candidate(trace: Trace, options: MechanicalOptions) -> M
         raise CalibrationError("No identifiable friction candidate: " + "; ".join(failures))
     best = min(candidates, key=lambda result: result.diagnostics["selection_score"])
     return replace(best, warnings=(*best.warnings, *failures))
+
+
+def _quick_stage_summary(trace: Trace) -> dict:
+    time, position, velocity, _ = trace.require("time", "position", "velocity", "torque")
+    return {
+        "raw_samples": len(time), "start_time": float(time[0]), "end_time": float(time[-1]),
+        "duration": float(time[-1] - time[0]),
+        "saturated_fraction": float(np.mean(trace.columns.get("saturated", np.zeros(len(time))) != 0)),
+        "raw_domain": {"position_min": float(np.min(position)), "position_max": float(np.max(position)),
+                       "velocity_min": float(np.min(velocity)), "velocity_max": float(np.max(velocity)),
+                       **({"temperature_min": float(np.min(trace.columns["temperature"])),
+                           "temperature_max": float(np.max(trace.columns["temperature"]))}
+                          if "temperature" in trace.columns else {})},
+    }
+
+
+def _evaluate_quick_stage(trace: Trace, candidate: MechanicalCandidate, options: MechanicalOptions,
+                          raw_indices: NDArray[np.int64], *, training: bool) -> tuple[dict, list[list]]:
+    """Score the frozen model/window; never select a model or tune on final validation."""
+    windows, speed, discarded = mechanical_windows(trace, options)
+    position, velocity, torque = trace.require("position", "velocity", "torque")
+    p = candidate.parameters
+    observed = windows.average(torque + trace.columns.get("external_torque", np.zeros_like(torque)))
+    predicted = (p["inertia"] * windows.derivative(velocity) + p["bias"] +
+                 windows.average(candidate.friction().torque(velocity)) +
+                 p.get("gravity_sin", 0) * windows.average(np.sin(position)) +
+                 p.get("gravity_cos", 0) * windows.average(np.cos(position)) +
+                 p.get("stiffness", 0) * windows.average(position))
+    errors = predicted - observed
+    if not len(errors):
+        raise CalibrationError("No valid sliding windows remain after reversal exclusion")
+    directions = {}
+    for label, sign in (("positive", 1), ("negative", -1)):
+        mask = sign * speed > 0
+        branch, residual = speed[mask], errors[mask]
+        directions[label] = {
+            "windows": len(branch),
+            "velocity_min": float(np.min(branch)) if len(branch) else None,
+            "velocity_max": float(np.max(branch)) if len(branch) else None,
+            "speed_span": float(np.ptp(branch)) if len(branch) else 0.0,
+            "rmse": float(np.sqrt(np.mean(residual**2))) if len(branch) else None,
+            "maximum_error": float(np.max(np.abs(residual))) if len(branch) else None,
+        }
+    report = {
+        **_quick_stage_summary(trace), "windows": len(speed), "discarded_reversal_windows": discarded,
+        "rmse": float(np.sqrt(np.mean(errors**2))), "maximum_error": float(np.max(np.abs(errors))),
+        "velocity_min": float(np.min(speed)), "velocity_max": float(np.max(speed)),
+        "directions": directions,
+    }
+    records = [[int(raw_indices[a]), int(raw_indices[b]),
+                "model_selection" if training and index % 5 == 4 else "fit" if training else "external_validation",
+                float(v), float(observation), float(prediction), float(error)]
+               for index, (a, b, v, observation, prediction, error) in enumerate(zip(
+                   windows.starts, windows.ends, speed, observed, predicted, errors))]
+    return report, records
+
+
+def analyze_quick_calibration(trace: Trace, options: MechanicalOptions | None = None, *,
+                              protocol: str,
+                              measurement_assumptions: "MeasurementAssumptions | None" = None) -> tuple[FitResult | None, dict]:
+    """Evaluate an explicitly versioned two-trajectory quick acquisition.
+
+    leg=0 supplies all fitting, model selection and adaptive-window decisions;
+    leg=1 is a subsequent, distinct reference and is used only for final scoring.
+    leg=-1 is transition/return data. The collector persists the reference plan;
+    these labels alone cannot prove what physical reference was executed.
+
+    Legacy fit_mechanical() intentionally retains its original semantics. A
+    single-leg historical CSV cannot gain independent validation through replay.
+    """
+    if protocol != QUICK_CALIBRATION_PROTOCOL:
+        raise CalibrationError("Independent quick analysis requires the explicit quick_independent_v1 protocol")
+    from .parameter_diagnostics import MeasurementAssumptions, parameter_identifiability
+    if measurement_assumptions is not None and not isinstance(measurement_assumptions, MeasurementAssumptions):
+        raise CalibrationError("measurement_assumptions must be MeasurementAssumptions or None")
+    options = options or MechanicalOptions()
+    leg, = trace.require("leg")
+    if not np.all(np.isin(leg, (-1, 0, 1))):
+        raise CalibrationError("Independent quick samples require leg -1, 0 or 1")
+    selected = [np.flatnonzero(leg == value) for value in (0, 1)]
+    if any(len(indices) < 3 for indices in selected):
+        raise CalibrationError("Independent quick analysis requires recorded training and external validation legs")
+    if selected[0][-1] >= selected[1][0] or any(np.any(np.diff(indices) != 1) for indices in selected):
+        raise CalibrationError("Quick training must precede external validation in separate contiguous acquisition legs")
+    stages = [Trace.of(**{name: values[indices] for name, values in trace.columns.items()}) for indices in selected]
+    issues: list[str] = []
+    report = {
+        "protocol": protocol, "qualified": False, "quality_issues": issues, "candidate_model": None,
+        "requested_options": asdict(options),
+        "training": _quick_stage_summary(stages[0]), "external_validation": _quick_stage_summary(stages[1]),
+        "coverage": {},
+        "parameter_identifiability": {"schema": "quick_parameter_diagnostics_v1",
+                                      "status": "unavailable_no_training_candidate",
+                                      "affects_prediction_qualification": False,
+                                      "measurement_assumptions": asdict(measurement_assumptions or MeasurementAssumptions())},
+        "data_selection": {
+            "fields": ["first_raw_sample", "last_raw_sample", "use", "mean_velocity", "observed_torque",
+                       "predicted_torque", "prediction_error"],
+            "training": [], "external_validation": [],
+            "transition_samples": int(np.sum(leg == -1)),
+            "raw_samples": len(leg),
+        },
+        "semantics": {
+            "training": "Every fifth accepted training window is held out for model selection; it is not final validation",
+            "external_validation": "Subsequent distinct reference; model, parameters and integration window are frozen using training only",
+            "windows": "Zero-based inclusive indices in the original samples.csv; non-sliding, saturated, gap-crossing and reversal windows are excluded",
+            "scope": "Quick sliding-friction/dynamic identification within measured coverage; no static-breakaway, thermal or full-speed certification",
+            "parameter_qualification": "qualified evaluates the frozen mechanical prediction, not independent accuracy of J, Fc, viscous friction, gravity or bias",
+        },
+        "limits": {"rmse": options.max_rmse, "minimum_windows_per_direction": 15,
+                   "minimum_speed_span_per_direction": max(0.03, options.min_speed * 2),
+                   "maximum_saturated_fraction": 0.05},
+    }
+    for name in ("training", "external_validation"):
+        if report[name]["saturated_fraction"] > 0.05:
+            issues.append(f"Quick {name} has more than 5% saturated samples")
+    try:
+        candidate = identify_mechanical_candidate(stages[0], options)
+    except CalibrationError as error:
+        issues.append("No identifiable training candidate: " + str(error))
+        return None, report
+    parameter_warning = ("Low prediction residual does not independently validate inertia, separate Coulomb/viscous "
+                         "coefficients, gravity or bias; see training-only parameter diagnostics before using individual physical parameters")
+    report["candidate_model"] = asdict(candidate)
+    # Keep the limitation when an unqualified candidate is explicitly accepted
+    # later. These metadata do not change fitting or prediction qualification.
+    report["candidate_model"]["diagnostics"].update(physical_parameters_independently_validated=0.0,
+                                                   parameter_diagnostics_version=1.0)
+    report["candidate_model"]["warnings"] = (*candidate.warnings, parameter_warning)
+    report["training"]["model_selection"] = dict(candidate.diagnostics)
+    # Freeze the adaptive choice from training; final validation cannot shorten it.
+    frozen = replace(options, model=candidate.model, window=candidate.diagnostics["integration_window"],
+                     adaptive_window=False)
+    report["frozen_options"] = asdict(frozen)
+    report["parameter_identifiability"] = parameter_identifiability(
+        stages[0], candidate, frozen, measurement_assumptions=measurement_assumptions, raw_indices=selected[0])
+    for name, stage, indices in zip(("training", "external_validation"), stages, selected):
+        try:
+            evaluated, records = _evaluate_quick_stage(stage, candidate, frozen, indices, training=name == "training")
+            report[name].update(evaluated)
+            report["data_selection"][name] = records
+        except CalibrationError as error:
+            issues.append(f"Quick {name} cannot be evaluated: {error}")
+            continue
+        if evaluated["rmse"] > options.max_rmse:
+            issues.append(f"Quick {name} RMS exceeds {options.max_rmse:g} Nm")
+        for direction, branch in evaluated["directions"].items():
+            if branch["windows"] < 15 or branch["speed_span"] < max(0.03, options.min_speed * 2):
+                issues.append(f"Quick {name} {direction} needs at least 15 sliding windows and multiple speeds")
+            if branch["rmse"] is not None and branch["rmse"] > options.max_rmse:
+                issues.append(f"Quick {name} {direction} RMS exceeds {options.max_rmse:g} Nm")
+    try:
+        candidate.qualified_result()
+    except CalibrationError as error:
+        issues.append("Training model selection is unqualified: " + str(error))
+    if "velocity_min" not in report["external_validation"] or "velocity_min" not in report["training"]:
+        return None, report
+    training, validation = report["training"], report["external_validation"]
+    minimum = max(training["velocity_min"], validation["velocity_min"])
+    maximum = min(training["velocity_max"], validation["velocity_max"])
+    report["coverage"] = {
+        "training_velocity_min": training["velocity_min"], "training_velocity_max": training["velocity_max"],
+        "validation_velocity_min": validation["velocity_min"], "validation_velocity_max": validation["velocity_max"],
+        "validated_velocity_min": minimum, "validated_velocity_max": maximum,
+        "semantics": "Intersection of measured sliding-window velocity ranges; not proof of every position/temperature/speed combination",
+    }
+    if not minimum < 0 < maximum:
+        issues.append("Training and external validation have no bidirectional velocity-domain intersection")
+    # Overall signed min/max alone can hide a hole: training at +/-0.1 and
+    # validation at +/-1 do not validate the training-speed range. Require
+    # genuinely shared sliding coverage separately on each branch.
+    common_branches = {}
+    for direction in ("positive", "negative"):
+        train_branch, validation_branch = training["directions"][direction], validation["directions"][direction]
+        if not train_branch["windows"] or not validation_branch["windows"]:
+            continue
+        lower = max(train_branch["velocity_min"], validation_branch["velocity_min"])
+        upper = min(train_branch["velocity_max"], validation_branch["velocity_max"])
+        counts = {name: sum(lower <= row[3] <= upper for row in report["data_selection"][name])
+                  for name in ("training", "external_validation")}
+        common_branches[direction] = {"velocity_min": lower, "velocity_max": upper,
+                                      "speed_span": max(0.0, upper - lower), "windows": counts}
+        if upper - lower < max(0.03, options.min_speed * 2) or min(counts.values()) < 15:
+            issues.append(f"Quick {direction} shared training/validation coverage needs 15 windows per leg and multiple speeds")
+    report["coverage"]["directions"] = common_branches
+    if issues:
+        return None, report
+    diagnostics = {
+        **candidate.diagnostics,
+        "model_selection_rmse": candidate.diagnostics["validation_rmse"],
+        "model_selection_samples": candidate.diagnostics["validation_samples"],
+        "validation_rmse": validation["rmse"], "external_validation_windows": float(validation["windows"]),
+        "external_validation_raw_samples": float(validation["raw_samples"]),
+        "external_max_error": validation["maximum_error"], "independent_validation": 1.0,
+        "quick_protocol_version": 1.0,
+        "physical_parameters_independently_validated": 0.0,
+        "parameter_diagnostics_version": 1.0,
+    }
+    result = FitResult("mechanical", candidate.model, candidate.parameters, candidate.units, diagnostics,
+                       {**candidate.domain, "velocity_min": minimum, "velocity_max": maximum},
+                       (*candidate.warnings,
+                        "Final validation uses a distinct subsequent trajectory; validity is limited to measured sliding coverage, not static friction or full-speed operation",
+                        parameter_warning))
+    report["qualified"] = True
+    return result, report
 
 
 def _identify_model(trace: Trace, options: MechanicalOptions) -> MechanicalCandidate:

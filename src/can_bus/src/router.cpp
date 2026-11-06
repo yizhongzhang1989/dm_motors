@@ -27,6 +27,21 @@ bool polling(const Client & c, const Frame & f)
 {
   return std::any_of(c.polls.begin(), c.polls.end(), [&](const auto & poll) {return same(poll, f);});
 }
+bool optional_position_read(const Client & c, const Frame & f)
+{
+  if (f.id != 0x7ff || f.length != 8 || f.channel || f.fd || f.brs ||
+    f.extended || f.rtr || f.error || !f.data[0] || f.data[1] ||
+    f.data[2] != 0x33 || f.data[3] != 80 ||
+    !std::all_of(f.data.begin() + 4, f.data.begin() + 8, [](uint8_t b) {return b == 0;}))
+  {return false;}
+  // Generic ownership is insufficient for this optional motor-specific lane.
+  return std::any_of(c.tx.begin(), c.tx.end(), [&](const auto & route) {
+    return route.id == 0x7ff && route.mask == 0x7ff && !route.extended && !route.channel &&
+           route.prefix.size() >= 2 && route.prefix_mask.size() >= 2 &&
+           route.prefix[0] == f.data[0] && route.prefix[1] == 0 &&
+           route.prefix_mask[0] == 255 && route.prefix_mask[1] == 255 && matches(route, f);
+  });
+}
 bool expired(const Client & c, double now)
 {
   // Discovery reserves routes, not motion authority; the first heartbeat activates the lease.
@@ -129,18 +144,36 @@ void Router::heartbeat(const std::string & token, uint64_t e, uint64_t seq,
   }
   c.fault = fault;
 }
-void Router::enqueue(const std::string & token, uint64_t e, uint64_t seq,
+std::vector<OptionalReadRemoved> Router::enqueue(const std::string & token, uint64_t e, uint64_t seq,
   double ttl, uint8_t priority, const Frame & f, double now, bool active, uint64_t sent_steady)
 {
   auto & c = authenticate(token, e);
   if (expired(c, now)) {revoke(c); throw std::invalid_argument("lease expired");}
   validate_frame(f, allow_fd);
   if (seq <= c.tx_sequence || !std::isfinite(ttl) || ttl <= 0 || ttl > .25 ||
-    priority > 2 || !allowed(c, f)) {throw std::invalid_argument("invalid TX sequence, TTL, priority or route");}
+    priority > 3 || !allowed(c, f)) {throw std::invalid_argument("invalid TX sequence, TTL, priority or route");}
+  if (priority == 3) {
+    if (active || !optional_position_read(c, f)) {
+      throw std::invalid_argument("optional TX requires an owned inactive classical position80 read");
+    }
+    if (c.fault || !maintenance_owner.empty() ||
+      std::any_of(c.pending.begin(), c.pending.end(), [](const auto & p) {return p.priority == 1;}))
+    {throw std::invalid_argument("optional position read blocked by fault, maintenance or queued stop");}
+    if (std::any_of(c.pending.begin(), c.pending.end(),
+      [&](const auto & p) {return p.priority == 3 && same(p.frame, f);}))
+    {throw std::invalid_argument("optional position read already pending for this route");}
+  }
+  std::vector<OptionalReadRemoved> removed;
   if (priority == 1) {
     if (active) {throw std::invalid_argument("stop cannot mark activity");}
     if (!std::any_of(c.stops.begin(), c.stops.end(), [&](const auto & s) {return same(s, f);})) {
       throw std::invalid_argument("priority stop must equal a registered stop frame");
+    }
+    for (const auto & p : c.pending) {
+      if (p.priority == 3 && now < p.expires) {
+        removed.push_back({c.token, epoch, p.sequence, seq, p.sent_steady,
+          static_cast<uint64_t>(now * 1e9), p.frame});
+      }
     }
     c.pending.erase(std::remove_if(c.pending.begin(), c.pending.end(),
       [&](const auto & p) {return p.priority != 1 || same(p.frame, f);}), c.pending.end());
@@ -168,7 +201,8 @@ void Router::enqueue(const std::string & token, uint64_t e, uint64_t seq,
     c.activity_requires_stop = true; c.stop_dispatched_steady = 0;
     c.last_activity_steady = sent_steady ? sent_steady : static_cast<uint64_t>(now * 1e9);
   }
-  c.pending.push_back({f, now + ttl, priority, active});
+  c.pending.push_back({f, now + ttl, priority, active, seq, sent_steady});
+  return removed;
 }
 bool Router::maintenance(const std::string & token, uint64_t e,
   bool acquire, double duration, double now)
@@ -223,6 +257,7 @@ std::vector<Frame> Router::drain(double now, bool transmit_ready)
     }
   }
   size_t priority_end = result.size();
+  size_t ordinary_end = result.size();
   for (auto & item : clients) {
     auto & c = item.second;
     for (auto it = c.pending.begin(); it != c.pending.end();) {
@@ -233,19 +268,25 @@ std::vector<Frame> Router::drain(double now, bool transmit_ready)
     auto stop = std::find_if(c.pending.begin(), c.pending.end(), [](const auto & p) {return p.priority == 1;});
     if (stop != c.pending.end()) {
       if (result.capacity() == 0) {result.reserve(clients.size());}
-      result.insert(result.begin() + priority_end, stop->frame); ++priority_end;
+      result.insert(result.begin() + priority_end, stop->frame); ++priority_end; ++ordinary_end;
       c.pending.erase(stop);
       if (c.activity_requires_stop) {c.stop_dispatched_steady = static_cast<uint64_t>(now * 1e9);}
       continue;
     }
     if (!c.heartbeat_sequence || !c.receive_ready) {continue;}
-    const auto & pending = c.pending.front();
+    auto selected = std::find_if(c.pending.begin(), c.pending.end(),
+      [](const auto & p) {return p.priority != 3;});
+    if (selected == c.pending.end()) {selected = c.pending.begin();}
+    const auto & pending = *selected;
     const bool maintenance_poll = pending.priority == 0 && !pending.active && polling(c, pending.frame);
     if ((!maintenance_owner.empty() && maintenance_owner != c.token && !maintenance_poll) ||
       now < c.next_tx) {continue;}
-    const auto frame = c.pending.front().frame;
+    const auto frame = pending.frame;
+    const bool optional = pending.priority == 3;
     if (result.capacity() == 0) {result.reserve(clients.size());}
-    result.push_back(frame); c.pending.pop_front();
+    if (optional) {result.push_back(frame);}
+    else {result.insert(result.begin() + ordinary_end, frame); ++ordinary_end;}
+    c.pending.erase(selected);
     if (c.activity_requires_stop && std::any_of(c.stops.begin(), c.stops.end(),
       [&](const auto & registered) {return same(registered, frame);}))
     {c.stop_dispatched_steady = static_cast<uint64_t>(now * 1e9);}

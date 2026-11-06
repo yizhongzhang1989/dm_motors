@@ -31,7 +31,7 @@ from dm_motor_interfaces.srv import LeadFollowControl
 
 class FollowHarness(unittest.TestCase):
     def setUp(self):
-        os.environ["ROS_DOMAIN_ID"] = str(150 + os.getpid() % 20)
+        os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(150 + os.getpid() % 20))
         rclpy.init()
         self.namespace = f"/follow_test_{os.getpid()}_{time.monotonic_ns()}"
         self.node = Node("probe", namespace=self.namespace)

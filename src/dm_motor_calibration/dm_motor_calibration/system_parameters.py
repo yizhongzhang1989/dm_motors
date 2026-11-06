@@ -39,7 +39,8 @@ def load_model(path: Path, identity: dict | None = None, *, report: dict | None 
                 not isinstance(document.get("identity"), dict)):
             raise CalibrationError("Model review requires a completed report with confirmed disable and identity")
         experiment = document.get("experiment")
-        analysis = document.get(experiment) if experiment in ("fourier", "precision") else None
+        analysis = (document.get("quick") if experiment == "calibrate" else
+                    document.get(experiment) if experiment in ("fourier", "precision") else None)
         if not isinstance(analysis, dict) or not isinstance(analysis.get("candidate_model"), dict):
             raise CalibrationError("Report has no usable mechanical candidate")
         issues = analysis.get("quality_issues", [])
@@ -53,7 +54,29 @@ def load_model(path: Path, identity: dict | None = None, *, report: dict | None 
         candidate = deepcopy(analysis["candidate_model"])
         candidate.pop("qualified", None)
         candidate["kind"] = "mechanical"
-        if experiment == "fourier":
+        if experiment == "calibrate":
+            if analysis.get("protocol") != "quick_independent_v1":
+                raise CalibrationError("Quick candidate requires its independent-validation protocol")
+            validation, coverage = analysis.get("external_validation"), analysis.get("coverage")
+            if not isinstance(validation, dict) or not isinstance(coverage, dict):
+                raise CalibrationError("Quick candidate requires independent validation and shared speed coverage")
+            for name in ("rmse", "maximum_error", "windows"):
+                if type(validation.get(name)) not in (int, float) or not math.isfinite(validation[name]) or validation[name] < 0:
+                    raise CalibrationError(f"Invalid quick validation metric: {name}")
+            for name in ("validated_velocity_min", "validated_velocity_max"):
+                if type(coverage.get(name)) not in (int, float) or not math.isfinite(coverage[name]):
+                    raise CalibrationError("Invalid quick validated speed coverage")
+            candidate["diagnostics"].update(
+                model_selection_rmse=candidate["diagnostics"]["validation_rmse"],
+                validation_rmse=validation["rmse"], external_max_error=validation["maximum_error"],
+                external_validation_windows=float(validation["windows"]), independent_validation=1.0,
+                quick_protocol_version=1.0)
+            candidate["domain"].update(
+                velocity_min=max(candidate["domain"]["velocity_min"], coverage["validated_velocity_min"]),
+                velocity_max=min(candidate["domain"]["velocity_max"], coverage["validated_velocity_max"]))
+            if document.get("qualified") is True and analysis.get("qualified") is not True:
+                raise CalibrationError("Quick report qualification disagrees with independent validation")
+        elif experiment == "fourier":
             metrics, validation = analysis.get("metrics"), analysis.get("validation")
             if not isinstance(metrics, dict) or not isinstance(validation, dict):
                 raise CalibrationError("Fourier candidate needs measured independent validation diagnostics")

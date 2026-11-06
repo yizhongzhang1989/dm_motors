@@ -26,7 +26,8 @@ from dm_motor_control.dashboard import plain_message
 MOTOR_FIELDS = ("motor_id", "name", "simulated", "ready", "phase", "status", "feedback_fresh",
                 "feedback_age", "position", "velocity", "torque", "mos_temperature",
                 "rotor_temperature", "feedback_rate", "control_owner", "error",
-                "host_fault", "device_fault", "target_active", "active_source")
+                "host_fault", "device_fault", "target_active", "active_source",
+                "tmax", "torque_limit", "kp_limit", "kd_limit", "host_protection_enabled")
 
 
 class ApiError(Exception):
@@ -173,6 +174,9 @@ class PairedDashboard(Node):
             self.event("Non-exclusive browser session opened; no motor control ownership")
             return {"session": self.owner}
 
+    def require_start(self):
+        self.require_idle()
+
     def heartbeat(self, session):
         with self.lock:
             self.require_session(session)
@@ -250,7 +254,7 @@ class PairedDashboard(Node):
         try:
             with self.lock:
                 self.require_session(session)
-                self.require_idle()
+                self.require_start() if start else self.require_idle()
                 generation = self.generation
                 if start and any(not item[1]["simulated"] for item in self.motors.values()) and not body["confirm_hardware"]:
                     raise ApiError(400, "Explicit site safety confirmation is required for hardware START")

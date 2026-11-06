@@ -58,12 +58,18 @@ public:
     physics.friction_model = parameter<std::string>("friction_model");
     physics.stribeck_velocity = parameter<double>("stribeck_velocity");
     physics.friction_negative_scale = parameter<double>("friction_negative_scale");
+    physics.friction_displacement_scale = parameter<double>(
+      "friction_displacement_scale", physics.friction_displacement_scale);
+    physics.initial_bristle_displacement = parameter<double>(
+      "initial_bristle_displacement", physics.initial_bristle_displacement);
     physics.gravity_torque = parameter<double>("gravity_torque");
     physics.gravity_offset = parameter<double>("gravity_offset");
     physics.joint_stiffness = parameter<double>("joint_stiffness");
     physics.load_torque = parameter<double>("load_torque");
     physics.max_torque = parameter<double>("max_torque");
     physics.no_load_speed = parameter<double>("no_load_speed");
+    physics.constant_torque_speed = parameter<double>(
+      "constant_torque_speed", physics.constant_torque_speed);
     physics.torque_time_constant = parameter<double>("torque_time_constant");
     physics.lower_limit = parameter<double>("lower_limit");
     physics.upper_limit = parameter<double>("upper_limit");
@@ -77,6 +83,12 @@ public:
     physics.initial_position = parameter<double>("initial_position");
     physics.initial_velocity = parameter<double>("initial_velocity");
     parameters.integration_step = parameter<double>("integration_step");
+    parameters.velocity_time_constant = parameter<double>("velocity_time_constant", 0);
+    parameters.feedback_velocity_source = parameter<std::string>("feedback_velocity_source", parameters.feedback_velocity_source);
+    parameters.feedback_velocity_time_constant = parameter<double>("feedback_velocity_time_constant", 0);
+    parameters.feedback_velocity_delay = parameter<double>("feedback_velocity_delay", 0);
+    parameters.feedback_torque_time_constant = parameter<double>("feedback_torque_time_constant", 0);
+    parameters.feedback_torque_delay = parameter<double>("feedback_torque_delay", 0);
     parameters.bus_voltage = parameter<double>("bus_voltage");
     parameters.velocity_kp = parameter<double>("velocity_kp");
     parameters.velocity_ki = parameter<double>("velocity_ki");
@@ -166,6 +178,14 @@ private:
     rcl_interfaces::msg::ParameterDescriptor descriptor;
     descriptor.read_only = true;
     return declare_parameter<T>(name, config_.get<T>("packages.dm_motor_control.nodes.sim_motor_node." + name), descriptor);
+  }
+  template<typename T>
+  T parameter(const std::string & name, const T & fallback)
+  {
+    rcl_interfaces::msg::ParameterDescriptor descriptor;
+    descriptor.read_only = true;
+    const auto key = "packages.dm_motor_control.nodes.sim_motor_node." + name;
+    return declare_parameter<T>(name, config_.has(key) ? config_.get<T>(key) : fallback, descriptor);
   }
 
   void require_virtual() const
@@ -278,6 +298,9 @@ private:
     output.contact_torque = physical.contact_torque; output.net_torque = physical.net_torque;
     output.load_torque = physical.load_torque;
     output.mechanical_energy = physical.mechanical_energy;
+    output.bristle_displacement = physical.bristle_displacement;
+    output.bristle_energy = physical.bristle_energy;
+    output.total_storage = physical.total_storage;
     output.rotor_temperature = physical.rotor_temperature; output.mos_temperature = physical.mos_temperature;
     output.bus_voltage = model_->voltage(); output.external_remaining = model_->external_remaining();
     output.external_source = external_source_; output.accepted_commands = model_->commands();

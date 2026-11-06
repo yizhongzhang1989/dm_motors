@@ -1,10 +1,19 @@
 """Shared bounded excitation and motion guards for simulation and the ROS collector."""
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, replace
 import math
 from typing import Protocol
 
 from .data import CalibrationError
+
+
+QUICK_CALIBRATION_PROTOCOL = "quick_independent_v1"
+TRAINING_HARMONICS = ((0.6, 1.0), (0.28, 2.3), (0.12, 5.1))
+VALIDATION_HARMONICS = ((0.7, 0.73), (0.3, 1.71))
+# A distinct reference with enough speed content for a 20-second quick leg.
+# Its weighted frequency bound (1.748) stays below training's bound (1.856).
+# Keep the legacy validation reference unchanged for A/B and old recordings.
+QUICK_VALIDATION_HARMONICS = ((0.7, 1.31), (0.3, 2.77))
 
 
 @dataclass(frozen=True)
@@ -101,14 +110,23 @@ class ExperimentSettings:
     max_travel: float = 2.0
     max_temperature: float = 50.0
     feedback_timeout: float = 0.08
+    # Independent acquisition recipes validate their own trajectory. This
+    # constructor-only switch is not a ROS parameter or a serialized setting.
+    _validate_reference: InitVar[bool] = True
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _validate_reference: bool) -> None:
+        if type(_validate_reference) is not bool:
+            raise CalibrationError("Reference validation selection must be boolean")
         if any(isinstance(value, bool) or not math.isfinite(value) or value <= 0 for value in vars(self).values()):
             raise CalibrationError("Experiment limits, gains and excitation must be finite and positive")
         if not 8 <= self.duration <= 600:
             raise CalibrationError("Experiment duration must be in [8,600] seconds")
-        if self.amplitude >= self.max_travel or self.feedback_timeout > 0.2:
-            raise CalibrationError("Excitation must fit inside travel limits; feedback timeout must be <=0.2 s")
+        if self.feedback_timeout > 0.2:
+            raise CalibrationError("Feedback timeout must be <=0.2 s")
+        if not _validate_reference:
+            return
+        if self.amplitude >= self.max_travel:
+            raise CalibrationError("Excitation must fit inside travel limits")
         maximum_reference_speed = self.amplitude * (
             2 * math.pi * self.frequency * (0.6 + 0.28 * 2.3 + 0.12 * 5.1) + math.pi / 4)
         if maximum_reference_speed >= self.max_speed:
@@ -125,13 +143,65 @@ def reference(elapsed: float, settings: ExperimentSettings, *, validation: bool 
     derivative = math.pi / 4 * math.sin(math.pi * edge / 2) if edge < 2 else 0.0
     if elapsed > settings.duration - 2:
         derivative = -derivative
-    harmonics = ((0.7, 0.73), (0.3, 1.71)) if validation else ((0.6, 1.0), (0.28, 2.3), (0.12, 5.1))
+    harmonics = VALIDATION_HARMONICS if validation else TRAINING_HARMONICS
     q = v = 0.0
     for weight, multiple in harmonics:
         omega = 2 * math.pi * settings.frequency * multiple
         q += weight * math.sin(omega * elapsed)
         v += weight * omega * math.cos(omega * elapsed)
     return settings.amplitude * envelope * q, settings.amplitude * (envelope * v + derivative * q)
+
+
+def quick_calibration_settings(settings: ExperimentSettings, leg: int) -> ExperimentSettings:
+    """Versioned quick protocol: preserve training, then measure a distinct short trajectory.
+
+    A measured return/settle separates the legs. Its duration is deliberately not
+    represented by a fixed delay here; the collector must confirm actual settling.
+    """
+    if type(leg) is not int or leg not in (0, 1):
+        raise CalibrationError("Quick calibration leg must be 0 (training) or 1 (external validation)")
+    return settings if leg == 0 else replace(settings, duration=max(16.0, min(24.0, settings.duration / 2)))
+
+
+def quick_calibration_reference(elapsed: float, settings: ExperimentSettings, leg: int) -> tuple[float, float]:
+    """Evaluate a reference using time since this leg started, excluding the return."""
+    local = quick_calibration_settings(settings, leg)
+    if leg == 0:
+        return reference(elapsed, local)
+    if not math.isfinite(elapsed) or elapsed < 0:
+        raise CalibrationError("Experiment elapsed time must be finite and nonnegative")
+    if elapsed >= local.duration:
+        return 0.0, 0.0
+    edge = min(elapsed, local.duration - elapsed, 2.0)
+    envelope = math.sin(math.pi * edge / 4) ** 2
+    derivative = math.pi / 4 * math.sin(math.pi * edge / 2) if edge < 2 else 0.0
+    if elapsed > local.duration - 2:
+        derivative = -derivative
+    q = v = 0.0
+    for weight, multiple in QUICK_VALIDATION_HARMONICS:
+        omega = 2 * math.pi * local.frequency * multiple
+        q += weight * math.sin(omega * elapsed)
+        v += weight * omega * math.cos(omega * elapsed)
+    return local.amplitude * envelope * q, local.amplitude * (envelope * v + derivative * q)
+
+
+def quick_calibration_plan(settings: ExperimentSettings) -> dict:
+    """Persist this alongside samples so legacy single-leg records keep their meaning."""
+    roles = [
+        {"leg": leg, "role": role, "duration": quick_calibration_settings(settings, leg).duration,
+         "reference": name, "harmonics": [list(pair) for pair in harmonics]}
+        for leg, role, name, harmonics in (
+            (0, "training_and_model_selection", "training_multisine_v1", TRAINING_HARMONICS),
+            (1, "external_validation", "quick_validation_multisine_v2", QUICK_VALIDATION_HARMONICS))]
+    return {
+        "protocol": QUICK_CALIBRATION_PROTOCOL,
+        "planned_excitation_duration": sum(role["duration"] for role in roles),
+        "roles": roles,
+        "transition": "measured_return_and_settle",
+        "transition_leg": -1,
+        "scope": "Quick sliding-friction/dynamic identification within measured bidirectional coverage; "
+                 "not static-breakaway, thermal or full-speed certification",
+    }
 
 
 def feedback_torque(position: float, velocity: float, target_position: float,

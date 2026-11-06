@@ -1,6 +1,7 @@
 #include "dm_motor_control/system_parameters.hpp"
 #include <gtest/gtest.h>
 #include <fstream>
+#include <limits>
 #include <unistd.h>
 
 namespace
@@ -35,6 +36,107 @@ TEST(SystemParameters, BoundedFrictionUsesMeasuredVelocityAndResetsOnReversal)
   EXPECT_DOUBLE_EQ(compensation.step(100, 0.01, 0.01), 0.01);
   EXPECT_THROW(compensation.step(NAN, 0.01, 1), std::runtime_error);
   EXPECT_THROW(compensation.step(1, 0.11, 1), std::runtime_error);
+}
+
+TEST(SystemParameters, OptionalFractionPreservesDefaultsAndExposesMeasuredDomain)
+{
+  dm_motor::FrictionCompensator original(fit()), explicit_default(fit()), half(fit());
+  EXPECT_EQ(original.model(), "coulomb_viscous");
+  EXPECT_DOUBLE_EQ(original.velocity_min(), -2.0);
+  EXPECT_DOUBLE_EQ(original.velocity_max(), 2.0);
+  for (const double velocity : {0.0, 0.1, 1.0, 20.0, -1.0, -20.0, 0.0}) {
+    EXPECT_DOUBLE_EQ(original.step(velocity, 0.01, 0.2), explicit_default.step(velocity, 0.01, 0.2, 0.8));
+  }
+  for (int i = 0; i < 100; ++i) {half.step(1, 0.01, 1, 0.5);}
+  EXPECT_NEAR(half.step(1, 0.01, 1, 0.5), 0.5 * (0.08 + 0.03), 1e-12);
+  for (int i = 0; i < 100; ++i) {half.step(20, 0.01, 1, 1);}
+  EXPECT_NEAR(half.step(20, 0.01, 1, 1), 0.08 + 0.03 * 2, 1e-12);
+  EXPECT_DOUBLE_EQ(half.step(20, 0.01, 0.01, 1), 0.01);
+}
+
+TEST(SystemParameters, ZeroFractionClearsHistoryAndInvalidFractionsAreRejected)
+{
+  dm_motor::FrictionCompensator compensation(fit());
+  for (int i = 0; i < 100; ++i) {compensation.step(1, 0.01, 1);}
+  EXPECT_GT(compensation.step(1, 0.01, 1), 0);
+  EXPECT_DOUBLE_EQ(compensation.step(1, 0.01, 1, 0), 0);
+  // Both filtered velocity and prior output must be gone when assistance resumes.
+  dm_motor::FrictionCompensator fresh(fit());
+  EXPECT_DOUBLE_EQ(compensation.step(-1, 0.01, 1, 1), fresh.step(-1, 0.01, 1, 1));
+  EXPECT_DOUBLE_EQ(compensation.step(-1, 0.01, 1, 0), 0);
+  for (const double fraction : {-0.01, 1.01, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    EXPECT_THROW(compensation.step(1, 0.01, 1, fraction), std::runtime_error);
+  }
+  EXPECT_THROW(compensation.step(NAN, 0.01, 1, 0), std::runtime_error);
+}
+
+TEST(SystemParameters, ExtraViscosityKeepsCalibrationDomainAndHasItsOwnSpeedCeiling)
+{
+  dm_motor::FrictionCompensator c(fit());
+  // The original model stays clipped at 2 rad/s. Only the explicit additional
+  // controller term can use the separately specified 13.2 rad/s ceiling.
+  for (int i = 0; i < 300; ++i) {c.step(10, .002, .4, .6, .02, 13.2);}
+  EXPECT_NEAR(c.step(10, .002, .4, .6, .02, 13.2), .6 * (.08 + .03 * 2) + .02 * 10, 1e-12);
+  for (int i = 0; i < 300; ++i) {c.step(100, .002, .4, .6, .02, 13.2);}
+  EXPECT_NEAR(c.step(100, .002, .4, .6, .02, 13.2), .6 * (.08 + .03 * 2) + .02 * 13.2, 1e-12);
+  EXPECT_DOUBLE_EQ(c.velocity_min(), -2.);
+  EXPECT_DOUBLE_EQ(c.velocity_max(), 2.);
+  EXPECT_DOUBLE_EQ(c.step(-10, .002, .4, .6, .02, 13.2), 0);
+  for (int i = 0; i < 300; ++i) {c.step(-10, .002, .4, .6, .02, 13.2);}
+  EXPECT_NEAR(c.step(-10, .002, .4, .6, .02, 13.2), -(.6 * (.08 + .03 * 2) + .02 * 10), 1e-12);
+}
+
+TEST(SystemParameters, ExtraViscositySharesCapSlewDeadZoneAndCompleteReset)
+{
+  dm_motor::FrictionCompensator c(fit());
+  double previous = 0;
+  for (int i = 0; i < 300; ++i) {
+    const double current = c.step(13.2, .002, .2, .6, .03, 13.2);
+    EXPECT_LE(std::abs(current - previous), .010000000001);
+    EXPECT_LE(std::abs(current), .2);
+    previous = current;
+  }
+  EXPECT_DOUBLE_EQ(previous, .2);
+  EXPECT_DOUBLE_EQ(c.step(.02, .002, .2, .6, .03, 13.2), 0);
+  dm_motor::FrictionCompensator fresh(fit());
+  EXPECT_DOUBLE_EQ(c.step(-13.2, .002, .2, .6, .03, 13.2),
+    fresh.step(-13.2, .002, .2, .6, .03, 13.2));
+  EXPECT_DOUBLE_EQ(c.step(-13.2, .002, .2, 0, .03, 13.2), 0);
+  fresh.reset();
+  EXPECT_DOUBLE_EQ(c.step(13.2, .002, .2, .6, .03, 13.2),
+    fresh.step(13.2, .002, .2, .6, .03, 13.2));
+}
+
+TEST(SystemParameters, ZeroExtraViscosityIsExactlyTheOriginalLaw)
+{
+  dm_motor::FrictionCompensator original(fit()), zero(fit());
+  for (int i = 0; i < 2000; ++i) {
+    const double v = i % 17 == 0 ? 0 : 20 * std::sin(i * .037);
+    const double dt = .001 + .001 * (i % 3);
+    EXPECT_DOUBLE_EQ(original.step(v, dt, .2, .6), zero.step(v, dt, .2, .6, 0, 0));
+  }
+  for (const double value : {-1., std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+    EXPECT_THROW(zero.step(1, .002, .2, .6, value, 13.2), std::runtime_error);
+    EXPECT_THROW(zero.step(1, .002, .2, .6, .02, value), std::runtime_error);
+  }
+  EXPECT_THROW(zero.step(1, .002, .2, .6, .02, 0), std::runtime_error);
+}
+
+TEST(SystemParameters, FractionStillCompensatesOnlyFriction)
+{
+  auto full_fit = fit();
+  full_fit["parameters"]["inertia"] = 2.0;
+  full_fit["parameters"]["bias"] = 0.3;
+  full_fit["parameters"]["gravity_sin"] = 0.4;
+  full_fit["parameters"]["gravity_cos"] = 0.5;
+  full_fit["parameters"]["stiffness"] = 1.0;
+  for (const auto & key : {"gravity_sin", "gravity_cos", "stiffness"}) {full_fit["units"][key] = "SI";}
+  dm_motor::FrictionCompensator original(fit()), complete(full_fit);
+  for (const double velocity : {0.0, 0.1, 1.0, 2.0, -0.1, -1.0, -2.0, 0.0}) {
+    EXPECT_DOUBLE_EQ(original.step(velocity, 0.01, 0.2, 0.5), complete.step(velocity, 0.01, 0.2, 0.5));
+  }
 }
 
 TEST(SystemParameters, SupportsAllAnalyticalModelsAndRejectsBadCoefficients)

@@ -32,6 +32,9 @@ struct MotorConfig
   uint16_t master{0};
   Mode mode{Mode::Mit};
   bool configure_mode_on_startup{false};
+  // Explicit profile RAM setting in Hz; zero leaves V_BW completely untouched.
+  // Read/conditional write/independent readback while disabled, never Flash-saved.
+  double startup_velocity_bandwidth{0};
   Mapping mapping{};
   Limits limits{};
   double command_timeout{0.25}, feedback_timeout{0.1}, watchdog{0.2};
@@ -64,6 +67,30 @@ struct RegisterOperation
   uint32_t raw_value{0};
   std::string message;
 };
+enum class PositionObservationState : uint8_t {Complete = 1, Timeout = 2, Cancelled = 3, Ambiguous = 4};
+struct PositionObservationPoint
+{
+  bool valid{false};
+  uint32_t raw{0};
+  double radians{0};
+  uint64_t tx_steady{0}, rx_steady{0};
+};
+struct PositionObservationContext
+{
+  uint64_t observation_epoch{0}, bus_epoch{0}, task_id{0};
+  std::string source_id;
+};
+struct PositionObservation
+{
+  uint64_t id{0}, requested_steady{0};
+  std::string motor;
+  PositionObservationContext context;
+  Mapping mapping;
+  PositionObservationState state{PositionObservationState::Cancelled};
+  PositionObservationPoint point;
+  bool session_locked{false};
+  std::string message;
+};
 // Encoders use native CAN payload lengths. SerialTransport explicitly applies
 // official u2can eight-byte zero-padding compatibility to four-byte payloads.
 Frame target_frame(uint8_t id, const Target & target, const Mapping & mapping,
@@ -73,9 +100,16 @@ double position_command_limit(Mode mode, const Mapping & mapping, const Limits &
 class Bus
 {
 public:
-  Bus(std::unique_ptr<Transport> transport, std::vector<MotorConfig> motors, bool simulated);
+  Bus(std::unique_ptr<Transport> transport, std::vector<MotorConfig> motors, bool simulated,
+    bool allow_native_position_observation = false);
   ~Bus();
   void tick(double now);
+  // Same serialized I/O owner as tick; both share a monotonic clock. Drain RX
+  // early only after initialization and outside maintenance (which stays on
+  // tick). Never send ordinary targets/queries or advance maintenance here;
+  // newly observed faults may send an emergency STOP. Periodic safety checks
+  // and stop retries remain on tick. Failed buses still accept diagnostic RX.
+  void poll_feedback(double now);
   MotorSnapshot snapshot(const std::string & name, double now) const;
   void set_feedback_callback(
     std::function<void(const std::string &, const MotorSnapshot &, double)> callback);
@@ -85,6 +119,22 @@ public:
   void fail(const std::string & name, const std::string & reason);
   void transport_failed(const std::string & reason);
   void command(const std::string & name, const Target &, double now);
+  bool position_observation_locked() const;
+  // Internal scheduler API; no external service. One pending read excludes
+  // maintenance. Busy, locked, unsupported or invalid live context
+  // returns false without sending. Accepted requests retain their source epoch.
+  // lineage_valid must retain the original transport/route/bus generation; it
+  // must not depend on the source or observation schedule remaining active.
+  bool request_position_observation(const std::string & name, uint64_t id, double now,
+    const PositionObservationContext &, std::function<bool()> source_valid,
+    std::function<bool()> lineage_valid);
+  // Normal source/STOP retirement consumes an already published read's old
+  // TX/RX evidence without publishing a usable value or extending its deadline.
+  // Faults and uncertain wire history still use hard cancellation below.
+  void retire_position_observation(const std::string & name, const std::string & reason);
+  bool position_observation_retiring() const;
+  void cancel_position_observation(const std::string & name, const std::string & reason);
+  void set_position_observation_callback(std::function<void(const PositionObservation &)> callback);
   // Maintenance is serialized and requires every motor disabled with fresh status.
   // The wire protocol cannot unambiguously separate arbitrary online reads from feedback.
   // Firmware RW descriptors do not imply generic-service permission: IDs, mapping,

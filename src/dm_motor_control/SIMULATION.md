@@ -35,6 +35,30 @@ ros2 launch dm_motor_control dashboard.launch.py simulation:=true motor_id:=1
 单电机入口可通过 `control_rate` 和 `can_fd` 覆盖驱动频率/虚拟 FD 模式；
 其它驱动和物理参数使用所选 common 配置中的节点覆盖。
 
+驱动提供默认关闭的启动参数 `event_driven_feedback`。单电机 launch 可传
+`event_driven_feedback:=true`；组场景在所选 profile 的
+`nodes.dm_motor_control.motor_node` 或逐轴 `system.motors.<name>` 中设置该布尔值。
+旧配置没有该字段时仍使用 `false`，运行中不能切换。
+开启后，CAN 接收通知会唤醒原 I/O 线程，提前处理并发布反馈；周期控制、普通目标发送、
+租约和超时监督仍使用原频率，启动及维护事务也仍由周期处理。
+新模式对每条唯一的新鲜反馈执行主机保护检查，防止后来的正常帧覆盖瞬时超限证据；
+故障保持锁存，正常反馈不会自动重新使能。它只减少反馈交付等待，不能单独证明拖动阻力降低。
+
+启动参数 `native_position_observation_rate` 默认为 `0`，可显式设置为 `125`：
+单电机 launch 传 `native_position_observation_rate:=125`，组场景在上述节点或逐轴配置中设置。
+该选项要求经典 CAN 帧和不低于250 Hz的控制频率，运行中不能切换。
+有效 MIT 控制期间，驱动每8 ms尝试读取本轴寄存器80；一个读取未结束时跳过新槽，
+不补发。STOP和普通控制优先。
+
+`<motor>/position_observation` 发布独立值、原始浮点位、控制来源及观察epoch、
+mapping、TX/RX/完成时间和漏槽计数。它不修改普通反馈、绝对位置锚、目标或补偿。
+该高频遥测使用best-effort QoS，观察者不参与普通反馈的可靠交付等待；
+记录器应匹配该QoS并用ID/完成计数检测漏样，不能假定订阅就一定完整。
+设备真正的取样时刻未知，`device_sample_time_known=false`；RX是主机解析时间，
+不能冒充设备时间。超时、重复证据或已提交后的取消使观察通道锁定，需重启驱动，
+普通控制和STOP仍沿用原路径。该通道默认关闭，125 Hz是目标频率，实际频率以记录为准。
+仿真的80当前来自模拟物理角度；真机存在静止噪声，不能把浮点精度视为机械测量精度。
+
 物理默认值位于 [config/dm_motors.yaml](../../config/dm_motors.yaml) 的
 `packages.dm_motor_control.nodes.sim_motor_node`。各 launch 保持独立 profile，
 `variants.simulation` 覆盖仿真所需的 `parameters`、`system` 和 `nodes`；
@@ -86,16 +110,37 @@ J * acceleration = motor_torque + external_torque + gravity_torque
 零位改变编码器偏置，不改变物理角度；CAN 反馈使用原协议的紧凑量化和回绕。
 TIMEOUT 由虚拟固件独立计时，丢失命令会锁存通信故障，即使主机控制节点已暂停。
 
+可选 `constant_torque_speed` 描述限流执行器的恒扭矩区间，单位 rad/s，要求有限且
+`0 <= constant_torque_speed < no_load_speed`。同向做功时，速度绝对值不超过该拐点，
+力矩上限保持 `max_torque`；超过拐点后线性下降，在 `no_load_speed` 归零。
+反向制动仍使用原 `max_torque` 上限。默认值 0 保留原来从零速开始的线性降额，
+不改变现有场景或热模型。这个包络作用于物理执行器请求，之后才经过原力矩响应时间常数；
+它不是 CAN 扭矩报告通道的裁剪。手测中约 ±7.8 Nm 的报告平台支持考察此可选结构，
+但没有唯一确定物理力矩标度或拐点速度，不能把最高观测速度当作已辨识的拐点。
+
 为[自动标定](../dm_motor_calibration/README.md)增加可选 Stribeck 滑动摩擦、
 负方向摩擦倍率、线性关节弹簧与恒定负载；默认仍是原来的库仑/黏性/静摩擦模型，
 新增负载默认零，不改变现有场景。`SimulationState.load_torque` 是实际施加的
 `-joint_stiffness*position-load_torque`，与重力/限位/手动外力分别记录。
 标定测试直接链接同一物理库，不另用拟合公式替代动力学积分。
 
+每个物理步内以当前驱动力和滑动干摩擦幅值积分，并解析处理线性黏性摩擦。
+若速度在步内到零，先累计到停转时刻的位移，再按负载方向的静摩擦门槛判断保持静止或反向起步；
+反向时重新选择方向倍率及零速Stribeck幅值。停住后的剩余时间不继续累计位移，
+摩擦也不会沿旧方向作用于反向运动。Stribeck幅值在每个运动段起点取值，这不是其非线性ODE的精确解；
+电磁力矩响应和重力/负载仍按现有物理步更新，模型仍受积分步长和参数假设限制。
+`friction_torque`和`net_torque`是最后一个物理步的冲量平均量；跨零步中不能把平均摩擦力矩乘总位移当作摩擦功。
+
 默认物理参数是可重复测试的示例，不是 J4310 工厂标定。需要真机测量惯量、摩擦、
 负载、带宽和热参数后才能主张具体工况下的近似精度。这里不模拟电源瞬态波形、
 电磁开关纹波、齿隙/柔性多体机构或全部固件私有功能，不能认证真实硬件急停或安全性能。
 纯软件测试能证明接口和定义的模型行为一致，不能证明任意实物有“完全相同”的动力学。
+
+本项目两台电机的手测记录另有[显式候选场景](../../config/bilateral_identification_20261104.md)。
+它保留已存机械先验，并配置通过固定动作回放检查的有效响应结构及低速力矩平台；
+没有覆盖这里的通用示例默认值。其通信时序与热模型的边界见对应实验报告。
+基于相同电机参数的[差模双边仿真](../../config/bilateral_optimized_simulation_20261104.md)
+另提供减阻控制器及显式时延的离线回归；其修改范围是控制律，不降低模型摩擦或惯量来获得改善。
 
 | 参数 | 单位 / 含义 |
 | --- | --- |
@@ -108,6 +153,7 @@ TIMEOUT 由虚拟固件独立计时，丢失命令会锁存通信故障，即使
 | `gravity_torque` / `gravity_offset` | 重力力矩幅值（例如 m·g·r）/ 安装相位，默认 0 / 0 |
 | `joint_stiffness` / `load_torque` | Nm/rad / Nm，线性关节弹簧和恒定阻力矩（符号沿输出轴坐标），默认均 0 |
 | `max_torque` / `no_load_speed` | Nm / rad/s，执行器峰值力矩及空载速度，默认 10 / 50 |
+| `constant_torque_speed` | rad/s，同向做功的恒扭矩区间上界；默认 0 保留原线性降额 |
 | `torque_time_constant` | s，电磁力矩一阶响应，默认 0.002 |
 | `lower_limit` / `upper_limit` | rad，机械角度限位，默认 ±1e6（多圈测试，不代表真机行程） |
 | `contact_stiffness` / `contact_damping` | Nm/rad / Nm/(rad/s)，限位接触模型 |

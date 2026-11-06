@@ -55,6 +55,20 @@ public:
 private:
   can_bus::SerialParser parser_;
 };
+// Broker dispatch evidence for the optional native position observation.
+// tx_steady is an observed physical-transport dispatch time, never enqueue time.
+struct PositionReadDispatch
+{
+  uint64_t read_id{0}, tx_steady{0};
+  bool ambiguous{false};
+};
+// Exact broker request identity has already been checked by the transport.
+// This proves only that a queued native80 read was erased by a registered STOP.
+struct PositionReadRemoval
+{
+  uint64_t read_id{0}, removed_steady{0};
+  bool ambiguous{false};
+};
 class Transport
 {
 public:
@@ -65,6 +79,13 @@ public:
   virtual bool activity_available() const {return true;}
   virtual bool prepare_maintenance() {return true;}
   virtual bool maintenance_blocked() const {return false;}
+  // Independent default-off native MIT telemetry: only own read-only register80,
+  // broker priority3. Existing transports retain their send/receive behavior.
+  virtual bool native_position_observation_supported() const {return false;}
+  virtual bool try_send_native_position_read(const Frame &, uint64_t, uint64_t) {return false;}
+  virtual std::vector<PositionReadDispatch> take_position_read_dispatches() {return {};}
+  virtual std::vector<PositionReadRemoval> take_position_read_removals() {return {};}
+  virtual void cancel_position_read(uint64_t) {}
 };
 class SerialTransport final : public Transport
 {

@@ -1,20 +1,17 @@
 """Offline calibration and reproducible physical-simulator acceptance runs."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, fields
 import json
 from pathlib import Path
 import sys
 
 import yaml
 
-from .auxiliary import fit_actuator, fit_breakaway, fit_electrical, fit_thermal, fit_torque_constant
 from .data import CalibrationError, Trace, atomic_json, read_json
 from .experiment import ExperimentSettings
 from .identification import MechanicalOptions, fit_mechanical
 from .models import MODELS
-from .simulation import collect_breakaway, collect_simulation, validate_compensation
-from .precision_simulation import collect_precision
 
 
 DEMO_PHYSICS = {
@@ -44,11 +41,37 @@ def parser() -> argparse.ArgumentParser:
     html.add_argument("recording", type=Path)
     html.add_argument("--output", type=Path, help="HTML output path; defaults to RECORDING/analysis.html")
     html.add_argument("--force", action="store_true", help="Replace only the derived HTML report, never raw data")
+    history = commands.add_parser("import-experiment", help="Copy a terminal independent speed-sweep result into dashboard history; offline, no parameter publication")
+    history.add_argument("source", type=Path)
+    history.add_argument("--history-root", type=Path, required=True)
+    sweep = commands.add_parser("speed-sweep-analyze", help="Analyze independent single-axis sweeps from archived trials; offline, no parameter publication")
+    sweep.add_argument("trials", type=Path, nargs="+")
+    sweep.add_argument("--output", type=Path, required=True)
+    sweep.add_argument("--identity", type=Path, required=True, help="Recorded motor identity JSON")
+    sweep.add_argument("--old-calibration", type=Path)
+    sweep.add_argument("--diagnostic-trial", type=Path, action="append", default=[],
+                       help="Explicit setup/startup diagnostic archive; repeat for each attempt. Evidence must prove no formal motion.")
     replay = commands.add_parser("reidentify", help="Recompute precision identification from a recording; never connects to a motor")
     replay.add_argument("recording", type=Path)
     replay.add_argument("--output", type=Path, required=True, help="New result directory; source files are never overwritten")
     replay.add_argument("--analysis-settings", type=Path, help="JSON overrides for analysis goals/averaging only")
     replay.add_argument("--verify-online", action="store_true", help="Require numerical agreement with the saved online result")
+    quick = commands.add_parser("quick-reidentify", help="Replay a terminated versioned quick experiment offline; never moves a motor or publishes parameters")
+    quick.add_argument("source", type=Path)
+    quick.add_argument("--output", type=Path, required=True, help="New directory outside SOURCE; original inputs are never overwritten")
+    quick.add_argument("--model", choices=(*MODELS, "auto"), help="Override training-only model selection; default: original recorded option")
+    quick.add_argument("--known-bias", type=float, help="Fix an independently known bias; default: original recorded options")
+    quick_sim = commands.add_parser("quick-simulate", help="Production-physics training, measured return and independent quick validation; no ROS or hardware")
+    quick_sim.add_argument("--output", type=Path, required=True, help="New report directory, never overwritten")
+    quick_sim.add_argument("--physics", type=Path, help="Production physics/report-chain YAML")
+    quick_sim.add_argument("--experiment-settings", type=Path, help="JSON ExperimentSettings overrides; motion limits never auto-increased")
+    quick_sim.add_argument("--analysis-settings", type=Path, help="JSON MechanicalOptions overrides, fixed before acquisition")
+    quick_sim.add_argument("--observer-settings", type=Path, help="JSON compact ranges, coordinates and sensor noise")
+    quick_sim.add_argument("--rate", type=float, default=200.)
+    quick_sim.add_argument("--jitter", type=float, default=0.)
+    quick_sim.add_argument("--seed", type=int, default=7)
+    quick_sim.add_argument("--excitation", choices=("auto", "fixed"), default="fixed",
+                           help="Fixed reference (default), or bounded tracking-first pilots selecting a frozen 40+20 s formal plan")
     precision = commands.add_parser("precision-simulate", help="Complete steady-speed and static calibration through +/-2*pi")
     precision.add_argument("--output", type=Path, required=True)
     precision.add_argument("--physics", type=Path)
@@ -86,6 +109,25 @@ def parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict:
+    if args.command == "quick-simulate":
+        from .quick_simulation import QuickObserverSettings
+        from .quick_workflow import load_physics_file, run_quick_simulation
+        physics = DEMO_PHYSICS.copy()
+        if args.physics:
+            physics = load_physics_file(args.physics)
+        def settings_file(path, cls, **defaults):
+            values = read_json(path) if path else {}
+            if not isinstance(values, dict) or set(values) - {field.name for field in fields(cls)}:
+                raise CalibrationError(f"Invalid {cls.__name__} settings mapping")
+            return cls(**{**defaults, **values})
+        return run_quick_simulation(physics, args.output,
+            settings=settings_file(args.experiment_settings, ExperimentSettings),
+            options=settings_file(args.analysis_settings, MechanicalOptions, window=.12, min_speed=.04, adaptive_window=True),
+            observer=settings_file(args.observer_settings, QuickObserverSettings),
+            rate=args.rate, jitter=args.jitter, seed=args.seed, excitation=args.excitation)
+    if args.command == "quick-reidentify":
+        from .quick_reidentify import reidentify_quick
+        return reidentify_quick(args.source, args.output, model=args.model, known_bias=args.known_bias)
     if args.command == "publish":
         from common.config import ConfigManager
         from dm_motor_control.system_parameters import SystemParameters, system_parameters_path
@@ -104,6 +146,14 @@ def run(args: argparse.Namespace) -> dict:
     if args.command == "report":
         from .html_report import generate_html_report
         return generate_html_report(args.recording, args.output, overwrite=args.force)
+    if args.command == "import-experiment":
+        from .speed_sweep_report import import_speed_sweep
+        return import_speed_sweep(args.source, args.history_root)
+    if args.command == "speed-sweep-analyze":
+        from .speed_sweep_analysis import generate_speed_sweep_report
+        return generate_speed_sweep_report(args.trials, args.output, read_json(args.identity),
+                                           old_calibration=args.old_calibration,
+                                           diagnostic_trial_directories=args.diagnostic_trial)
     if args.command == "reidentify":
         from .reidentify import reidentify_recording
         settings = read_json(args.analysis_settings) if args.analysis_settings else None
@@ -133,6 +183,7 @@ def run(args: argparse.Namespace) -> dict:
                 "qualified": result is not None, "report": str(args.output / "report.json"),
                 "metrics": report["metrics"], "quality_issues": report["quality_issues"]}
     if args.command == "precision-simulate":
+        from .precision_simulation import collect_precision
         physics = DEMO_PHYSICS.copy()
         if args.physics:
             from common.config import UniqueKeysLoader
@@ -149,6 +200,7 @@ def run(args: argparse.Namespace) -> dict:
                 "quality_issues": report["quality_issues"], "static": report["static"]}
     args.output.mkdir(parents=True, exist_ok=False)
     if args.command == "fit":
+        from .auxiliary import fit_actuator, fit_breakaway, fit_electrical, fit_thermal, fit_torque_constant
         trace = Trace.read(args.csv)
         fitters = {"electrical": fit_electrical, "thermal": fit_thermal, "actuator": fit_actuator,
                    "torque_constant": fit_torque_constant, "breakaway": fit_breakaway}
@@ -159,6 +211,8 @@ def run(args: argparse.Namespace) -> dict:
         fit.save(args.output / "calibration.json", identity)
         report = {"status": "qualified", "calibration": str(args.output / "calibration.json"), "fit": asdict(fit)}
     else:
+        from .auxiliary import fit_breakaway
+        from .simulation import collect_breakaway, collect_simulation, validate_compensation
         if args.physics:
             from common.config import UniqueKeysLoader
             with args.physics.open(encoding="utf-8") as stream:
@@ -203,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{label}: {error}", file=sys.stderr)
         return 1
     print(json.dumps(report, indent=2, allow_nan=False))
+    if args.command == "quick-simulate":
+        return 0 if report["qualified"] else 2 if report["status"] == "completed_unqualified" else 1
     return 0
 
 

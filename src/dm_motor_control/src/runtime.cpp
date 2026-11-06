@@ -230,11 +230,14 @@ struct Bus::Impl
     double last_feedback{-1}, last_command{-1}, transition{0}, last_stop{-1};
     unsigned startup{0};
     bool startup_status_requested{false};
+    std::optional<uint32_t> startup_bandwidth_raw;
+    bool startup_bandwidth_confirmed{false};
     bool anchor_pending{false};
     double anchor_time{-1}, tracking_time{-1};
     double anchor_idle_since{-1};
   };
-  enum class Kind {Read, Write, ModeWrite, Save, Clear, Zero, StartupRead, StartupWatchdog};
+  enum class Kind {Read, Write, ModeWrite, Save, Clear, Zero, StartupRead, StartupWatchdog,
+    StartupBandwidthRead, StartupBandwidthWrite};
   struct Transaction
   {
     uint64_t op{0};
@@ -257,8 +260,235 @@ struct Bus::Impl
   uint64_t next{1};
   std::string init_error;
   bool initialized{false}, failed{false};
-  double last_tick{-1}, quiet_until{0};
+  double last_io_time{-1}, quiet_until{0};
   size_t startup_motor{0};
+  struct PositionPending
+  {
+    PositionObservation result;
+    size_t motor{0};
+    uint64_t read_id{0}, submitted_steady{0};
+    double deadline{0};
+    bool submitted{false}, retiring{false};
+    std::string retirement_reason;
+    std::function<bool()> source_valid, lineage_valid;
+    std::vector<Frame> replies;
+    std::optional<PositionReadRemoval> removal;
+  };
+  bool allow_native_observation{false}, position_locked{false};
+  uint64_t next_position_read{1};
+  std::optional<PositionPending> position_pending;
+  std::function<void(const PositionObservation &)> observation_callback;
+
+  void finish_position(PositionObservationState state, const std::string & message, bool lock)
+  {
+    if (!position_pending) {return;}
+    auto result = position_pending->result;
+    result.message = message;
+    try {transport->cancel_position_read(position_pending->read_id);}
+    catch (...) {
+      lock = true;
+      if (state == PositionObservationState::Complete) {
+        state = PositionObservationState::Ambiguous;
+        result.point.valid = false;
+        result.message = "position observation cancellation failed";
+      }
+    }
+    position_pending.reset();
+    position_locked = position_locked || lock;
+    result.state = state; result.session_locked = position_locked;
+    // Optional telemetry failure must never become an I/O fault or delay STOP
+    // by waiting for a subscriber. The node only enqueues this small result.
+    try {
+      if (observation_callback) {observation_callback(result);}
+    }
+    catch (...) {position_locked = true;}
+  }
+  void cancel_position(size_t i, const std::string & reason)
+  {
+    if (position_pending && position_pending->motor == i) {
+      finish_position(PositionObservationState::Cancelled, reason, position_pending->submitted);
+    }
+  }
+  bool position_lineage() const
+  {
+    try {
+      if (!position_pending || !initialized || failed || !queue.empty() ||
+        !transport->activity_available()) {return false;}
+      const auto & pending = *position_pending;
+      const auto & m = motors[pending.motor];
+      if (m.state.host_fault ||
+        m.state.device_fault || m.state.phase == Phase::Fault || !m.state.absolute_position_valid ||
+        m.state.mode != Mode::Mit ||
+        m.state.mapping.p != pending.result.mapping.p ||
+        m.state.mapping.v != pending.result.mapping.v ||
+        m.state.mapping.t != pending.result.mapping.t) {return false;}
+      return pending.lineage_valid && pending.lineage_valid();
+    }
+    catch (...) {return false;}
+  }
+  void retire_position(size_t i, const std::string & reason)
+  {
+    if (!position_pending || position_pending->motor != i) {return;}
+    if (!position_lineage()) {cancel_position(i, "native observation lineage ended"); return;}
+    if (!position_pending->submitted) {
+      finish_position(PositionObservationState::Cancelled, reason + "; never published", false);
+    } else if (!position_pending->retiring) {
+      position_pending->retiring = true;
+      position_pending->retirement_reason = reason;
+    }
+  }
+  bool position_context(double now) const
+  {
+    if (!position_pending || !initialized || failed || !queue.empty() ||
+      !transport->activity_available()) {return false;}
+    const auto & pending = *position_pending;
+    const auto & m = motors[pending.motor];
+    if (m.state.phase != Phase::Enabled || m.state.feedback.status != 1 ||
+      !fresh(pending.motor, now) || !m.state.absolute_position_valid ||
+      m.state.mode != Mode::Mit || m.target.mode != Mode::Mit ||
+      now < m.last_command || now - m.last_command > configs[pending.motor].command_timeout)
+    {return false;}
+    if (!position_lineage()) {return false;}
+    try {return pending.source_valid && pending.source_valid();}
+    catch (...) {return false;}
+  }
+  void position_dispatches()
+  {
+    if (!position_pending) {return;}
+    for (const auto & dispatch : transport->take_position_read_dispatches()) {
+      if (!position_pending) {break;}
+      auto & pending = *position_pending;
+      if (!pending.submitted || dispatch.read_id != pending.read_id) {continue;}
+      auto & point = pending.result.point;
+      if (dispatch.ambiguous || !dispatch.tx_steady ||
+        dispatch.tx_steady < pending.submitted_steady ||
+        dispatch.tx_steady >= static_cast<uint64_t>(pending.deadline * 1e9) ||
+        (point.tx_steady && point.tx_steady != dispatch.tx_steady))
+      {
+        finish_position(PositionObservationState::Ambiguous, "position read TX identity/timing ambiguous", true);
+        break;
+      }
+      point.tx_steady = dispatch.tx_steady;
+    }
+  }
+  void position_reply(const Frame & f)
+  {
+    if (!position_pending || !position_pending->submitted) {return;}
+    auto & pending = *position_pending;
+    const auto & c = configs[pending.motor];
+    if (f.id != c.master || f.channel || f.length != 8 || f.fd || f.brs ||
+      f.data[0] != c.id || f.data[1] != 0 || f.data[2] != 0x33 ||
+      f.data[3] != 80) {return;}
+    if (!f.received_steady) {
+      finish_position(PositionObservationState::Ambiguous, "position read RX lacks acquisition timestamp", true);
+      return;
+    }
+    // A queued response observed before this read was submitted is not fresh.
+    if (f.received_steady <= pending.submitted_steady) {return;}
+    if (pending.replies.size() == 4) {
+      finish_position(PositionObservationState::Ambiguous, "position read RX evidence overflow", true);
+      return;
+    }
+    pending.replies.push_back(f);
+  }
+  void position_removals(double now)
+  {
+    for (const auto & removal : transport->take_position_read_removals()) {
+      if (!position_pending) {break;}
+      auto & pending = *position_pending;
+      if (!pending.submitted || removal.read_id != pending.read_id) {continue;}
+      if (now >= pending.deadline) {continue;}  // Keep the original TIMEOUT terminal state.
+      if (removal.ambiguous || !pending.retiring || !removal.removed_steady ||
+        removal.removed_steady < pending.submitted_steady ||
+        removal.removed_steady >= static_cast<uint64_t>(pending.deadline * 1e9) ||
+        (pending.removal && pending.removal->removed_steady != removal.removed_steady)) {
+        finish_position(PositionObservationState::Ambiguous, "invalid broker optional-read removal evidence", true);
+        return;
+      }
+      pending.removal = removal;
+    }
+  }
+  void position_progress(double now, bool send)
+  {
+    if (!position_pending) {return;}
+    try {
+      if (now >= position_pending->deadline) {
+        // A never-published optional read cannot have a late device reply.
+        finish_position(PositionObservationState::Timeout,
+          "native position read unconfirmed within 20ms", position_pending->submitted);
+        return;
+      }
+      if (!(position_pending->retiring ?
+        position_lineage() && fresh(position_pending->motor, now) : position_context(now))) {
+        const auto i = position_pending->motor;
+        cancel_position(i, "position observation source/phase/target context ended");
+        return;
+      }
+      auto & pending = *position_pending;
+      auto & point = pending.result.point;
+      if (pending.removal) {
+        // Inspect RX before accepting absence of dispatch. Never turn conflicting
+        // evidence into success, or consume a future acquisition-time witness.
+        if (point.tx_steady || !pending.replies.empty()) {
+          finish_position(PositionObservationState::Ambiguous, "broker removal conflicts with position TX/RX", true);
+        } else if (pending.removal->removed_steady <= static_cast<uint64_t>(now * 1e9)) {
+          point.valid = false;
+          finish_position(PositionObservationState::Cancelled,
+            pending.retirement_reason + "; broker confirmed queued native80 removed by STOP before dispatch", false);
+        }
+        return;
+      }
+      if (pending.submitted && point.tx_steady) {
+        std::optional<Frame> matched;
+        for (const auto & reply : pending.replies) {
+          if (reply.received_steady <= point.tx_steady) {continue;}
+          if (reply.received_steady >= static_cast<uint64_t>(pending.deadline * 1e9)) {continue;}
+          // RX can arrive concurrently after the cycle's `now` snapshot. Keep
+          // its evidence bounded, but never consume a future acquisition time.
+          // A later poll may confirm it; the original 20ms deadline is fixed.
+          if (reply.received_steady > static_cast<uint64_t>(now * 1e9)) {continue;}
+          if (matched) {
+            finish_position(PositionObservationState::Ambiguous, "multiple RX replies for one position read", true);
+            return;
+          }
+          matched = reply;
+        }
+        if (matched) {
+          point.raw = raw_value(*matched); point.rx_steady = matched->received_steady;
+          const auto value = number(point.raw);
+          if (!std::isfinite(value)) {
+            finish_position(PositionObservationState::Ambiguous, "nonfinite position read value", true);
+            return;
+          }
+          point.radians = value;
+          if (pending.retiring) {
+            // The wire transaction closed, but its source is no longer live.
+            // Keep the old audit witnesses; never renew a consumer's position.
+            point.valid = false;
+            finish_position(PositionObservationState::Cancelled,
+              pending.retirement_reason + "; retired 80 confirmed by observed TX then RX", false);
+            return;
+          }
+          point.valid = true;
+          finish_position(PositionObservationState::Complete,
+            "80 confirmed by observed TX then RX; device sample time unknown", false);
+          return;
+        }
+      }
+      if (send && position_pending && !position_pending->submitted && !position_pending->retiring) {
+        auto & current = *position_pending;
+        // Recheck immediately before the explicit transport method; no generic
+        // maintenance enqueue, no target/lease/task modification.
+        if (!position_context(now)) {cancel_position(current.motor, "position send context changed"); return;}
+        const auto frame = parameter(configs[current.motor].id, 0x33, 80);
+        current.submitted_steady = static_cast<uint64_t>(now * 1e9);
+        current.submitted = transport->try_send_native_position_read(frame, current.read_id,
+          static_cast<uint64_t>(current.deadline * 1e9));
+      }
+    } catch (const std::exception & error) {
+      finish_position(PositionObservationState::Ambiguous, std::string("position observation failed: ") + error.what(), true);
+    }
+  }
 
   size_t index(const std::string & name) const
   {
@@ -274,7 +504,7 @@ struct Bus::Impl
   }
   bool maintenance(double now, bool clear = false, size_t selected = 0) const
   {
-    if (!initialized || failed || !std::isfinite(now) || now < last_tick) {return false;}
+    if (!initialized || failed || !std::isfinite(now) || now < last_io_time) {return false;}
     for (size_t i = 0; i < motors.size(); ++i) {
       const auto & m = motors[i];
       if (!fresh(i, now)) {return false;}
@@ -286,12 +516,16 @@ struct Bus::Impl
     }
     return true;
   }
-  void stop(size_t i)
+  void stop(size_t i, bool normal_stop = false)
   {
+    if (!(normal_stop && position_pending && position_pending->motor == i &&
+      position_pending->retiring))
+    {cancel_position(i, "STOP cancelled position observation");}
     transport->send(special_frame(control_id(configs[i].id, motors[i].state.mode), 0xfd));
   }
   void fault(size_t i, const std::string & reason)
   {
+    cancel_position(i, "fault cancelled position observation");
     auto & m = motors[i];
     if (!m.state.host_fault) {m.state.error = reason; m.last_stop = -1;}
     m.state.host_fault = true;
@@ -320,6 +554,43 @@ struct Bus::Impl
     }
     queue.clear();
   }
+  bool accept_clock(double now)
+  {
+    if (!std::isfinite(now) || now < 0 || (last_io_time >= 0 && now < last_io_time)) {
+      io_failure("invalid or non-monotonic bus clock"); return false;
+    }
+    last_io_time = now;
+    return true;
+  }
+  void drain_feedback(double now)
+  {
+    if (position_pending) {
+      try {position_dispatches();}
+      catch (const std::exception & error) {
+        finish_position(PositionObservationState::Ambiguous, error.what(), true);
+      }
+    }
+    for (const auto & f : transport->receive()) {receive(f, now);}
+    if (position_pending) {
+      try {position_removals(now);}
+      catch (const std::exception & error) {
+        finish_position(PositionObservationState::Ambiguous, error.what(), true);
+      }
+    }
+    position_progress(now, false);
+  }
+  void send_pending_stops(double now, bool retry)
+  {
+    for (size_t i = 0; i < motors.size(); ++i) {
+      auto & m = motors[i];
+      if (m.state.phase == Phase::Fault || m.state.phase == Phase::Stopping) {
+        const bool retry_stop = m.state.host_fault || m.state.phase == Phase::Stopping;
+        if (m.last_stop < 0 || (retry && retry_stop && now - m.last_stop >= 0.05)) {
+          stop(i, m.state.phase == Phase::Stopping && !m.state.host_fault); m.last_stop = now;
+        }
+      }
+    }
+  }
   uint64_t enqueue(size_t i, Kind kind, uint8_t rid, uint32_t raw, double now,
     const std::string & rejection = {})
   {
@@ -331,6 +602,9 @@ struct Bus::Impl
     }
     const uint64_t id = next++;
     std::string error = rejection;
+    if (error.empty() && (position_pending ||
+      (position_locked && kind == Kind::Read && (rid == 80 || rid == 81))))
+    {error = "position telemetry pending/ambiguous; cannot reuse its register reply channel";}
     if (queue.size() >= 64) {error = "pending operation queue full";}
     if (error.empty() && !maintenance(now, kind == Kind::Clear, i)) {
       error = "maintenance requires fresh confirmed disabled status on the entire bus; selected phase=" +
@@ -404,6 +678,13 @@ struct Bus::Impl
         m.transition = now;
       }
       ++m.startup;
+    } else if (tx.kind == Kind::StartupBandwidthRead || tx.kind == Kind::StartupBandwidthWrite) {
+      try {validate_raw(32, value);}
+      catch (const std::exception &) {
+        io_failure("startup V_BW readback is not a finite supported bandwidth"); return;
+      }
+      m.startup_bandwidth_raw = value;
+      m.startup_bandwidth_confirmed = value == bits(static_cast<float>(c.startup_velocity_bandwidth));
     } else if (tx.kind == Kind::StartupWatchdog) {
       ++m.startup;
     }
@@ -441,6 +722,14 @@ struct Bus::Impl
         queue.push_back({0, startup_motor, Kind::StartupWatchdog, 9, raw});
       }
     } else if (m.startup == 7) {
+      if (configs[startup_motor].startup_velocity_bandwidth > 0 && !m.startup_bandwidth_confirmed) {
+        // The profile is an explicit RAM configuration, not a temporary trial:
+        // read first, skip an unnecessary write, and never save or restore on STOP.
+        queue.push_back({0, startup_motor,
+          m.startup_bandwidth_raw ? Kind::StartupBandwidthWrite : Kind::StartupBandwidthRead,
+          32, bits(static_cast<float>(configs[startup_motor].startup_velocity_bandwidth))});
+        return;
+      }
       // Finish bus-wide commissioning before anchoring: another node's startup
       // parameter burst suppresses our feedback and can make a new anchor ambiguous.
       if (!transport->activity_available() || !fresh(startup_motor, now) ||
@@ -488,11 +777,12 @@ struct Bus::Impl
         return;
       }
       // Revalidate at dispatch, not only when the service request was queued.
-      const bool startup_mode = !tx.op && tx.kind == Kind::ModeWrite;
+      const bool startup_disabled_required = !tx.op && (tx.kind == Kind::ModeWrite ||
+        tx.kind == Kind::StartupBandwidthRead || tx.kind == Kind::StartupBandwidthWrite);
       const bool startup_disabled = m.state.phase == Phase::Disabled &&
         m.state.feedback.status == 0 && fresh(tx.motor, now);
       if ((tx.op && !maintenance(now, tx.kind == Kind::Clear, tx.motor)) ||
-        (startup_mode && !startup_disabled))
+        (startup_disabled_required && !startup_disabled))
       {
         const bool quiet_phase = m.state.phase == Phase::Disabled ||
           (tx.kind == Kind::Clear && m.state.phase == Phase::Fault);
@@ -511,10 +801,10 @@ struct Bus::Impl
       tx.deadline = now + 0.5;
       tx.sent = now;
       tx.feedback_before = m.state.feedback_count;
-      if (tx.kind == Kind::Read || tx.kind == Kind::StartupRead) {
+      if (tx.kind == Kind::Read || tx.kind == Kind::StartupRead || tx.kind == Kind::StartupBandwidthRead) {
         transport->send(parameter(c.id, 0x33, tx.rid)); tx.stage = 2;
       } else if (tx.kind == Kind::Write || tx.kind == Kind::ModeWrite ||
-        tx.kind == Kind::StartupWatchdog)
+        tx.kind == Kind::StartupWatchdog || tx.kind == Kind::StartupBandwidthWrite)
       {
         transport->send(parameter(c.id, 0x55, tx.rid, tx.raw)); tx.stage = 1;
       } else if (tx.kind == Kind::Save) {
@@ -527,7 +817,7 @@ struct Bus::Impl
     } else if (tx.stage == 1 && now - tx.sent >= 0.01) {
       // Drain write echoes before issuing an independent readback / fresh status query.
       if (tx.kind == Kind::Write || tx.kind == Kind::ModeWrite ||
-        tx.kind == Kind::StartupWatchdog)
+        tx.kind == Kind::StartupWatchdog || tx.kind == Kind::StartupBandwidthWrite)
       {
         transport->send(parameter(c.id, 0x33, tx.rid));
       } else {
@@ -541,6 +831,7 @@ struct Bus::Impl
   {
     if (f.channel != 0 || f.id > 0x7ff || (f.brs && !f.fd)) {return;}
     if (parameter_packet(f)) {
+      position_reply(f);
       if (queue.empty()) {return;}
       const auto tx = queue.front();
       const auto & c = configs[tx.motor];
@@ -557,7 +848,7 @@ struct Bus::Impl
       } else if (f.length == 8 && f.data[2] == 0x33) {
         const uint32_t value = raw_value(f);
         const bool write = tx.kind == Kind::Write || tx.kind == Kind::ModeWrite ||
-          tx.kind == Kind::StartupWatchdog;
+          tx.kind == Kind::StartupWatchdog || tx.kind == Kind::StartupBandwidthWrite;
         if (tx.kind == Kind::ModeWrite && value == tx.raw) {
           // A mode operation is terminal only after post-change disabled status arrives.
           // This makes CONFIRMED immediately usable by an explicit enable request.
@@ -666,7 +957,8 @@ struct Bus::Impl
   }
 };
 
-Bus::Bus(std::unique_ptr<Transport> transport, std::vector<MotorConfig> configs, bool simulated)
+Bus::Bus(std::unique_ptr<Transport> transport, std::vector<MotorConfig> configs, bool simulated,
+  bool allow_native_position_observation)
 : impl_(std::make_unique<Impl>())
 {
   (void)simulated;  // Both transports must pass identical startup confirmations.
@@ -681,6 +973,16 @@ Bus::Bus(std::unique_ptr<Transport> transport, std::vector<MotorConfig> configs,
     for (unsigned mode = 1; mode <= 4; ++mode) {command_ids.insert(control_id(c.id, Mode(mode)));}
     control_id(c.id, c.mode);
     resolve_limits(c.mapping, c.limits);
+    if (!std::isfinite(c.startup_velocity_bandwidth) || c.startup_velocity_bandwidth < 0 ||
+      c.startup_velocity_bandwidth >= 500)
+    {
+      throw std::invalid_argument("startup_velocity_bandwidth must be 0 (unchanged) or in (0,500) Hz");
+    }
+    if (c.startup_velocity_bandwidth > 0) {
+      // The exact representable float32 is also checked; reject underflow to0
+      // or rounding to the excluded500 Hz boundary before any device traffic.
+      validate_raw(32, bits(static_cast<float>(c.startup_velocity_bandwidth)));
+    }
     for (double timeout : {c.command_timeout, c.feedback_timeout, c.watchdog}) {
       if (!std::isfinite(timeout) || timeout <= 0) {throw std::invalid_argument("timeouts must be positive");}
     }
@@ -700,10 +1002,14 @@ Bus::Bus(std::unique_ptr<Transport> transport, std::vector<MotorConfig> configs,
   }
   impl_->transport = std::move(transport);
   impl_->configs = std::move(configs);
+  impl_->allow_native_observation = allow_native_position_observation;
 }
 Bus::~Bus()
 {
   if (!impl_) {return;}
+  // Owners may already be destroying their axis/publication state. Explicit
+  // disable emits cancellation while alive; destruction only sends STOP.
+  impl_->observation_callback = {};
   for (size_t i = 0; i < impl_->motors.size(); ++i) {
     try {impl_->stop(i);} catch (...) {}
   }
@@ -711,15 +1017,12 @@ Bus::~Bus()
 void Bus::tick(double now)
 {
   auto & b = *impl_;
-  if (!std::isfinite(now) || now < 0 || (b.last_tick >= 0 && now < b.last_tick)) {
-    b.io_failure("invalid or non-monotonic bus clock"); return;
-  }
-  b.last_tick = now;
+  if (!b.accept_clock(now)) {return;}
   if (b.failed) {
     // Keep the single receive owner alive for diagnostic feedback after an I/O fault.
     // Unknown mode/watchdog state remains latched until reconnect, never auto-enabled.
     try {
-      for (const auto & f : b.transport->receive()) {b.receive(f, now);}
+      b.drain_feedback(now);
     } catch (...) {}
     for (size_t i = 0; i < b.motors.size(); ++i) {
       auto & m = b.motors[i];
@@ -733,7 +1036,7 @@ void Bus::tick(double now)
     return;
   }
   try {
-    for (const auto & f : b.transport->receive()) {b.receive(f, now);}
+    b.drain_feedback(now);
     if (b.failed) {return;}
     // Safety and stop traffic always precede parameter dispatch or ordinary control.
     for (size_t i = 0; i < b.motors.size(); ++i) {
@@ -756,15 +1059,7 @@ void Bus::tick(double now)
         b.fault(i, "disable acknowledgement timeout");
       }
     }
-    for (size_t i = 0; i < b.motors.size(); ++i) {
-      auto & m = b.motors[i];
-      if (m.state.phase == Phase::Fault || m.state.phase == Phase::Stopping) {
-        const bool retry_stop = m.state.host_fault || m.state.phase == Phase::Stopping;
-        if (m.last_stop < 0 || (retry_stop && now - m.last_stop >= 0.05)) {
-          b.stop(i); m.last_stop = now;
-        }
-      }
-    }
+    b.send_pending_stops(now, true);
     if (!b.queue.empty() && b.queue.front().kind == Impl::Kind::Save &&
       b.queue.front().stage == 3 && now - b.queue.front().sent >= 0.03)
     {
@@ -787,6 +1082,24 @@ void Bus::tick(double now)
         }
       }
     }
+    b.position_progress(now, true);
+  } catch (const std::exception & e) {b.io_failure(std::string("bus I/O/protocol failure: ") + e.what());}
+}
+void Bus::poll_feedback(double now)
+{
+  auto & b = *impl_;
+  if (!b.accept_clock(now)) {return;}
+  if (b.failed) {
+    // Keep diagnostics live without retrying maintenance or clearing the latch.
+    try {b.drain_feedback(now);} catch (...) {}
+    return;
+  }
+  // receive() can confirm maintenance and issue follow-up queries. Leave its
+  // entire startup/maintenance path on tick; no deferred reply queue is needed.
+  if (!b.initialized || !b.queue.empty()) {return;}
+  try {
+    b.drain_feedback(now);
+    if (!b.failed) {b.send_pending_stops(now, false);}
   } catch (const std::exception & e) {b.io_failure(std::string("bus I/O/protocol failure: ") + e.what());}
 }
 MotorSnapshot Bus::snapshot(const std::string & name, double now) const
@@ -830,13 +1143,14 @@ void Bus::transport_failed(const std::string & reason)
 void Bus::disable(const std::string & name, double now)
 {
   auto & b = *impl_; const auto i = b.index(name); auto & m = b.motors[i];
+  b.retire_position(i, "STOP retired native observation");
   m.target = {};
   const bool already_disabled = m.state.phase == Phase::Disabled &&
     b.fresh(i, now) && m.state.feedback.status == 0;
   if (m.state.phase != Phase::Fault && !already_disabled) {
     m.state.phase = Phase::Stopping; m.transition = now;
   }
-  try {b.stop(i); m.last_stop = now;}
+  try {b.stop(i, true); m.last_stop = now;}
   catch (const std::exception & e) {b.io_failure(e.what());}
 }
 void Bus::reset(const std::string & name, double now)
@@ -865,12 +1179,53 @@ void Bus::command(const std::string & name, const Target & target, double now)
   if (m.state.phase != Phase::Enabled || target.mode != m.state.mode) {
     throw std::runtime_error("target requires confirmed enabled motor and matching mode");
   }
-  if (!std::isfinite(now) || now < b.last_tick || !b.fresh(i, now) ||
+  if (!std::isfinite(now) || now < b.last_io_time || !b.fresh(i, now) ||
     !snapshot(name, now).absolute_position_valid) {
     throw std::runtime_error("target requires monotonic time and fresh feedback");
   }
   target_frame(b.configs[i].id, target, m.state.mapping, b.configs[i].limits);
   m.target = target; m.last_command = now;
+}
+bool Bus::position_observation_locked() const {return impl_->position_locked;}
+bool Bus::request_position_observation(const std::string & name, uint64_t id, double now,
+  const PositionObservationContext & context, std::function<bool()> source_valid,
+  std::function<bool()> lineage_valid)
+{
+  auto & b = *impl_;
+  if (!b.allow_native_observation || b.position_locked || b.position_pending ||
+    !b.transport->native_position_observation_supported()) {return false;}
+  if (!id || !context.observation_epoch || !context.bus_epoch || context.source_id.empty() ||
+    !std::isfinite(now) || now < b.last_io_time)
+  {throw std::invalid_argument("native position observation requires a valid source epoch and clock");}
+  Impl::PositionPending pending;
+  pending.motor = b.index(name); pending.source_valid = std::move(source_valid);
+  pending.lineage_valid = std::move(lineage_valid);
+  pending.result.id = id; pending.result.motor = name;
+  pending.result.requested_steady = static_cast<uint64_t>(now * 1e9);
+  pending.result.context = context;
+  pending.result.mapping = b.motors[pending.motor].state.mapping;
+  pending.deadline = now + .02; pending.read_id = b.next_position_read++;
+  b.position_pending = std::move(pending);
+  if (!b.position_context(now)) {b.position_pending.reset(); return false;}
+  return true;
+}
+void Bus::retire_position_observation(const std::string & name, const std::string & reason)
+{
+  auto & b = *impl_;
+  b.retire_position(b.index(name), reason);
+}
+bool Bus::position_observation_retiring() const
+{
+  return impl_->position_pending && impl_->position_pending->retiring;
+}
+void Bus::cancel_position_observation(const std::string & name, const std::string & reason)
+{
+  auto & b = *impl_;
+  if (b.position_pending) {b.cancel_position(b.index(name), reason);}
+}
+void Bus::set_position_observation_callback(std::function<void(const PositionObservation &)> callback)
+{
+  impl_->observation_callback = std::move(callback);
 }
 uint64_t Bus::read_register(const std::string & name, uint8_t rid, double now)
 {

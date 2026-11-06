@@ -5,6 +5,7 @@
 #include "can_bus/msg/status.hpp"
 #include "can_bus/msg/tx_frame.hpp"
 #include "can_bus/msg/heartbeat.hpp"
+#include "can_bus/msg/optional_read_removed.hpp"
 #include "can_bus/srv/register_client.hpp"
 #include "can_bus/srv/maintenance.hpp"
 #include <rclcpp/rclcpp.hpp>
@@ -17,10 +18,12 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <variant>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 namespace
 {
 using Wire = can_bus::msg::Frame;
+using Removed = can_bus::msg::OptionalReadRemoved;
 can_bus::Frame decode(const Wire & m)
 {
   can_bus::Frame f;
@@ -68,6 +71,7 @@ class BusNode final : public rclcpp::Node
   bool ready_{false};
   uint64_t rx_{0}, tx_{0};
   rclcpp::Publisher<Wire>::SharedPtr rx_pub_, wire_tx_, tx_observed_;
+  rclcpp::Publisher<Removed>::SharedPtr optional_removed_;
   rclcpp::Publisher<can_bus::msg::Status>::SharedPtr status_;
   std::map<std::string, rclcpp::Publisher<Wire>::SharedPtr> client_rx_;
   std::map<std::string, std::string> client_errors_;
@@ -79,12 +83,15 @@ class BusNode final : public rclcpp::Node
   rclcpp::TimerBase::SharedPtr io_timer_, status_timer_;
   std::mutex observer_mutex_;
   std::condition_variable observer_condition_;
-  std::deque<std::pair<rclcpp::Publisher<Wire>::SharedPtr, Wire>> observer_queue_;
+  using Observation = std::variant<std::pair<rclcpp::Publisher<Wire>::SharedPtr, Wire>,
+    std::pair<rclcpp::Publisher<Removed>::SharedPtr, Removed>>;
+  std::deque<Observation> observer_queue_;
   std::atomic<bool> observer_running_{false};
   std::atomic<uint64_t> observer_dropped_{0};
   std::atomic<uint32_t> observer_inflight_{0};
   std::thread observer_thread_;
-  void observe(const rclcpp::Publisher<Wire>::SharedPtr & publisher, const Wire & frame)
+  template<class Message>
+  void observe(const typename rclcpp::Publisher<Message>::SharedPtr & publisher, const Message & frame)
   {
     if (!observer_running_ || !publisher->get_subscription_count()) {return;}
     {
@@ -94,7 +101,7 @@ class BusNode final : public rclcpp::Node
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
           "CAN observer backlog overflow; control RX is unaffected, inspect observer_dropped");
       }
-      observer_queue_.emplace_back(publisher, frame);
+      observer_queue_.emplace_back(std::make_pair(publisher, frame));
     }
     observer_condition_.notify_one();
   }
@@ -111,7 +118,7 @@ class BusNode final : public rclcpp::Node
       }
       for (const auto & item : batch) {
         if (!observer_running_) {return;}
-        try {item.first->publish(item.second);}
+        try {std::visit([](const auto & value) {value.first->publish(value.second);}, item);}
         catch (const std::exception & error) {
           ++observer_dropped_;
           if (rclcpp::ok(get_node_base_interface()->get_context())) {
@@ -183,12 +190,21 @@ class BusNode final : public rclcpp::Node
   }
   void transmit(const can_bus::Frame & f)
   {
-    if (transport_) {transport_->send(f);}
-    else {auto m = encode(f); m.header.stamp = now(); wire_tx_->publish(m);}
-    ++tx_;
     auto observed = encode(f);
-    observed.header.stamp = now();
-    observed.received_steady = static_cast<uint64_t>(can_bus::steady_seconds() * 1e9);
+    if (backend_ == "virtual") {
+      // Another process may receive and reply before publish returns. The
+      // virtual TX event is dispatch, shared by the wire and its observation.
+      observed.header.stamp = now();
+      observed.received_steady = static_cast<uint64_t>(can_bus::steady_seconds() * 1e9);
+      wire_tx_->publish(observed);
+    } else {
+      if (transport_) {transport_->send(f);}
+      else {auto m = encode(f); m.header.stamp = now(); wire_tx_->publish(m);}
+      // Physical transports and the legacy sim backend retain send-return time.
+      observed.header.stamp = now();
+      observed.received_steady = static_cast<uint64_t>(can_bus::steady_seconds() * 1e9);
+    }
+    ++tx_;  // A failed send/publish must not create a successful TX observation.
     observe(tx_observed_, observed);
   }
   void drain_transmit()
@@ -253,6 +269,7 @@ public:
     const auto qos = rclcpp::QoS(64).reliable();
     rx_pub_ = create_publisher<Wire>("rx", qos);
     tx_observed_ = create_publisher<Wire>("tx_observed", qos);
+    optional_removed_ = create_publisher<Removed>("optional_read_removed", qos);
     wire_tx_ = create_publisher<Wire>("wire_tx", qos);
     status_ = create_publisher<can_bus::msg::Status>("status", rclcpp::QoS(1).reliable().transient_local());
     if (backend_ == "sim" || backend_ == "virtual") {
@@ -265,6 +282,7 @@ public:
       [this](can_bus::msg::TxFrame::ConstSharedPtr m) {
         if (!ready_) {++router_.rejected; return;}
         bool accepted = false;
+        std::vector<can_bus::OptionalReadRemoved> removed;
         try {
           const double ttl = seconds(m->valid_for);
           const double age = (now() - rclcpp::Time(m->frame.header.stamp, get_clock()->get_clock_type())).seconds();
@@ -277,7 +295,7 @@ public:
             throw std::invalid_argument("missing or stale activity timestamp");
           }
           if (backend_ == "serial") {can_bus::serial_packet(can_bus::legacy_serial_frame(f));}
-          router_.enqueue(m->token, m->epoch, m->sequence, ttl - std::max(0.0, age),
+          removed = router_.enqueue(m->token, m->epoch, m->sequence, ttl - std::max(0.0, age),
             m->priority, f, can_bus::steady_seconds(), m->active, m->sent_steady);
           accepted = true;
         }
@@ -288,7 +306,22 @@ public:
             client_errors_[m->token] = e.what();
           }
         }
-        if (accepted) {flush_transmit();}
+        if (accepted) {
+          // STOP is dispatched first. Publication uses the existing bounded
+          // observer worker; no subscriber or DDS acknowledgement can delay it.
+          flush_transmit();
+          if (ready_ && endpoint_ready()) {
+            for (const auto & event : removed) {
+              Removed witness;
+              witness.header.stamp = now(); witness.token = event.token;
+              witness.epoch = event.epoch; witness.sequence = event.sequence;
+              witness.stop_sequence = event.stop_sequence;
+              witness.sent_steady = event.sent_steady; witness.removed_steady = event.removed_steady;
+              witness.frame = encode(event.frame);
+              observe(optional_removed_, witness);
+            }
+          }
+        }
       });
     heartbeat_ = create_subscription<can_bus::msg::Heartbeat>("heartbeat", qos,
       [this](can_bus::msg::Heartbeat::ConstSharedPtr m) {

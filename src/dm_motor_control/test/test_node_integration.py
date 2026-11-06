@@ -30,7 +30,7 @@ from dm_motor_control.topic_client import (
 class SharedBusIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["ROS_DOMAIN_ID"] = str(120 + os.getpid() % 50)
+        os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(120 + os.getpid() % 50))
         cls.namespace = f"/dm_bus_test_{os.getpid()}"
         rclpy.init()
         cls.node = Node("shared_bus_probe", namespace=cls.namespace)

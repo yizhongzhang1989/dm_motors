@@ -36,3 +36,9 @@ float64 anchor_bearing
 float64 anchor_stiffness
 float64 anchor_torque
 float64 transient_torque
+# Optional LuGre friction storage. These are simulated physical states, not
+# quantities measured or inferred from the real motor's compact feedback.
+float64 bristle_displacement
+float64 bristle_energy
+# Mechanical energy plus bristle energy; equal to mechanical_energy otherwise.
+float64 total_storage

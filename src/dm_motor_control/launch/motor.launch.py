@@ -12,6 +12,26 @@ from dm_motor_control.launch_utils import (
 PACKAGE, LAUNCH = "dm_motor_control", "motor.launch.py"
 
 
+class OptionalNodeDefault(ConfigValue):
+    """Keep configuration files without optional driver features compatible."""
+
+    fallback = "false"
+
+    def perform(self, context):
+        config = config_for_context(context)
+        profile = profile_for_context(context, PACKAGE, LAUNCH)
+        variant = variant_for_context(context)
+        parameters = config.launch(*profile, variant=variant).get("parameters", {})
+        defaults = config.node_parameters(PACKAGE, "motor_node", profile, variant=variant)
+        if isinstance(parameters, dict) and self.key not in parameters and self.key not in defaults:
+            return self.fallback
+        return super().perform(context)
+
+
+class ObservationRateDefault(OptionalNodeDefault):
+    fallback = "0.0"
+
+
 def launch_motor(context):
     value = lambda name: LaunchConfiguration(name).perform(context)
     def boolean(name):
@@ -73,6 +93,8 @@ def launch_motor(context):
             "can_bus_namespace": bus_namespace,
             "mode": int(value("mode")),
             "configure_mode_on_startup": boolean("configure_mode_on_startup"),
+            "event_driven_feedback": boolean("event_driven_feedback"),
+            "native_position_observation_rate": float(value("native_position_observation_rate")),
             "profile": value("profile"),
             "fault_group": value("fault_group"),
             "protection_samples": int(value("protection_samples")),
@@ -116,6 +138,10 @@ def generate_launch_description():
         "position_min", "position_max", "measured_velocity_limit", "measured_torque_limit",
         "estimated_torque_limit", "mos_temperature_stop", "rotor_temperature_stop", "max_task_duration")}
     defaults.update({
+        "event_driven_feedback": OptionalNodeDefault(
+            "event_driven_feedback", PACKAGE, LAUNCH, (PACKAGE, "motor_node")),
+        "native_position_observation_rate": ObservationRateDefault(
+            "native_position_observation_rate", PACKAGE, LAUNCH, (PACKAGE, "motor_node")),
         **{name: ConfigValue(name, PACKAGE, LAUNCH, ("can_bus", "can_bus_node"))
            for name in ("backend", "port", "can_bitrate")},
         **{name: ConfigValue(name, PACKAGE, LAUNCH)

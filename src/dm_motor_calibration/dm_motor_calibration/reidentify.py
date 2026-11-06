@@ -141,9 +141,16 @@ def load_recording(root: Path, *, expected_kind: str = "precision_recording") ->
             if target.stat().st_size != descriptor["bytes"] or file_sha256(target) != descriptor["sha256"]:
                 raise CalibrationError(f"Recorded input integrity check failed: {filename}")
             with target.open(encoding="utf-8", newline="") as stream:
-                fields = next(csv.reader(stream), [])
-            if fields != descriptor["fields"]:
-                raise CalibrationError(f"Recorded column schema does not match metadata: {filename}")
+                reader = csv.reader(stream)
+                fields = next(reader, [])
+                if fields != descriptor["fields"]:
+                    raise CalibrationError(f"Recorded column schema does not match metadata: {filename}")
+                # Count logical CSV records, including quoted multiline payloads;
+                # ignore blank records just as the replay DictReader does.
+                rows = sum(1 for row in reader if row)
+            if rows != descriptor["rows"]:
+                raise CalibrationError(
+                    f"Recorded row count does not match metadata: {filename} (read {rows}, recorded {descriptor['rows']})")
         return metadata, None
     if expected_kind != "precision_recording":
         raise CalibrationError("Fourier replay requires its versioned recording manifest")

@@ -1,0 +1,349 @@
+# Explicit simulation-only differential torque preset; no automatic enable.
+# Plant and friction law retained from the 2026-11-04 identification candidate.
+# Virtual-only bilateral candidate from the2026-11-04 manual recordings.
+# Effective model and limits: bilateral_identification_20261104.md. No automatic enable.
+version: 2
+system_parameters_file: bilateral_optimized_parameters_20261104.yaml
+packages:
+  can_bus:
+    nodes:
+      can_bus_node:
+        backend: virtual
+        port: ''
+        can_fd: false
+        can_bitrate: 1000000
+        io_rate: 1000.0
+        client_timeout: 0.5
+      dashboard:
+        bus_namespace: /can/main
+        host: 0.0.0.0
+        port: 8080
+  dm_motor_control:
+    nodes:
+      motor_node:
+        motor_name: motor
+        motor_id: 1
+        master_id: 0
+        can_bus_namespace: /bilateral_optimized_simulation/can/main
+        require_virtual_bus: true
+        can_fd: false
+        control_rate: 500.0
+        event_driven_feedback: false
+        state_rate: 500.0
+        max_task_duration: 60.0
+        mode: 1
+        configure_mode_on_startup: true
+        startup_velocity_bandwidth: 100.0
+        profile: j4310_v12
+        legacy_control: false
+        direction: 1.0
+        software_offset: 0.0
+        watchdog_timeout: 0.2
+        command_timeout: 0.25
+        feedback_timeout: 0.1
+        position_limit: 0.0
+        velocity_limit: 26.0
+        torque_limit: 0.0
+        kp_limit: 500.0
+        kd_limit: 1.0
+        position_min: -350.0
+        position_max: 350.0
+        host_protection_enabled: true
+        measured_velocity_limit: 26.0
+        measured_torque_limit: 0.0
+        estimated_torque_limit: 0.0
+        mos_temperature_stop: 50.0
+        rotor_temperature_stop: 50.0
+        protection_samples: 1
+        fault_group: ''
+        native_position_observation_rate: 0.0
+      dashboard:
+        motor_id: 1
+        host: 0.0.0.0
+        port: 8081
+        client_timeout: 0.75
+        command_timeout: 0.25
+        simulation: false
+        shaft_stiffness: 1.0
+        shaft_damping: 0.05
+      sim_motor_node:
+        motor_name: motor_1
+        motor_id: 1
+        master_id: 0
+        mode: 1
+        can_bus_namespace: /bilateral_optimized_simulation/can/main
+        physics_rate: 1000.0
+        state_rate: 500.0
+        integration_step: 3.125e-05
+        mapping_position: 12.5
+        mapping_velocity: 50.0
+        mapping_torque: 10.0
+        inertia: 0.01
+        viscous_friction: 0.02
+        coulomb_friction: 0.03
+        static_friction: 0.05
+        friction_model: coulomb_viscous
+        stribeck_velocity: 0.15
+        friction_negative_scale: 1.0
+        gravity_torque: 0.0
+        gravity_offset: 0.0
+        joint_stiffness: 0.0
+        load_torque: 0.0
+        max_torque: 10.0
+        no_load_speed: 50.0
+        torque_time_constant: 0.002
+        velocity_time_constant: 0.0
+        feedback_velocity_source: physical
+        feedback_velocity_time_constant: 0.0045
+        feedback_velocity_delay: 0.0015
+        feedback_torque_time_constant: 0.012
+        feedback_torque_delay: 0.002
+        lower_limit: -1000000.0
+        upper_limit: 1000000.0
+        contact_stiffness: 200.0
+        contact_damping: 2.0
+        ambient_temperature: 25.0
+        heat_capacity: 100.0
+        thermal_resistance: 1.0
+        winding_resistance: 0.8
+        torque_constant: 1.0
+        initial_position: 0.0
+        initial_velocity: 0.0
+        bus_voltage: 48.0
+        velocity_kp: 1.0
+        velocity_ki: 0.0
+        position_kp: 8.0
+        position_ki: 0.0
+        anchor_stiffness: 0.5
+        persistence_file: ''
+        constant_torque_speed: 0.0
+  dm_motor_bilateral_control:
+    nodes:
+      bilateral_control_node:
+        motor_a: motor_1
+        motor_b: motor_2
+        control_mode: differential_torque
+        required_velocity_bandwidth: 100.0
+        rate: 500.0
+        target_validity: 0.05
+        operator_timeout: 1.0
+        direction: 1
+        stiffness: 50.0
+        coupling_damping: 0.4975
+        local_damping: 0.005
+        max_torque: 0.0
+        friction_compensation_enabled: true
+        friction_compensation_fraction: 0.6
+        friction_torque_limit: 0.2
+        motion_limits_enabled: false
+        max_feedback_torque: 1.0
+        max_travel: 0.3
+        warning_temperature: 45.0
+        max_temperature: 55.0
+        feedback_age: 0.02
+        pair_skew: 0.005
+        feedback_stop: 0.08
+        recovery_time: 0.1
+      dashboard:
+        controller_namespace: bilateral_control
+        host: 0.0.0.0
+        port: 8084
+  dm_motor_bringup:
+    launches:
+      bilateral_control.launch.py:
+        parameters:
+          namespace: bilateral_optimized_simulation
+          control_rate: '500'
+          dashboard_host: 127.0.0.1
+          can_dashboard_ports: {}
+          motor_dashboard_ports: {}
+          dashboard_port: 8184
+        system:
+          bus_names:
+          - main
+          motor_names:
+          - motor_1
+          - motor_2
+          buses:
+            main:
+              backend: virtual
+              port: ''
+              io_rate: 1000.0
+          motors:
+            motor_1:
+              bus: main
+              motor_id: 1
+              configure_mode_on_startup: true
+            motor_2:
+              bus: main
+              motor_id: 2
+              configure_mode_on_startup: true
+        nodes:
+          dm_motor_control:
+            motor_node:
+              startup_velocity_bandwidth: 100.0
+              host_protection_enabled: true
+              measured_torque_limit: 0.0
+              estimated_torque_limit: 0.0
+              mos_temperature_stop: 50.0
+              rotor_temperature_stop: 50.0
+              control_rate: 500.0
+              state_rate: 500.0
+              require_virtual_bus: true
+              event_driven_feedback: false
+              native_position_observation_rate: 0.0
+              direction: 1.0
+              software_offset: 0.0
+              position_min: -350.0
+              position_max: 350.0
+              velocity_limit: 26.0
+              measured_velocity_limit: 26.0
+              protection_samples: 1
+              torque_limit: 0.0
+              kp_limit: 500.0
+              kd_limit: 1.0
+              configure_mode_on_startup: true
+          dm_motor_bilateral_control:
+            bilateral_control_node:
+              control_mode: differential_torque
+              required_velocity_bandwidth: 100.0
+              motor_a: motor_1
+              motor_b: motor_2
+              direction: 1
+              stiffness: 50.0
+              coupling_damping: 0.4975
+              local_damping: 0.005
+              rate: 500.0
+              target_validity: 0.05
+              operator_timeout: 1.0
+              friction_compensation_enabled: true
+              friction_compensation_fraction: 0.6
+              friction_torque_limit: 0.2
+              max_torque: 0.0
+              motion_limits_enabled: false
+              feedback_age: 0.02
+              pair_skew: 0.005
+              feedback_stop: 0.08
+              recovery_time: 0.1
+              max_feedback_torque: 1.0
+              max_travel: 0.3
+              warning_temperature: 45.0
+              max_temperature: 55.0
+        variants:
+          simulation:
+            system:
+              buses:
+                main:
+                  backend: virtual
+                  port: ''
+                  can_fd: false
+                  io_rate: 1000.0
+            devices:
+              motor_1:
+                inertia: 0.0038742723463633427
+                coulomb_friction: 0.1416881637628295
+                viscous_friction: 1.1849527629928617e-23
+                static_friction: 0.1700257965153954
+                friction_model: coulomb_viscous
+                gravity_torque: 0.0
+                joint_stiffness: 0.0
+                load_torque: 0.0
+                max_torque: 7.87
+                constant_torque_speed: 8.0
+                no_load_speed: 50.0
+                mapping_position: 12.5
+                mapping_velocity: 50.0
+                mapping_torque: 10.0
+                physics_rate: 1000.0
+                state_rate: 500.0
+                integration_step: 3.125e-05
+                velocity_time_constant: 0.0
+                torque_time_constant: 0.002
+                feedback_velocity_source: physical
+                feedback_velocity_time_constant: 0.0045
+                feedback_velocity_delay: 0.0015
+                feedback_torque_time_constant: 0.012
+                feedback_torque_delay: 0.002
+                initial_position: 0.0
+                initial_velocity: 0.0
+                persistence_file: ''
+              motor_2:
+                inertia: 0.0014637501871318296
+                coulomb_friction: 0.10164556437387359
+                viscous_friction: 1.302478596080289e-16
+                static_friction: 0.1219746772486483
+                friction_model: coulomb_viscous
+                gravity_torque: 0.0
+                joint_stiffness: 0.0
+                load_torque: 0.0
+                max_torque: 7.84
+                constant_torque_speed: 8.0
+                no_load_speed: 50.0
+                mapping_position: 12.5
+                mapping_velocity: 50.0
+                mapping_torque: 10.0
+                physics_rate: 1000.0
+                state_rate: 500.0
+                integration_step: 3.125e-05
+                velocity_time_constant: 0.0
+                torque_time_constant: 0.002
+                feedback_velocity_source: physical
+                feedback_velocity_time_constant: 0.0045
+                feedback_velocity_delay: 0.0015
+                feedback_torque_time_constant: 0.012
+                feedback_torque_delay: 0.002
+                initial_position: 0.0
+                initial_velocity: 0.0
+                persistence_file: ''
+            nodes:
+              dm_motor_control:
+                motor_node:
+                  host_protection_enabled: true
+                  position_limit: 0.0
+                  velocity_limit: 26.0
+                  torque_limit: 0.0
+                  position_min: -350.0
+                  position_max: 350.0
+                  measured_velocity_limit: 26.0
+                  measured_torque_limit: 0.0
+                  estimated_torque_limit: 0.0
+                  mos_temperature_stop: 50.0
+                  rotor_temperature_stop: 50.0
+                  control_rate: 500.0
+                  state_rate: 500.0
+                  require_virtual_bus: true
+                  startup_velocity_bandwidth: 100.0
+                  event_driven_feedback: false
+                  native_position_observation_rate: 0.0
+                  direction: 1.0
+                  software_offset: 0.0
+                  protection_samples: 1
+                  kp_limit: 500.0
+                  kd_limit: 1.0
+                  configure_mode_on_startup: true
+              dm_motor_bilateral_control:
+                bilateral_control_node:
+                  max_torque: 0.0
+                  motion_limits_enabled: false
+                  friction_compensation_enabled: true
+                  control_mode: differential_torque
+                  required_velocity_bandwidth: 100.0
+                  motor_a: motor_1
+                  motor_b: motor_2
+                  direction: 1
+                  stiffness: 50.0
+                  coupling_damping: 0.4975
+                  local_damping: 0.005
+                  rate: 500.0
+                  target_validity: 0.05
+                  operator_timeout: 1.0
+                  friction_compensation_fraction: 0.6
+                  friction_torque_limit: 0.2
+                  feedback_age: 0.02
+                  pair_skew: 0.005
+                  feedback_stop: 0.08
+                  recovery_time: 0.1
+                  max_feedback_torque: 1.0
+                  max_travel: 0.3
+                  warning_temperature: 45.0
+                  max_temperature: 55.0

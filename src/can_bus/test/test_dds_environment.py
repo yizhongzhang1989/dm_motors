@@ -70,18 +70,37 @@ def test_profile_only_changes_the_participant_transport():
         "transport_descriptors", "participant"}
 
 
-def test_real_participant_uses_the_hook_without_shared_memory():
+def test_real_participant_uses_hook_with_rmw_localhost_policy():
     code = """
+import os
 from pathlib import Path
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.utilities import get_rmw_implementation_identifier
+from std_msgs.msg import String
 rclpy.init()
 node = Node("dds_environment_probe", start_parameter_services=False)
 try:
     assert get_rmw_implementation_identifier() == "rmw_fastrtps_cpp"
     mappings = Path("/proc/self/maps").read_text()
-    assert "/dev/shm/fastrtps_" not in mappings, "DDS profile still uses shared memory"
+    has_shared_memory = "/dev/shm/fastrtps_" in mappings
+    # Humble rmw_fastrtps adds its own loopback UDP and SHM transports after
+    # loading XML when localhost_only=true. This does not invalidate the
+    # hook's UDP-only profile (checked separately above).
+    if os.environ.get("ROS_LOCALHOST_ONLY") == "1":
+        assert has_shared_memory, "Humble localhost policy should add SHM"
+    else:
+        assert not has_shared_memory, "ordinary profile mode should remain UDP-only"
+    received = []
+    publisher = node.create_publisher(String, "dds_environment_probe/data", 1)
+    subscription = node.create_subscription(
+        String, "dds_environment_probe/data", lambda message: received.append(message.data), 1)
+    deadline = time.monotonic() + 3.0
+    while not received and time.monotonic() < deadline:
+        publisher.publish(String(data="participant_ready"))
+        rclpy.spin_once(node, timeout_sec=0.02)
+    assert received == ["participant_ready"], "participant did not deliver a sample"
 finally:
     node.destroy_node()
     rclpy.shutdown()
@@ -90,6 +109,6 @@ finally:
         "sh", "-c", '. "$1"; exec "$2" -c "$3"',
         "dds-participant-test", str(HOOK), sys.executable, code,
     ], env=environment(RMW_IMPLEMENTATION="rmw_fastrtps_cpp",
-                       ROS_DOMAIN_ID=str(30 + os.getpid() % 40)),
+                       ROS_DOMAIN_ID=os.environ.get("DM_MOTOR_TEST_DOMAIN", str(30 + os.getpid() % 40))),
         capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr

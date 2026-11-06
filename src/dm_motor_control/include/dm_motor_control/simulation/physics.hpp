@@ -11,9 +11,13 @@ struct PhysicsParameters
   double viscous_friction{0.02}, coulomb_friction{0.03}, static_friction{0.05};
   std::string friction_model{"coulomb_viscous"};
   double stribeck_velocity{0.15}, friction_negative_scale{1};
+  // Optional symmetric LuGre branch: sigma1=0, stiffness=static_friction/scale.
+  double friction_displacement_scale{0.001}, initial_bristle_displacement{0};
   double gravity_torque{0}, gravity_offset{0};
   double joint_stiffness{0}, load_torque{0};
   double max_torque{10}, no_load_speed{50}, torque_time_constant{0.002};
+  // Motoring torque stays constant up to this speed; zero preserves the legacy envelope.
+  double constant_torque_speed{0};
   double lower_limit{-1e6}, upper_limit{1e6};
   double contact_stiffness{200}, contact_damping{2};
   double ambient_temperature{25}, heat_capacity{100}, thermal_resistance{1};
@@ -29,6 +33,10 @@ struct PhysicsState
   double load_torque{0};
   double rotor_temperature{25}, mos_temperature{25}, mechanical_energy{0};
   uint64_t integration_steps{0};
+  // LuGre-only storage/work diagnostics; mechanical_energy keeps its old meaning.
+  double bristle_displacement{0}, bristle_torque{0}, bristle_energy{0};
+  double bristle_drive_work{0}, viscous_dissipation{0}, bristle_dissipation{0};
+  double total_storage{0};
 };
 
 class JointPhysics

@@ -5,6 +5,8 @@ const CalibrationView = (() => {
     idle: "等待实验", checking: "就绪与能力检查", arming: "等待实际使能确认",
     resetting: "主机故障复位 · 等待新的失能反馈",
     acquisition: "多频激励 · 采集实际反馈", baseline: "A/B · 无补偿基线",
+    quick_training: "快速标定 · 训练采集", quick_validation: "快速标定 · 独立验证",
+    quick_pilot: "自动激励 · 预探测", quick_pilot_return: "自动激励 · 回位确认",
     returning: "回位并等待静止", compensated: "A/B · 加入摩擦补偿",
     assistance: "低阻力拖动助力", settling: "静摩擦试验 · 回位 / 准备",
     conditioning: "静摩擦试验 · 同向接近基准", neutral_dwell: "静摩擦试验 · 撤除预载并静置",
@@ -47,16 +49,18 @@ const CalibrationView = (() => {
   }
   stages.fourier_periodic = "傅里叶激励 · 多谐波周期运动";
   stages.fourier_home = "傅里叶激励 · 定位 / 最终回零";
-  const experiments = {precision: "精密全速摩擦", fourier: "傅里叶摩擦辨识", calibrate: "快速机械辨识", validate: "补偿 A/B", breakaway: "静摩擦起动", compensate: "拖动助力"};
+  const experiments = {precision: "精密全速摩擦", fourier: "傅里叶摩擦辨识", calibrate: "快速机械标定", validate: "补偿 A/B", breakaway: "静摩擦起动", compensate: "拖动助力", low_speed: "短行程低速摩擦", speed_sweep: "独立轴高速滑动摩擦"};
+  for (const [phase, label] of Object.entries({home: "定位", ramp: "速度过渡", transit: "稳速接近", sample: "固定区间采样", brake: "减速", final_home: "返回起点", done: "采集结束"}))
+    stages[`low_speed_${phase}`] = `低速摩擦 · ${label}`;
   const models = {auto: "自动选择", viscous: "黏性", coulomb_viscous: "库仑 + 黏性",
     stribeck: "Stribeck", asymmetric_coulomb_viscous: "非对称库仑 + 黏性", asymmetric_stribeck: "非对称 Stribeck",
-    tabulated: "精密分档表（双向）"};
-  const editable = ["experiment", "model", "calibration_file", "duration", "amplitude", "frequency", "kp", "kd",
+    tabulated: "精密分档表（双向）", coulomb_viscous_bias: "滑动报告力矩 · 库仑 + 黏性 + 偏置"};
+  const editable = ["experiment", "model", "calibration_file", "quick_excitation", "duration", "amplitude", "frequency", "kp", "kd",
     "fit_bias", "known_bias", "fit_gravity", "fit_stiffness", "compensation_fraction",
     "collect_warmup", "collect_static", "collect_training", "collect_validation"];
   const selectable = ["warmup", "static", "training", "validation"];
   const bools = new Set(["fit_bias", "fit_gravity", "fit_stiffness", ...selectable.map(name => `collect_${name}`)]);
-  const strings = new Set(["experiment", "model", "calibration_file"]);
+  const strings = new Set(["experiment", "model", "calibration_file", "quick_excitation"]);
   const active = new Set(["checking", "arming", "running", "returning", "stopping", "fitting", "resetting"]);
   const completed = new Set(["completed", "completed_unqualified", "qualified"]);
   const terminal = new Set([...completed, "failed", "incomplete", "recorded"]);
@@ -64,9 +68,70 @@ const CalibrationView = (() => {
   const colors = {measured: "#69d6df", target: "#b3a0ff", feedforward: "#f2bc67", fit: "#72dfa8"};
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const number = (value, digits = 4) => finite(value) ? value.toFixed(digits) : "—";
+  function sharedRanges(directions) {
+    const result = {};
+    for (const direction of ["negative", "positive"]) {
+      const branch = directions?.[direction], lower = branch?.velocity_min, upper = branch?.velocity_max;
+      if (!finite(lower) || !finite(upper) || !(lower < upper) ||
+          !(direction === "negative" ? upper < 0 : lower > 0) ||
+          !["training", "external_validation"].every(role => Number.isInteger(branch?.windows?.[role]) && branch.windows[role] > 0)) continue;
+      result[direction] = branch;
+    }
+    return result;
+  }
+  function sharedRangeText(branch) {
+    return branch ? `${number(branch.velocity_min, 3)} ～ ${number(branch.velocity_max, 3)}；训练 ${branch.windows.training} / 独立验证 ${branch.windows.external_validation} 窗`
+      : "未记录可用共有范围";
+  }
+  function speedInSharedRanges(speed, ranges) {
+    return finite(speed) && Object.values(sharedRanges(ranges)).some(branch => speed >= branch.velocity_min && speed <= branch.velocity_max);
+  }
+  function sharedModelCurves(curves, ranges) {
+    return (curves || []).flatMap(points => Object.values(sharedRanges(ranges)).map(branch =>
+      points.filter(point => finite(point[0]) && finite(point[1]) && point[0] >= branch.velocity_min && point[0] <= branch.velocity_max)))
+      .filter(points => points.length > 1);
+  }
+  const quickProtocol = "quick_independent_v1";
+  function speedSweepDiagnostics(report) {
+    if (report?.experiment !== "speed_sweep") return [];
+    return (report.excluded_diagnostic_trials || []).map(item => [
+      item.trial || "未命名", item.had_enable_request === true ? "已请求" : item.had_enable_request === false ? "未请求" : "未记录",
+      `${item.commands ?? "—"} 条${item.startup_only === true ? " baseline 起点保持目标" : "目标"}`,
+      item.stop_confirmed === true ? "已确认" : "未确认", (item.errors || []).join("；"),
+    ]);
+  }
+  function quickProfile(schema) {
+    const profile = schema?.quick_profile;
+    return profile?.id === "quick_mechanical" && profile.protocol === quickProtocol &&
+      profile.settings?.experiment === "calibrate" && finite(profile.settings.duration) &&
+      profile.settings.duration > 0 && finite(profile.training_seconds) && profile.training_seconds > 0 &&
+      finite(profile.validation_seconds) && profile.validation_seconds > 0 ? profile : null;
+  }
+  function quickTiming(config) {
+    if (config?.quick_excitation === "auto") return {training: 40, validation: 20};
+    const training = Number(config?.duration);
+    return finite(training) && training > 0
+      ? {training, validation: Math.max(16, Math.min(24, training / 2))} : null;
+  }
+  function quickAdaptation(state) {
+    if (state?.experiment !== "calibrate") return null;
+    const snapshot = state.quick_adaptation || state.report?.quick_adaptation;
+    const mode = state.configuration?.quick_excitation ?? "fixed";
+    if (!snapshot) return mode === "auto" ? {text: "自动选择 · 等待预探测记录；尚未选定正式方案。", selected: null} : null;
+    const selected = snapshot.selected_candidate, settings = snapshot.candidates?.[selected]?.formal_settings;
+    const count = Array.isArray(snapshot.attempts) ? snapshot.attempts.length : 0;
+    const phase = {probe_ready: "等待预探测", return_required: "等待回位确认", selected: "已选定",
+      rejected: "未找到可用方案", aborted: "已中止"}[snapshot.status] || snapshot.status || "等待记录";
+    const status = stages[state.stage] || phase;
+    const recipe = settings ? `幅值 ${number(settings.amplitude, 3)} rad · ${number(settings.frequency, 3)} Hz · Kp ${number(settings.kp, 2)} / Kd ${number(settings.kd, 2)}` : "";
+    const reason = Array.isArray(snapshot.abort_reasons) ? snapshot.abort_reasons.map(reason => String(reason)).join("；") : "";
+    return {selected, settings, attempts: count,
+      text: selected && settings ? `自动选择 ${selected} · ${recipe}。完成 ${count} 段预探测；正式结果仍须独立验证。`
+        : `自动选择 · ${terminal.has(state.phase) ? phase : status} · 已记录 ${count}/2 段预探测。尚未选定正式方案。${reason}`};
+  }
   function experimentState(detail) {
     if (!detail?.report) return null;
-    const report = detail.report, saved = report.dashboard_state || {}, config = report.configuration || {};
+    const report = detail.report, saved = report.dashboard_state || {}, config = {quick_excitation: "fixed", ...report.configuration};
     const experiment = report.experiment || "", phase = report.status || "incomplete";
     const settings = prefix => Object.fromEntries(Object.entries(config)
       .filter(([name]) => name.startsWith(prefix)).map(([name, value]) => [name.slice(prefix.length), value]));
@@ -87,8 +152,14 @@ const CalibrationView = (() => {
       samples: report.samples ?? detail.raw_samples ?? 0, events: report.events || [],
       stop_confirmed: report.stop_confirmed === true, error: report.error || "",
       failure_stage: report.failure_stage, report, fit: detail.fit, precision,
+      quick_calibration_plan: report.quick_plan || saved.quick_calibration_plan || null,
+      quick_adaptation: report.quick_adaptation || saved.quick_adaptation || null,
+      requested_configuration: report.requested_configuration || saved.requested_configuration || null,
+      recorded_samples: report.recorded_samples ?? saved.recorded_samples ?? report.samples ?? 0,
       precision_settings: saved.precision_settings || report.precision?.settings || settings("precision_"),
       fourier_settings: saved.fourier_settings || report.fourier?.settings || settings("fourier_"),
+      low_speed: saved.low_speed || report.low_speed_progress || null,
+      low_speed_settings: saved.low_speed_settings || report.low_speed?.settings || settings("low_speed_"),
       progress: completed.has(phase) ? 1 : saved.progress ?? 0};
   }
   function latestExperiment(runs, state, motor = "") {
@@ -124,7 +195,14 @@ const CalibrationView = (() => {
     if (spec.type === "integer" && !Number.isInteger(value)) throw new Error(`${spec.label} 必须为整数`);
     return value;
   }
-  function stageEstimate(stage, config, experiment) {
+  function stageEstimate(stage, config, experiment, quick = false) {
+    if (quick && experiment === "calibrate" && ["training", "validation"].includes(stage)) {
+      const timing = quickTiming(config);
+      return timing ? stage === "training"
+        ? `训练 ${number(timing.training, 1)} s；仅训练数据用于拟合、模型选择与积分窗口选择。`
+        : `独立验证 ${number(timing.validation, 1)} s；使用后续不同轨迹，冻结模型后评分，不重新拟合。`
+        : "等待有效的快速标定计划。";
+    }
     if (!["precision", "fourier"].includes(experiment)) {
       return ["training", "validation", "static"].includes(stage)
         ? `有限时长 ${number(config.duration, 1)} s${experiment === "validate" ? " / 段；两段之间确认回位与静止" : ""}，实际运动仍受固定保护边界限制。`
@@ -161,25 +239,71 @@ const CalibrationView = (() => {
     return {calibration_file, compensation_fraction};
   }
   function stageRows(state, selections, planning = false) {
+    if (state.experiment === "speed_sweep") {
+      const report = state.report?.speed_sweep || {}, coverage = report.coverage || {};
+      const labels = {checking: "独立轴检查", training: "双向训练轮", validation: "整轮独立验证", stopping: "停止确认", saving: "原始记录归档", analysis: "滑动预测评价"};
+      return ["checking", "pilot", "warmup", "baseline", "static", "training", "validation", "stopping", "saving", "analysis"].map(id => ({
+        id, visible: Object.hasOwn(labels, id), label: labels[id] || id,
+        kind: id === "analysis" ? report.prediction_qualified ? "done" : "warning"
+          : id === "stopping" ? state.stop_confirmed ? "done" : "warning"
+            : report.acquisition_quality_passed ? "done" : "warning",
+        status: id === "analysis" ? report.prediction_qualified ? "预测通过" : "查看质量说明"
+          : id === "stopping" ? state.stop_confirmed ? "已确认" : "未确认" : "已归档",
+        detail: id === "training" || id === "validation" ? `${coverage.complete_trials ?? "—"}/${coverage.expected_trials ?? "—"} 独立轮次；验证轮不参与拟合`
+          : id === "analysis" ? "高速滑动候选；惯量和静摩擦未测量，未发布生产参数。" : "",
+      }));
+    }
+    if (state.experiment === "low_speed") {
+      const progress = state.low_speed || {}, report = state.report?.low_speed;
+      const phase = planning ? "idle" : state.phase, done = completed.has(phase), failed = phase === "failed";
+      const role = progress.cells?.[progress.cell]?.role;
+      const current = ["checking", "arming", "idle"].includes(phase) ? "checking"
+        : state.stage === "stopping" ? "stopping" : phase === "fitting" || done ? "analysis"
+          : role === "validation" ? "validation" : "training";
+      const visible = ["checking", "training", "validation", "stopping", "analysis"];
+      const labels = {checking: "启动检查", training: "双向低速采集", validation: "独立速度采集", stopping: "停止确认", analysis: "配对质量分析"};
+      return ["checking", "pilot", "warmup", "baseline", "static", "training", "validation", "stopping", "saving", "analysis"].map(id => ({
+        id, visible: visible.includes(id), label: labels[id] || id,
+        kind: failed && current === id ? "failed" : done ? (id === "analysis" ? "warning" : "done") : current === id && !planning ? "current" : "",
+        status: planning ? "待开始" : done ? (id === "analysis" ? "诊断已保存" : "已完成") : failed && current === id ? "中止" : current === id ? "进行中" : "等待",
+        detail: id === "training" || id === "validation" ? `${progress.completed_cells ?? 0}/${progress.required_cells ?? "—"} 段 · 正反方向经过同一预定区间`
+          : id === "analysis" ? (report ? "局部配对阻力观测；未发布补偿模型。" : "保留完整数据，检查稳速、重复性及位置影响。") : "",
+      }));
+    }
     const prepared = ["precision", "fourier"].includes(state.experiment), fourier = state.experiment === "fourier";
+    const quick = state.experiment === "calibrate" &&
+      (state.quick_calibration_plan?.protocol === quickProtocol || state.report?.quick?.protocol === quickProtocol ||
+       state.quick_adaptation || state.configuration?.quick_excitation === "auto");
+    const automatic = quick && (state.configuration?.quick_excitation === "auto" || state.quick_adaptation || state.report?.quick_adaptation);
+    const adaptation = state.quick_adaptation || state.report?.quick_adaptation;
+    const formalSamples = state.report ? state.report.samples : state.samples;
+    const preparationOnly = automatic && adaptation && formalSamples === 0 &&
+      !adaptation.selected_candidate && adaptation.collector?.stage !== "formal";
     const p = planning ? null : state.precision, phase = planning ? "idle" : state.phase;
     const stage = planning ? "" : state.stage, local = p?.phase || "";
-    const keys = ["checking", "warmup", "baseline", "static", "training", "validation", "stopping", "saving", "analysis"];
-    const labels = ["启动检查", "预运行", "零偏测量", "静摩擦",
-      fourier ? "傅里叶训练采集" : prepared ? "双向稳速采集" : experiments[state.experiment],
+    const keys = ["checking", "pilot", "warmup", "baseline", "static", "training", "validation", "stopping", "saving", "analysis"];
+    const labels = ["启动检查", "自动选择激励", "预运行", "零偏测量", "静摩擦",
+      fourier ? "傅里叶训练采集" : prepared ? "双向稳速采集" : quick ? "训练采集" : experiments[state.experiment],
       "独立验证", "停止确认", "保存记录", "模型计算"];
     let current = "checking";
-    if (prepared && (local.includes("warmup") || stage.includes("warmup"))) current = "warmup";
+    if (automatic && ["quick_pilot", "quick_pilot_return"].includes(stage)) current = "pilot";
+    else if (prepared && (local.includes("warmup") || stage.includes("warmup"))) current = "warmup";
     else if (prepared && ["baseline", "await_enable"].includes(local)) current = "baseline";
     else if (local.startsWith("static") || local === "review_static" || state.experiment === "breakaway") current = "static";
     else if (phase === "running" || phase === "returning" || local === "done" || prepared && p && phase === "failed")
-      current = p?.validation || stage === "compensated" ? "validation" : "training";
+      current = p?.validation || stage === "compensated" || stage === "quick_validation" ? "validation" : "training";
     if (phase === "failed" && stage !== "stopping") {
       const failure = state.failure_stage || "";
       if (failure.includes("qualification") || failure === "fitting") current = "analysis";
+      else if (["quick_pilot", "quick_pilot_return"].includes(failure)) current = "pilot";
+      // Older ROS reports retain the broad running/returning failure phase.
+      // The saved collector role and zero formal samples distinguish preparation.
+      else if (preparationOnly && (["running", "returning", "quick_selection"].includes(failure) ||
+        !failure && ["pilot", "pilot_return"].includes(adaptation.collector?.stage))) current = "pilot";
       else if (["checking", "arming"].includes(failure)) current = "checking";
       else if (failure === "recording_setup") current = "saving";
       else if (failure === "stopping") current = "stopping";
+      else if (failure === "quick_validation") current = "validation";
       else if (!prepared && ["running", "returning"].includes(failure))
         current = state.experiment === "breakaway" ? "static" : "training";
     }
@@ -192,10 +316,10 @@ const CalibrationView = (() => {
       (finite(value) && total > 0 ? ` · ${Math.min(100, Math.floor(100 * (value || 0) / total))}%` : "");
     return keys.map((id, index) => {
       const selected = !selectable.includes(id) || !prepared || selections[`collect_${id}`] !== false;
-      const visible = prepared || !["warmup", "baseline"].includes(id) &&
+      const visible = id === "pilot" ? Boolean(automatic) : prepared || !["warmup", "baseline"].includes(id) &&
         (id !== "static" || state.experiment === "breakaway") &&
         (id !== "training" || state.experiment !== "breakaway") &&
-        (id !== "validation" || state.experiment === "validate");
+        (id !== "validation" || state.experiment === "validate" || quick);
       let status = "等待", kind = "", detail = "";
       const warmupOff = id === "warmup" && !state.precision_settings?.warmup_repetitions;
       if (!selected || warmupOff) { status = "跳过"; kind = "skipped"; detail = warmupOff && selected ? "节点预运行次数配置为 0" : "不执行，也不自动复用历史数据"; }
@@ -223,7 +347,7 @@ const CalibrationView = (() => {
           detail = current === id ? `${p.baseline_settling ? "失能稳定等待" : "统计零偏"} · ${number(p.phase_elapsed, 1)} s · ${p.baseline_samples ?? "—"} 样本` : "";
         }
         if (p && id === "static" && selected) {
-          const completedTrials = done || motionIndex > 3 ? p.static_trials : p.static_completed ?? Math.max(0, p.static_trial - 1);
+          const completedTrials = done || motionIndex > keys.indexOf("static") ? p.static_trials : p.static_completed ?? Math.max(0, p.static_trial - 1);
           detail = finite(p.static_trials) ? count(completedTrials, p.static_trials, "次") : "";
           if (!terminal.has(phase) && current === id) detail += `\n${p.static_conditioning ? "预处理" : "测量"} · ${number(p.static_angle, 3)} rad · ${stages[stage] || stage}`;
           if (p.static_diagnostics?.qualified === false || state.report?.[state.experiment]?.static?.qualified === false) {
@@ -253,6 +377,27 @@ const CalibrationView = (() => {
         kind = id === "analysis" ? "" : "done";
         detail = "";
       }
+      if (quick && ["training", "validation"].includes(id)) {
+        const measured = state.report?.quick?.[id === "training" ? "training" : "external_validation"];
+        const timing = quickTiming(state.configuration);
+        if (measured) detail = `${number(measured.duration, 1)} s · ${measured.raw_samples ?? "—"} 条样本`;
+        else if (timing) detail = `${number(timing[id], 1)} s${id === "validation" ? " · 不参与拟合" : " · 模型选择仅使用本段"}`;
+      }
+      if (id === "pilot" && automatic) detail = planning
+        ? "最多 2 × 10 s 预探测，每段后实测回位；不用于正式拟合或独立验证。"
+        : quickAdaptation(state)?.text || "等待预探测记录。";
+      if (failed && preparationOnly) {
+        if (id === "pilot" && current === "pilot")
+          status = adaptation.status === "rejected" ? "预探测未通过" : "预探测已中断";
+        if (["training", "validation"].includes(id)) {
+          status = "未执行"; kind = "";
+          detail = "正式采集未开始；预探测样本不用于本阶段。";
+        }
+      } else if (failed && automatic && adaptation?.selected_candidate && formalSamples === 0 &&
+        id === "training" && current === "training") {
+        status = "未取得样本";
+        detail = "已选定正式方案，但未保存正式采集样本。";
+      }
       return {id, label: labels[index], selected, visible, status, kind, detail};
     });
   }
@@ -272,6 +417,7 @@ const CalibrationView = (() => {
       if (!strings.has(name) && !bools.has(name) && (!element.value.trim() || !finite(value))) throw new Error(`${name} 需要有限数值`);
       result[name] = value;
     }
+    if (!["fixed", "auto"].includes(result.quick_excitation)) throw new Error("quick_excitation 选项无效");
     return result;
   }
   function mergeRows(previous, rows, reset = false) {
@@ -351,8 +497,9 @@ const CalibrationView = (() => {
     const match = translations.find(item => message.startsWith(item[0]));
     return match ? `${match[1]} 原始诊断：${message}` : message;
   }
-  return {stages, experiments, models, editable, selectable, stageRows, parseStageValue, stageEstimate, readDragValues, experimentState, latestExperiment, active, completed, terminal, maxChartPoints,
-    bools, colors, finite, number, bounds, readValues, mergeRows, limitRows, windowRows, reason};
+  return {stages, experiments, models, editable, selectable, stageRows, parseStageValue, stageEstimate, readDragValues, experimentState, latestExperiment, quickProfile, quickTiming, quickAdaptation, quickProtocol, active, completed, terminal, maxChartPoints,
+    bools, colors, finite, number, sharedRanges, sharedRangeText, speedInSharedRanges, sharedModelCurves, speedSweepDiagnostics,
+    bounds, readValues, mergeRows, limitRows, windowRows, reason};
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = CalibrationView;

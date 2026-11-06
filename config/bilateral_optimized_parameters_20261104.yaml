@@ -1,0 +1,84 @@
+# Simulation-only namespace copy; original qualified friction laws are unchanged.
+# SIMULATION-ONLY compensation-law copy. Original hardware approval retained; NOT a new plant or hand-force identification.
+version: 1
+motors:
+  /bilateral_optimized_simulation/motor_1:
+    description: Simulation-only replay of archived Oct30 hardware compensation law;
+      qualified flag and approval refer to original hardware law, not this plant candidate.
+    simulation:
+      calibrations:
+        mechanical:
+          schema: 3
+          qualified: true
+          identity:
+            motor_id: 1
+            mode: 1
+            direction: 1.0
+            software_offset: 0.0
+            pmax: 12.5
+            vmax: 50.0
+            tmax: 10.0
+          fit:
+            model: coulomb_viscous
+            parameters:
+              inertia: 0.0038742723463633427
+              bias: -0.0005889825793854415
+              coulomb: 0.1416881637628295
+              viscous: 1.1849527629928617e-23
+            units:
+              inertia: kg*m^2
+              bias: Nm
+              coulomb: Nm
+              viscous: Nm/(rad/s)
+            domain:
+              velocity_min: -0.41082839909298696
+              velocity_max: 0.3914534530874406
+              position_min: -0.39424412147926624
+              position_max: 0.30042285036783944
+              temperature_min: 27.0
+              temperature_max: 27.0
+          source: /home/robot/.ros/dm_motor_calibration/20261030T055853-8c3a2b81/calibration.json
+          approval:
+            user_accepted: true
+            saved_at: '2026-10-30T06:11:19.287517+00:00'
+            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T061057-e5418e38/report.json
+  /bilateral_optimized_simulation/motor_2:
+    description: Simulation-only replay of archived Oct30 hardware compensation law;
+      qualified flag and approval refer to original hardware law, not this plant candidate.
+    simulation:
+      calibrations:
+        mechanical:
+          schema: 3
+          qualified: true
+          identity:
+            motor_id: 2
+            mode: 1
+            direction: 1.0
+            software_offset: 0.0
+            pmax: 12.5
+            vmax: 50.0
+            tmax: 10.0
+          fit:
+            model: coulomb_viscous
+            parameters:
+              inertia: 0.0014637501871318296
+              bias: -0.0020214819187987522
+              coulomb: 0.10164556437387359
+              viscous: 1.302478596080289e-16
+            units:
+              inertia: kg*m^2
+              bias: Nm
+              coulomb: Nm
+              viscous: Nm/(rad/s)
+            domain:
+              velocity_min: -0.32715376170404525
+              velocity_max: 0.3227948923915729
+              position_min: -0.4430571017880549
+              position_max: 0.3637636809997691
+              temperature_min: 26.0
+              temperature_max: 26.0
+          source: /home/robot/.ros/dm_motor_calibration/20261030T055934-dfaba92f/calibration.json
+          approval:
+            user_accepted: true
+            saved_at: '2026-10-30T06:11:12.121757+00:00'
+            drag_report: /home/robot/.ros/dm_motor_calibration/20261030T061039-a64cb7f4/report.json

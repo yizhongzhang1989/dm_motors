@@ -1,8 +1,10 @@
 #pragma once
 
 #include "dm_motor_control/simulation/physics.hpp"
+#include "dm_motor_control/simulation/feedback.hpp"
 #include <dm_motor_control/runtime.hpp>
 
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -14,6 +16,12 @@ struct DeviceParameters
   dm_motor::MotorConfig motor;
   PhysicsParameters physics;
   double integration_step{0.0005}, bus_voltage{48};
+  // Optional internal velocity-estimator lag for robustness experiments; zero is ideal.
+  double velocity_time_constant{0};
+  // Reporting dynamics never change the physical state or internal servo feedback.
+  std::string feedback_velocity_source{"internal"};
+  double feedback_velocity_time_constant{0}, feedback_velocity_delay{0};
+  double feedback_torque_time_constant{0}, feedback_torque_delay{0};
   double velocity_kp{1}, velocity_ki{0}, position_kp{8}, position_ki{0};
   double anchor_stiffness{0.5};
   std::string persistence_file;
@@ -61,6 +69,7 @@ private:
   void restore_registers();
   DeviceParameters parameters_;
   JointPhysics physics_;
+  FeedbackDynamics feedback_dynamics_;
   dm_motor::Target target_;
   std::map<uint8_t, uint32_t> registers_, saved_;
   double time_, last_command_, zero_offset_{0}, saved_offset_{0};

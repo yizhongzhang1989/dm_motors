@@ -1,0 +1,86 @@
+# 独立高速滑动摩擦候选；不是 ROS 参数或 production registry，不会自动启用补偿。
+# 恒速平台不能辨识惯量与静摩擦。须重新联轴验证后再选择部署参数。
+schema: 1
+protocol: independent_speed_sweep_v1
+topology: separated
+identified_on: '2026-11-06'
+model: coulomb_viscous_bias
+torque_source: motor_reported_current_derived_estimate
+production_registry_unchanged_sha256: fc92c69eea3f86777d3288f9a923ee76641b385965ee214162eb973d3f3e45db
+deployment_status: candidate_for_reconnected_rig_validation
+bias_is_sensor_offset: false
+bias_as_friction_feedforward_allowed: false
+zero_speed_compensation_validated: false
+axes:
+  A:
+    identity:
+      namespace: /motor_1
+      motor_id: 1
+      simulated: false
+      mode: 1
+      direction: 1.0
+      software_offset: 0.0
+      pmax: 12.5
+      vmax: 50.0
+      tmax: 10.0
+    velocity_bandwidth_hz: 100
+    parameters:
+      coulomb: 0.1470528020277679
+      viscous: 0.009665463671690223
+      bias: -0.00230889113237427
+    units:
+      coulomb: Nm
+      viscous: Nm/(rad/s)
+      bias: Nm
+    domain:
+      velocity_min: -13.185140257981443
+      velocity_max: 13.226780210901058
+      lowest_measured_sliding_speed: 0.5983865872496166
+      lowest_independent_validation_speed: 1.49909821629182
+      temperature_min: 20.0
+      temperature_max: 21.0
+    prediction_qualified: true
+    inertia_identified: false
+    static_friction_identified: false
+    full_angle_precision_calibration: false
+    production_published: false
+    source_report: /home/robot/.ros/dm_motor_calibration/independent-ac-20261106/analyses/A-v1/report.json
+    source_report_sha256: 4910ab0209b6b5fc39765bba49eca74625cf894f477943f968d507033819445f
+    history_run: 20261106T032519-d032ef8c
+    validation_rmse_Nm: 0.008194525997694366
+  C:
+    identity:
+      namespace: /motor_3
+      motor_id: 3
+      simulated: false
+      mode: 1
+      direction: 1.0
+      software_offset: 0.0
+      pmax: 12.5
+      vmax: 50.0
+      tmax: 10.0
+    velocity_bandwidth_hz: 40
+    parameters:
+      coulomb: 0.10958108069236736
+      viscous: 0.017122812763445072
+      bias: -0.004071065775343401
+    units:
+      coulomb: Nm
+      viscous: Nm/(rad/s)
+      bias: Nm
+    domain:
+      velocity_min: -13.194674212661853
+      velocity_max: 13.206931326339781
+      lowest_measured_sliding_speed: 0.5977785403494249
+      lowest_independent_validation_speed: 1.499361911646083
+      temperature_min: 25.0
+      temperature_max: 26.0
+    prediction_qualified: true
+    inertia_identified: false
+    static_friction_identified: false
+    full_angle_precision_calibration: false
+    production_published: false
+    source_report: /home/robot/.ros/dm_motor_calibration/independent-ac-20261106/analyses/C-v1/report.json
+    source_report_sha256: 368d91f584f0a6a7ea06daeedfe106ecb89c67ff1fff08c464ffa00e7d1a4d2c
+    history_run: 20261106T032521-e2e97ea7
+    validation_rmse_Nm: 0.014161694194882545

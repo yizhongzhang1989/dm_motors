@@ -72,11 +72,17 @@ def compact_calibration(document: dict) -> dict:
     for key in ("namespace", "simulated"):
         entry["identity"].pop(key, None)
     fit = entry["fit"]
-    sensor_bias = fit.get("diagnostics", {}).get("bias_is_sensor_offset")
+    # These are deployment semantics, not duplicated experimental statistics.
+    # A qualified predictor must not become a claim of accurate physical J/Fc/b
+    # merely because compaction removes its full report and warnings.
+    semantic_keys = ("bias_is_sensor_offset", "independent_validation", "quick_protocol_version",
+                     "physical_parameters_independently_validated")
+    semantics = {key: fit["diagnostics"][key] for key in semantic_keys
+                 if key in fit.get("diagnostics", {})}
     for key in ("kind", "diagnostics", "warnings"):
         fit.pop(key, None)
-    if sensor_bias is not None:
-        fit["diagnostics"] = {"bias_is_sensor_offset": sensor_bias}
+    if semantics:
+        fit["diagnostics"] = semantics
     if not fit.get("friction_table"):
         fit.pop("friction_table", None)
     parameters = fit["parameters"]

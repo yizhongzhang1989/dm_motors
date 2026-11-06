@@ -35,6 +35,24 @@ public:
   {
     if (broken) {throw std::runtime_error("injected transport disconnect");}
     sent.push_back(f);
+    if (f.id == 0x7ff && f.data[3] == 32) {
+      if (f.data[2] == 0x55) {
+        ++bandwidth_writes;
+        if (ignore_bandwidth_write) {
+          Frame echo = f; echo.id = 0; injected.push_back(echo); return;
+        }
+      } else if (f.data[2] == 0x33) {
+        ++bandwidth_reads;
+        if (drop_bandwidth_readback && bandwidth_writes) {return;}
+        if (bandwidth_read_override) {
+          Frame reply = f; reply.id = 0;
+          for (unsigned j = 0; j < 4; ++j) {
+            reply.data[4 + j] = (*bandwidth_read_override >> (8 * j)) & 255;
+          }
+          injected.push_back(reply); return;
+        }
+      }
+    }
     if (f.id == 0x7ff && f.data[2] == 0x33 && f.data[3] == 80) {
       if (drop_position_read) {return;}
       if (position_raw_override) {
@@ -54,17 +72,30 @@ public:
   }
   std::vector<Frame> receive() override
   {
-    if (broken) {throw std::runtime_error("injected transport disconnect");}
+    ++receives;
+    if (broken || receive_broken) {throw std::runtime_error("injected transport disconnect");}
     auto result = sim.receive();
     result.insert(result.end(), injected.begin(), injected.end()); injected.clear();
     return result;
   }
+  void initial_bandwidth(uint8_t id, float value, bool persisted = false)
+  {
+    Frame frame{0x7ff, {id, 0, 0x55, 32, 0, 0, 0, 0}};
+    const auto raw = float_bits(value);
+    for (unsigned j = 0; j < 4; ++j) {frame.data[4 + j] = (raw >> (8 * j)) & 255;}
+    sim.send(frame);
+    if (persisted) {sim.send({0x7ff, {id, 0, 0xaa, 1, 0, 0, 0, 0}});}
+    sim.receive();  // Fixture preparation, before the production Bus owns transport.
+  }
   SimBusTransport sim;
-  bool ignore_write{false}, broken{false};
+  bool ignore_write{false}, broken{false}, receive_broken{false};
   bool available{true}, reserved{true};
   bool motion_available{true};
   bool drop_position_read{false};
   std::optional<uint32_t> position_raw_override;
+  bool ignore_bandwidth_write{false}, drop_bandwidth_readback{false};
+  unsigned bandwidth_reads{0}, bandwidth_writes{0}, receives{0};
+  std::optional<uint32_t> bandwidth_read_override;
   std::vector<Frame> sent, injected;
 };
 class RuntimeTest : public ::testing::Test
@@ -255,6 +286,210 @@ TEST_F(RuntimeTest, FeedbackObserverPreservesEveryFrameInOneReceiveBatch)
   EXPECT_EQ(counts.size(), bus->snapshot("a", now).feedback_count - before);
   for (size_t i = 0; i < counts.size(); ++i) {EXPECT_EQ(counts[i], before + i + 1);}
 }
+TEST_F(RuntimeTest, PollFeedbackPublishesEveryFreshSampleWithoutSendingTargetsOrQueries)
+{
+  ready(); enable("a");
+  transport->receive(); transport->sent.clear();
+  const auto before = bus->snapshot("a", now).feedback_count;
+  std::vector<uint64_t> counts;
+  std::vector<double> times;
+  bus->set_feedback_callback([&](const std::string & name, const MotorSnapshot & sample, double received) {
+    ASSERT_EQ(name, "a");
+    counts.push_back(sample.feedback_count); times.push_back(received);
+  });
+  for (unsigned i = 1; i <= 3; ++i) {
+    auto frame = feedback_frame(1, 0, {1, i * 0.001, 0, 0, 28, 29}, {});
+    frame.received_steady = static_cast<uint64_t>(std::llround((now + i * 0.0001) * 1e9));
+    transport->injected.push_back(frame);
+  }
+  now += 0.001;
+  bus->poll_feedback(now);
+  ASSERT_EQ(counts.size(), 3u);
+  for (size_t i = 0; i < counts.size(); ++i) {
+    EXPECT_EQ(counts[i], before + i + 1);
+    EXPECT_NEAR(times[i], now - 0.001 + (i + 1) * 0.0001, 1e-9);
+  }
+  EXPECT_EQ(bus->snapshot("a", now).feedback_count, before + 3);
+  EXPECT_NEAR(bus->snapshot("a", now).feedback_age, 0.0007, 1e-9);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Enabled);
+  EXPECT_TRUE(transport->sent.empty());
+  bus->poll_feedback(now);  // An empty drain never replays callbacks.
+  EXPECT_EQ(counts.size(), 3u);
+  EXPECT_TRUE(transport->sent.empty());
+}
+TEST_F(RuntimeTest, PollFeedbackDoesNotDrainOrInitializeDuringStartup)
+{
+  transport->injected.push_back(feedback_frame(1, 0, {0, 0, 0, 0, 28, 29}, {}));
+  const auto receives = transport->receives;
+  now = 0.01; bus->poll_feedback(now);
+  EXPECT_EQ(transport->receives, receives);
+  EXPECT_EQ(bus->snapshot("a", now).feedback_count, 0u);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_TRUE(transport->sent.empty());
+  step();
+  EXPECT_GT(transport->receives, receives);
+  EXPECT_GT(bus->snapshot("a", now).feedback_count, 0u);
+}
+TEST_F(RuntimeTest, PollFeedbackLeavesPendingReadAndRepliesEntirelyOnTick)
+{
+  ready();
+  const auto id = bus->read_register("a", 60, now);
+  const auto receives = transport->receives;
+  const auto count = bus->snapshot("a", now).feedback_count;
+  transport->sent.clear();
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_EQ(transport->receives, receives);
+  EXPECT_EQ(bus->snapshot("a", now).feedback_count, count);
+  EXPECT_EQ(bus->operation(id).state, OperationState::Pending);
+  EXPECT_TRUE(transport->sent.empty());
+  step();  // Only tick dispatches the read; its reply is now queued in transport.
+  ASSERT_EQ(bus->operation(id).state, OperationState::Pending);
+  const auto dispatched_receives = transport->receives;
+  transport->sent.clear();
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_EQ(transport->receives, dispatched_receives);
+  EXPECT_EQ(bus->operation(id).state, OperationState::Pending);
+  EXPECT_TRUE(transport->sent.empty());
+  step();
+  EXPECT_EQ(bus->operation(id).state, OperationState::Confirmed);
+}
+TEST_F(RuntimeTest, PollFeedbackCannotAdvanceModeWriteReadbackOrAutoEnable)
+{
+  ready();
+  const auto id = bus->set_mode("a", Mode::Velocity, now);
+  step();  // Dispatch write, but do not consume its echo or issue readback.
+  ASSERT_EQ(bus->operation(id).state, OperationState::Pending);
+  const auto receives = transport->receives;
+  transport->sent.clear();
+  now += 0.02; bus->poll_feedback(now);
+  EXPECT_EQ(transport->receives, receives);
+  EXPECT_TRUE(transport->sent.empty());
+  EXPECT_EQ(bus->operation(id).state, OperationState::Pending);
+  EXPECT_EQ(bus->snapshot("a", now).mode, Mode::Mit);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Disabled);
+  EXPECT_EQ(await(id).state, OperationState::Confirmed);
+  EXPECT_EQ(bus->snapshot("a", now).mode, Mode::Velocity);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Disabled);
+  EXPECT_FALSE(std::any_of(transport->sent.begin(), transport->sent.end(), [](const Frame & f) {
+    return f.data[7] == 0xfc && std::all_of(f.data.begin(), f.data.begin() + 7,
+      [](uint8_t b) {return b == 0xff;});
+  }));
+}
+TEST_F(RuntimeTest, PollFeedbackCannotRefreshPublisherDeadlineOrRunPeriodicSafety)
+{
+  ready(); enable("a");
+  Target target; target.torque = 0.1;
+  bus->command("a", target, now);
+  transport->receive(); transport->sent.clear();
+  for (unsigned i = 0; i < 26; ++i) {
+    transport->injected.push_back(feedback_frame(1, 0, {1, 0, 0, 0, 28, 29}, {}));
+    now += 0.01; bus->poll_feedback(now);
+  }
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Enabled);
+  EXPECT_TRUE(transport->sent.empty());
+  step();
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Fault);
+  EXPECT_EQ(bus->snapshot("a", now).error, "command publisher timeout");
+}
+TEST_F(RuntimeTest, PollFeedbackSendsDeviceFaultStopImmediatelyWithoutRepeatingIt)
+{
+  ready(); enable("a");
+  transport->receive(); transport->sent.clear();
+  transport->sim.inject_fault(1, 0xb);
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Fault);
+  EXPECT_TRUE(bus->snapshot("a", now).device_fault);
+  EXPECT_FALSE(bus->snapshot("a", now).host_fault);
+  ASSERT_EQ(transport->sent.size(), 1u);
+  EXPECT_EQ(transport->sent[0].id, 1);
+  EXPECT_EQ(transport->sent[0].data, special_frame(1, 0xfd).data);
+  now += 0.06; bus->poll_feedback(now);
+  EXPECT_EQ(transport->sent.size(), 1u);
+}
+TEST_F(RuntimeTest, PollFeedbackUnexpectedEnableStopsWithoutSendingAnyEnable)
+{
+  ready(); transport->receive(); transport->sent.clear();
+  transport->injected.push_back(feedback_frame(1, 0, {1, 0, 0, 0, 28, 29}, {}));
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_TRUE(bus->snapshot("a", now).host_fault);
+  EXPECT_EQ(bus->snapshot("a", now).error, "unexpected external enable");
+  ASSERT_EQ(transport->sent.size(), 1u);
+  EXPECT_EQ(transport->sent[0].data, special_frame(1, 0xfd).data);
+  transport->sent.clear();
+  now += 0.06; bus->poll_feedback(now);
+  EXPECT_TRUE(transport->sent.empty());  // Retry remains on the periodic path.
+  step();
+  ASSERT_FALSE(transport->sent.empty());
+  EXPECT_EQ(transport->sent[0].data, special_frame(1, 0xfd).data);
+}
+TEST_F(RuntimeTest, PollFeedbackOutOfOrderAcquisitionStopsBeforeNextTick)
+{
+  ready(); enable("a");
+  transport->receive(); transport->sent.clear();
+  auto frame = feedback_frame(1, 0, {1, 0, 0, 0, 28, 29}, {});
+  frame.received_steady = static_cast<uint64_t>(std::llround((now - 0.001) * 1e9));
+  transport->injected.push_back(frame);
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_TRUE(bus->snapshot("a", now).host_fault);
+  EXPECT_FALSE(bus->snapshot("a", now).absolute_position_valid);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Fault);
+  ASSERT_EQ(transport->sent.size(), 1u);
+  EXPECT_EQ(transport->sent[0].data, special_frame(1, 0xfd).data);
+}
+TEST_F(RuntimeTest, PollFeedbackLatchesIoFailureAndKeepsDiagnosticCallbacksAlive)
+{
+  ready(); enable("a");
+  transport->broken = true;
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_TRUE(bus->snapshot("a", now).host_fault);
+  EXPECT_TRUE(bus->snapshot("b", now).host_fault);
+  const auto error = bus->snapshot("a", now).error;
+  transport->broken = false;
+  transport->receive(); transport->sent.clear();
+  const auto before = bus->snapshot("a", now).feedback_count;
+  unsigned callbacks = 0;
+  bus->set_feedback_callback([&](const std::string &, const MotorSnapshot &, double) {++callbacks;});
+  transport->injected.push_back(feedback_frame(1, 0, {0, 0, 0, 0, 28, 29}, {}));
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_EQ(callbacks, 1u);
+  EXPECT_EQ(bus->snapshot("a", now).feedback_count, before + 1);
+  EXPECT_EQ(bus->snapshot("a", now).phase, Phase::Fault);
+  EXPECT_EQ(bus->snapshot("a", now).error, error);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_TRUE(transport->sent.empty());
+  EXPECT_THROW(bus->enable("a", now), std::runtime_error);
+}
+TEST_F(RuntimeTest, PollFeedbackReceiveFailureStopsAllModesWhenTransportStillWrites)
+{
+  ready(); transport->receive(); transport->sent.clear();
+  transport->receive_broken = true;
+  now += 0.001; bus->poll_feedback(now);
+  EXPECT_FALSE(bus->ready());
+  ASSERT_EQ(transport->sent.size(), 8u);
+  for (const auto & frame : transport->sent) {
+    EXPECT_EQ(frame.data, special_frame(1, 0xfd).data);
+  }
+}
+TEST(RuntimePollClock, PollAndTickShareMonotonicClockEvenWhenPollIsGated)
+{
+  for (unsigned scenario = 0; scenario < 3; ++scenario) {
+    Bus local(make_sim_transport(configuration()), configuration(), true);
+    if (scenario == 0) {local.tick(1.0); local.poll_feedback(0.999);}
+    else if (scenario == 1) {local.poll_feedback(1.0); local.tick(0.999);}
+    else {local.poll_feedback(1.0); local.poll_feedback(0.999);}
+    EXPECT_FALSE(local.ready());
+    EXPECT_EQ(local.snapshot("a", 1).phase, Phase::Fault);
+    EXPECT_EQ(local.snapshot("a", 1).error, "invalid or non-monotonic bus clock");
+  }
+  for (double invalid : {-0.001, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    Bus local(make_sim_transport(configuration()), configuration(), true);
+    local.poll_feedback(invalid);
+    EXPECT_EQ(local.snapshot("a", 1).error, "invalid or non-monotonic bus clock");
+  }
+}
 TEST_F(RuntimeTest, FeedbackQueueDelayDoesNotRefreshAcquisitionTimeOrWatchdog)
 {
   ready(); enable("a");
@@ -364,6 +599,160 @@ TEST_F(RuntimeTest, StartupModeConfigurationNeverWritesWhileMotorIsEnabled)
   EXPECT_TRUE(std::none_of(transport->sent.begin(), transport->sent.end(), [](const Frame & frame) {
     return frame.id == 0x7ff && frame.data[2] == 0x55 && frame.data[3] == 10;
   }));
+}
+
+TEST_F(RuntimeTest, DefaultStartupLeavesVelocityBandwidthCompletelyUntouched)
+{
+  transport->initial_bandwidth(1, 40);
+  transport->initial_bandwidth(2, 80);
+  ready();
+  EXPECT_EQ(transport->bandwidth_reads, 0u);
+  EXPECT_EQ(transport->bandwidth_writes, 0u);
+  EXPECT_EQ(transport->sim.register_value(1, 32), float_bits(40));
+  EXPECT_EQ(transport->sim.register_value(2, 32), float_bits(80));
+}
+
+TEST_F(RuntimeTest, StartupBandwidthAlreadyMatchedReadsWithoutWriting)
+{
+  auto desired = configuration();
+  for (auto & c : desired) {c.startup_velocity_bandwidth = 100;}
+  auto remote = std::make_unique<RecordingTransport>(configuration()); transport = remote.get();
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  ready();
+  EXPECT_EQ(transport->bandwidth_reads, 2u);
+  EXPECT_EQ(transport->bandwidth_writes, 0u);
+}
+
+TEST_F(RuntimeTest, StartupBandwidthReadsWritesAndIndependentlyConfirmsRamWithoutEnableOrSave)
+{
+  auto desired = configuration();
+  for (auto & c : desired) {c.startup_velocity_bandwidth = 100;}
+  auto remote = std::make_unique<RecordingTransport>(configuration()); transport = remote.get();
+  transport->initial_bandwidth(1, 40, true);
+  transport->initial_bandwidth(2, 80, true);
+  transport->sim.set_position(1, 7.5); transport->sim.set_position(2, -8.5);
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  ready();
+  EXPECT_EQ(transport->bandwidth_reads, 4u);
+  EXPECT_EQ(transport->bandwidth_writes, 2u);
+  for (const auto & c : desired) {
+    std::vector<uint8_t> sequence;
+    for (const auto & frame : transport->sent) {
+      if (frame.id == 0x7ff && frame.data[0] == c.id && frame.data[3] == 32) {
+        sequence.push_back(frame.data[2]);
+      }
+    }
+    EXPECT_EQ(sequence, (std::vector<uint8_t>{0x33, 0x55, 0x33}));
+    EXPECT_EQ(transport->sim.register_value(c.id, 32), float_bits(100));
+    EXPECT_EQ(bus->snapshot(c.name, now).feedback.status, 0);
+  }
+  EXPECT_NEAR(bus->snapshot("a", now).absolute_position, 7.5, 0.001);
+  EXPECT_NEAR(bus->snapshot("b", now).absolute_position, -8.5, 0.001);
+  EXPECT_TRUE(std::none_of(transport->sent.begin(), transport->sent.end(), [](const Frame & frame) {
+    return (frame.id == 0x7ff && frame.data[2] == 0xaa) ||
+      (frame.id != 0x7ff && (frame.data[7] == 0xfc || frame.data[7] == 0xfe || frame.data[7] == 0xfb));
+  }));
+  bus->disable("a", now); bus->disable("b", now); step(10);
+  EXPECT_EQ(transport->bandwidth_writes, 2u);  // STOP does not restore this profile's RAM setting.
+  EXPECT_EQ(transport->sim.register_value(1, 32), float_bits(100));
+  transport->sim.power_cycle(1); transport->sim.power_cycle(2);
+  EXPECT_EQ(transport->sim.register_value(1, 32), float_bits(40));
+  EXPECT_EQ(transport->sim.register_value(2, 32), float_bits(80));
+}
+
+TEST_F(RuntimeTest, StartupBandwidthWriteEchoOrDifferentReadbackCannotMakeReadyOrRetry)
+{
+  auto desired = configuration(); desired[0].startup_velocity_bandwidth = 100;
+  auto remote = std::make_unique<RecordingTransport>(configuration()); transport = remote.get();
+  transport->initial_bandwidth(1, 40); transport->ignore_bandwidth_write = true;
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  step(300);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_NE(bus->initialization_error().find("readback differs"), std::string::npos);
+  EXPECT_EQ(transport->bandwidth_writes, 1u);
+  EXPECT_EQ(transport->bandwidth_reads, 2u);
+  EXPECT_EQ(transport->sim.register_value(1, 32), float_bits(40));
+  EXPECT_THROW(bus->enable("a", now), std::runtime_error);
+  EXPECT_TRUE(std::all_of(desired.begin(), desired.end(), [&](const MotorConfig & c) {
+    return bus->snapshot(c.name, now).host_fault && bus->snapshot(c.name, now).feedback.status == 0;
+  }));
+}
+
+TEST_F(RuntimeTest, StartupBandwidthLostReadbackIsUnknownWithoutAutomaticRewrite)
+{
+  auto desired = configuration(); desired[0].startup_velocity_bandwidth = 100;
+  auto remote = std::make_unique<RecordingTransport>(configuration()); transport = remote.get();
+  transport->initial_bandwidth(1, 40); transport->drop_bandwidth_readback = true;
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  step(300);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_NE(bus->initialization_error().find("outcome unknown"), std::string::npos);
+  EXPECT_NE(bus->initialization_error().find("register=32"), std::string::npos);
+  EXPECT_EQ(transport->bandwidth_writes, 1u);
+  EXPECT_EQ(transport->sim.register_value(1, 32), float_bits(100));
+  EXPECT_THROW(bus->enable("a", now), std::runtime_error);
+}
+
+TEST_F(RuntimeTest, StartupBandwidthRechecksDisabledStateAtActualWriteDispatch)
+{
+  auto desired = configuration(); desired[0].startup_velocity_bandwidth = 100;
+  auto remote = std::make_unique<RecordingTransport>(configuration()); transport = remote.get();
+  transport->initial_bandwidth(1, 40);
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  for (unsigned i = 0; i < 200 && transport->bandwidth_reads == 0; ++i) {step();}
+  ASSERT_EQ(transport->bandwidth_reads, 1u);
+  // An external source changes device state after the first read was sent.
+  transport->sim.send(special_frame(1, 0xfc));
+  transport->sim.send(query_frame(1));
+  step(150);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_EQ(transport->bandwidth_writes, 0u);
+  EXPECT_EQ(transport->sim.register_value(1, 32), float_bits(40));
+  EXPECT_NE(bus->initialization_error().find("disabled maintenance precondition changed"), std::string::npos);
+}
+
+TEST_F(RuntimeTest, StartupBandwidthWaitsForReservationAndRejectsStaleWritePrecondition)
+{
+  auto desired = configuration(); desired[0].startup_velocity_bandwidth = 100;
+  auto remote = std::make_unique<RecordingTransport>(configuration()); transport = remote.get();
+  transport->initial_bandwidth(1, 40);
+  bus = std::make_unique<Bus>(std::move(remote), desired, true);
+  for (unsigned i = 0; i < 200 && transport->bandwidth_reads == 0; ++i) {step();}
+  ASSERT_EQ(transport->bandwidth_reads, 1u);
+  transport->reserved = false; transport->sim.drop_replies(true);
+  step(30);
+  EXPECT_EQ(transport->bandwidth_writes, 0u);
+  EXPECT_FALSE(bus->ready());
+  transport->reserved = true;
+  step(150);
+  EXPECT_EQ(transport->bandwidth_writes, 0u);
+  EXPECT_FALSE(bus->ready());
+  EXPECT_NE(bus->initialization_error().find("disabled maintenance precondition changed"), std::string::npos);
+}
+
+TEST_F(RuntimeTest, StartupBandwidthRejectsInvalidDeviceValueBeforeWriting)
+{
+  for (const auto value : {0.0f, 500.0f, std::numeric_limits<float>::quiet_NaN()}) {
+    auto desired = configuration(); desired[0].startup_velocity_bandwidth = 100;
+    auto remote = std::make_unique<RecordingTransport>(configuration()); transport = remote.get();
+    transport->bandwidth_read_override = float_bits(value);
+    bus = std::make_unique<Bus>(std::move(remote), desired, true); now = 0;
+    step(200);
+    EXPECT_FALSE(bus->ready());
+    EXPECT_EQ(transport->bandwidth_writes, 0u);
+    EXPECT_NE(bus->initialization_error().find("startup V_BW readback"), std::string::npos);
+  }
+}
+
+TEST(RuntimeInitialization, RejectsInvalidStartupBandwidthBeforeAnyIo)
+{
+  for (const auto value : {-1.0, 500.0, 501.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), std::numeric_limits<double>::denorm_min(),
+      std::nextafter(500.0, 0.0)})
+  {
+    auto c = configuration(); c[0].startup_velocity_bandwidth = value;
+    EXPECT_THROW(Bus(make_sim_transport(configuration()), c, true), std::invalid_argument) << value;
+  }
 }
 TEST_F(RuntimeTest, StartupAnchorsEachMotorOnceAtMultiTurnPosition)
 {

@@ -31,24 +31,30 @@ from .report_jobs import ReportJobs
 from .merged_analysis import ReanalysisJobs
 from .stage_parameters import parameter_schema, workflow_test_profile
 from .system_parameters import load_model, tested_calibration
+from .speed_sweep_report import speed_sweep_analysis, speed_sweep_plot, verify_speed_sweep_inputs
 from .dashboard_data import (
     ACTIVE_PHASES, DISPLAY_FIELDS, MAX_SNAPSHOT_ROWS, DisplayBuffer, decode_object, display_trace, friction_plot,
-    model_curves, normalize_drag_settings, normalize_settings,
+    model_curves, normalize_drag_settings, normalize_settings, quick_shared_ranges,
 )
 
 
 RUN_NAME = re.compile(r"^\d{8}T\d{6}-[0-9a-f]{8}$")
 ARTIFACTS = {"samples.csv", "report.json", "calibration.json", "breakaway.json", "display.json", "precision.json",
-             "fourier.json", "static.json", "warmup.json", "recording.json", "feedback.csv", "state.csv", "commands.csv", "events.csv",
+             "low_speed.json", "low_speed_samples.csv", "low_speed_plan.json",
+             "quick.json", "quick_plan.json", "quick_sources.json", "driver_configuration.json",
+             "quick_adaptation.json", "requested_configuration.json", "all_samples.csv", "pilot_samples.csv",
+             "fourier.json", "static.json", "warmup.json", "recording.json", "raw_recording.json", "feedback.csv", "state.csv", "commands.csv", "events.csv",
+             "position_observation.csv",
              "inputs.json", REPORT_NAME, REPORT_META}
+ARTIFACTS.update({"analysis.json", "REPORT.md", "plot_data.json", "analysis_source.py", "imported_source_report.json"})
 
 
-def saved_motion(path: Path) -> tuple[list, tuple]:
+def saved_motion(path: Path, *, extra_fields: tuple[str, ...] = ()) -> tuple[list, tuple]:
     """Recover a whole-run overview without loading an unbounded CSV into RAM."""
     fields, rows = (), []
     for row in csv_rows(path):
         if not fields:
-            fields = tuple(name for name in DISPLAY_FIELDS if name in row)
+            fields = tuple(name for name in (*DISPLAY_FIELDS, *extra_fields) if name in row)
             if not {"time", "position", "velocity", "torque"} <= set(fields):
                 raise CalibrationError("Saved motion needs time, position, velocity and torque columns")
         values = [float(row[name]) for name in fields]
@@ -206,7 +212,8 @@ class Dashboard(Node):
                                      "drag_manual_stop": bool(self.state and self.state.get("drag_stop_policy") == "operator"),
                                      "drag_operator_speed": bool(self.state and self.state.get("drag_speed_policy") == "operator"),
                                      "fault_reset": bool(self.state and "can_reset_fault" in self.state),
-                                     "stage_parameters": bool(self.state and "protocol_mode" in self.state["configuration"])},
+                                     "stage_parameters": bool(self.state and "protocol_mode" in self.state["configuration"]),
+                                     "quick_excitation": bool(self.state and "quick_excitation" in self.state["configuration"])},
                     "services_ready": self.control.service_is_ready()}
 
     def reanalyze(self, body: dict) -> dict:
@@ -300,6 +307,10 @@ class Dashboard(Node):
             state = snapshot["state"]
             if not snapshot["connected"] or state is None:
                 raise ApiError(503, "标定器状态陈旧；请等待连接恢复")
+            if (settings.get("experiment", state["experiment"]) == "calibrate" and
+                    settings.get("quick_excitation") == "auto" and
+                    "quick_excitation" not in state["configuration"]):
+                raise ApiError(409, "当前节点尚不支持自动激励，请使用固定参数或更新节点")
             if drag and (not start or state.get("drag_speed_policy") != "operator"):
                 raise ApiError(409, "当前标定节点尚不支持操作者控制拖动速度，请先更新节点")
             if state["phase"] in ACTIVE_PHASES or not state["stop_confirmed"]:
@@ -398,9 +409,15 @@ class Dashboard(Node):
                 if report.get("status") == "checking" and self.state and self.state["run_id"] == directory.name:
                     entry.update(status=self.state["phase"], experiment=self.state["experiment"],
                                  samples=self.state["samples"])
-                analysis = report.get(report.get("experiment"))
+                analysis = report.get("quick") if report.get("experiment") == "calibrate" else report.get(report.get("experiment"))
                 candidate = analysis.get("candidate_model") if isinstance(analysis, dict) else None
-                if (directory / "calibration.json").exists() or isinstance(candidate, dict):
+                sweep = speed_sweep_analysis(report)
+                if sweep is not None:
+                    entry.update(model=(candidate or {}).get("model"), eligible=False,
+                                 automatic_qualified=False, prediction_qualified=sweep.get("prediction_qualified"),
+                                 quality_issues=sweep.get("quality_issues", []), domain=(candidate or {}).get("domain"),
+                                 save_blocked_reason="独立高速滑动候选未发布生产补偿参数")
+                elif (directory / "calibration.json").exists() or isinstance(candidate, dict):
                     filename = "calibration.json" if (directory / "calibration.json").exists() else "report.json"
                     path = self.artifact(directory.name, filename)
                     artifact = load_model(path, self.state["identity"] if self.state else None,
@@ -409,6 +426,7 @@ class Dashboard(Node):
                     entry.update(eligible=fit.kind == "mechanical" and report.get("status") in ("completed", "completed_unqualified")
                                  and report.get("stop_confirmed") is True,
                                  calibration_file=str(path), model=fit.model, domain=fit.domain,
+                                 shared_ranges=quick_shared_ranges(report.get("quick")),
                                  automatic_qualified=artifact.qualified, quality_issues=list(artifact.quality_issues),
                                  model_warnings=list(fit.warnings),
                                  quality={"validation_rmse": fit.diagnostics.get("validation_rmse"),
@@ -448,12 +466,18 @@ class Dashboard(Node):
         artifacts = [name for name in sorted(ARTIFACTS) if (root / run / name).is_file()]
         fit = None
         model_error = ""
+        sweep = speed_sweep_analysis(report)
+        if sweep is not None:
+            verify_speed_sweep_inputs(root / run, report)
         try:
-            if "calibration.json" in artifacts:
+            if sweep is not None:
+                pass  # Sliding-only candidates must not enter ModelResult or deployment loading.
+            elif "calibration.json" in artifacts:
                 fit = FitResult.load(self.artifact(run, "calibration.json"))
             elif isinstance(report.get("source_fit"), dict):
                 fit = ModelResult.from_mapping(report["source_fit"])
-            elif isinstance(report.get(report.get("experiment")), dict) and report[report["experiment"]].get("candidate_model"):
+            elif ((report.get("quick") if report.get("experiment") == "calibrate" else
+                   report.get(report.get("experiment"))) or {}).get("candidate_model"):
                 fit = load_model(self.artifact(run, "report.json"), report=report).result
         except (CalibrationError, ValueError, OSError) as error:
             model_error = f"模型读取失败：{error}"
@@ -463,7 +487,11 @@ class Dashboard(Node):
             metadata = read_json(self.artifact(run, "recording.json"))
             usage = metadata.get("data_usage")
         manual_drag = report.get("configuration", {}).get("drag_stop_policy") == "operator"
-        trace = Trace.read(self.artifact(run, "samples.csv")) if "samples.csv" in artifacts and not (precision or manual_drag) else None
+        low_speed = report.get("experiment") == "low_speed"
+        adaptive = bool(report.get("quick_adaptation"))
+        formal_available = not (low_speed or sweep is not None) and (not adaptive or type(report.get("samples")) is int and report["samples"] >= 3)
+        trace = Trace.read(self.artifact(run, "samples.csv")) if "samples.csv" in artifacts and formal_available and not (precision or manual_drag) else None
+        motion_file = "all_samples.csv" if adaptive and "all_samples.csv" in artifacts else "samples.csv"
         display_fields = DISPLAY_FIELDS
         display = None
         if "display.json" in artifacts:
@@ -474,25 +502,37 @@ class Dashboard(Node):
             buffer.update(run, len(display["trace"]), display["trace"])
             displayed = buffer.after(-1)
         else:
-            displayed = display_trace(trace) if trace is not None else []
+            displayed = display_trace(trace) if trace is not None and motion_file == "samples.csv" else []
         # Older/offline experiments may have no display cache; a drag cache can
         # contain only its tail. Stream raw samples with a bounded plot budget.
         trace_error = ""
-        if "samples.csv" in artifacts and (not displayed or display and display.get("truncated")):
+        if motion_file in artifacts and (motion_file == "all_samples.csv" or not displayed or display and display.get("truncated")):
             try:
-                displayed, display_fields = saved_motion(self.artifact(run, "samples.csv"))
+                displayed, display_fields = saved_motion(self.artifact(run, motion_file),
+                                                         extra_fields=("trial_index",) if sweep is not None else ())
             except (CalibrationError, ValueError, OSError) as error:
                 trace_error = f"运动记录恢复失败：{error}"
         plot, plot_error = None, ""
+        if sweep is not None:
+            plot = speed_sweep_plot(sweep)
         if isinstance(report.get("fourier"), dict):
             plot = report["fourier"].get("validation_friction") or report["fourier"].get("training_friction")
         if fit is not None:
             plot = plot or {"kind": "model_only", "points": [], "curves": model_curves(fit)}
             if trace is not None and report.get("experiment") == "calibrate":
                 try:
-                    plot = friction_plot(trace, fit)
+                    plotted_trace = trace
+                    if isinstance(report.get("quick"), dict):
+                        selected = trace.columns["leg"] == 1
+                        plotted_trace = Trace.of(**{key: values[selected] for key, values in trace.columns.items()})
+                    plot = friction_plot(plotted_trace, fit)
+                    if isinstance(report.get("quick"), dict):
+                        plot["source_role"] = "external_validation"
                 except CalibrationError as error:
                     plot_error = str(error)
+            if isinstance(report.get("quick"), dict):
+                plot["shared_ranges"] = quick_shared_ranges(report["quick"])
+                plot["curves"] = model_curves(fit, shared_ranges=plot["shared_ranges"])
         if precision and isinstance(report.get("precision"), dict):
             points = []
             for entry in report["precision"].get("levels", []):
@@ -504,9 +544,9 @@ class Dashboard(Node):
                     point.append(entry["ci95"])
                 points.append(point)
             plot = {"kind": "precision_steady", "points": points, "curves": model_curves(fit) if fit else []}
-        return {"id": run, "report": report, "fit": asdict(fit) if fit else None,
+        return {"id": run, "report": report, "fit": sweep.get("candidate_model") if sweep is not None else asdict(fit) if fit else None,
                 "trace": displayed,
-                "raw_samples": report.get("samples", 0) if precision or manual_drag else len(trace.columns["time"]) if trace is not None else 0,
+                "raw_samples": report.get("samples", 0) if precision or manual_drag or low_speed or sweep is not None else len(trace.columns["time"]) if trace is not None else 0,
                 "plot": plot, "plot_error": plot_error, "model_error": model_error, "trace_error": trace_error,
                 "artifacts": artifacts,
                 "data_usage": {key: value for key, value in usage.items() if key != "segments"} if usage else None,
@@ -598,6 +638,7 @@ class Handler(SharedHandler):
                 if state is None or "stage_defaults" not in state:
                     raise ApiError(503, "当前标定节点尚不支持阶段参数，请在失能后更新节点")
                 self.json_response(200, {**parameter_schema(state.get("constraint_bounds")), "defaults": state["stage_defaults"],
+                                        "quick_profile": state.get("quick_profile"),
                                         "test_profiles": {name: workflow_test_profile(name) for name in ("precision", "fourier")}})
             elif url.path == "/api/run":
                 self.json_response(200, node.run_details(args.get("run", [""])[0]))

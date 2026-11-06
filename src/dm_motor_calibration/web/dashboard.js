@@ -6,7 +6,7 @@ if (typeof document !== "undefined") (() => {
   let formVersion = "", selectedRun = "", detail = null, detailKey = "", lastHistory = 0, historyBusy = false;
   let lastRenderedEvents = "", lastFit = "", lastComparison = "", lastDownloads = "", lastConfiguration = "", chartQueued = false;
   let connectionFailed = false, runs = [], followLatest = true, draftMode = false, historyLoaded = false;
-  let formContext = "", savedDraft = null;
+  let formContext = "";
   let pendingVersion = null;
   let lastPrecision = "";
   let chartCursor = null, motionCache = null;
@@ -15,6 +15,7 @@ if (typeof document !== "undefined") (() => {
   let stageSchema = null, stageSchemaController = "", stageDraft = {}, dialogStage = "", dialogVersion = "";
   let stageInputs = {};
   let calibrationSignature = "", calibrationController = "", dragInitialized = false;
+  let quickDraftSeed = null, quickDraftEdited = false;
   let dragWasRunning = false;
   let dragController = "";
   let saveContext = "";
@@ -128,33 +129,75 @@ if (typeof document !== "undefined") (() => {
       busy = false; render();
     }
   });
-  function fillForm(state) {
+  function applyDraftValues(values) {
+    for (const [name, value] of Object.entries(values)) {
+      if (elements[name]) {
+        if (V.bools.has(name)) elements[name].checked = value;
+        else elements[name].value = value;
+      } else stageDraft[name] = value;
+    }
+  }
+  function fillForm(state, quick = false) {
     const config = calibrationConfig(state);
     options();
     for (const name of V.editable) {
       if (V.bools.has(name)) elements[name].checked = config[name] ?? name.startsWith("collect_");
-      else elements[name].value = config[name];
+      else elements[name].value = config[name] ?? (name === "quick_excitation" ? "fixed" : "");
     }
-    if (elements.experiment.value === "compensate" || !elements.experiment.value) elements.experiment.value = "fourier";
+    if (elements.experiment.value === "compensate" || !elements.experiment.value) elements.experiment.value = "calibrate";
     dirty = false;
     stageDraft = {};
     formVersion = version(state);
     calibrationSignature = JSON.stringify(config); calibrationController = state.controller_id;
+    quickDraftSeed = null; quickDraftEdited = false;
+    if (quick) {
+      const profile = V.quickProfile(stageSchema);
+      const settings = Object.fromEntries(Object.entries(profile?.settings || {}).filter(([name]) =>
+        V.editable.includes(name) || name === "protocol_mode"));
+      applyDraftValues({...settings, experiment: "calibrate", calibration_file: "",
+        collect_warmup: false, collect_static: false, collect_training: true, collect_validation: true});
+      quickDraftSeed = quickProfileKey(profile);
+      dirty = true;
+    }
     hints();
   }
   function hints() {
     const precision = elements.experiment.value === "precision";
-    $("calibration-choice").hidden = ["calibrate", "precision", "fourier"].includes(elements.experiment.value);
-    $("calibration_file").required = !["calibrate", "precision", "fourier"].includes(elements.experiment.value);
+    $("quick-excitation-choice").hidden = !draftMode || elements.experiment.value !== "calibrate";
+    $("calibration-choice").hidden = ["calibrate", "precision", "fourier", "low_speed"].includes(elements.experiment.value);
+    $("calibration_file").required = !["calibrate", "precision", "fourier", "low_speed"].includes(elements.experiment.value);
     text("calibration-summary", precision ? "双向分档表 · 各步骤分别配置参数。"
+      : elements.experiment.value === "low_speed" ? "正反向固定区间采样，不需要旧摩擦模型；速度档和重复数使用节点配置。"
       : ["fourier", "calibrate"].includes(elements.experiment.value)
         ? `摩擦模型：${V.models[elements.model.value] || elements.model.value} · 在“模型计算 → 参数”中调整。`
         : "此任务使用已有模型；轨迹 / 时长在对应采集步骤的参数中调整。");
   }
-  function changed() { dirty = true; hints(); render(); }
+  function quickProfileKey(profile) {
+    return profile ? JSON.stringify([snapshot?.state?.controller_id, profile.settings, profile.selection]) : null;
+  }
+  function quickProfileReason(profile) {
+    const reason = profile?.selection?.reason || "";
+    const hints = [
+      ["No explicit local", "尚未配置匹配的验证来源"], ["Complete motor identity", "等待新鲜电机身份确认"],
+      ["another host", "方案属于其他主机"], ["identity/coordinates/ranges", "电机身份、坐标或范围不匹配"],
+      ["hash changed", "来源报告已变化"], ["context changed", "当前参数与验证来源不一致"],
+      ["deferred", "运行结束后更新方案来源"], ["travel limits", "激励超出当前行程范围"],
+      ["Reference speed bound", "激励超出当前速度范围"], ["No such file", "来源报告不可读"],
+    ];
+    return hints.find(([key]) => reason.includes(key))?.[1] || V.reason(reason);
+  }
+  function quickDraftSource(profile) {
+    if (quickDraftEdited) return "自定义草稿 · 参数已修改，尚未验证。";
+    if (!profile || profile.available === false) return "快速方案暂不可用。";
+    if (quickDraftSeed !== quickProfileKey(profile)) return "未验证草稿 · 方案来源已变化，请重新载入快速预设。";
+    if (profile.selection?.status === "validated_local") return "本机已验证方案 · 本轮仍须独立验证。";
+    const reason = quickProfileReason(profile);
+    return `未验证启动候选${reason ? `：${reason}` : ""}。`;
+  }
+  function changed() { dirty = true; quickDraftEdited = true; hints(); render(); }
   for (const element of Object.values(elements)) element.addEventListener("input", changed);
   elements.experiment.addEventListener("change", () => {
-    if (!["calibrate", "precision", "fourier"].includes(elements.experiment.value) && !elements.calibration_file.value) {
+    if (!["calibrate", "precision", "fourier", "low_speed"].includes(elements.experiment.value) && !elements.calibration_file.value) {
       const recent = runs.find(run => run.eligible);
       if (recent) elements.calibration_file.value = recent.calibration_file;
     }
@@ -197,7 +240,8 @@ if (typeof document !== "undefined") (() => {
         stageInputs.known_bias.disabled = $("stage-parameter-save").disabled || stageInputs.fit_bias.checked;
       text("stage-parameter-estimate", dialogStage === "constraints"
         ? "每项允许范围以当前控制器提供的预算为准；后端会原子校验全部关联条件，任一失败则整批不应用。"
-        : V.stageEstimate(dialogStage, config, elements.experiment.value));
+        : V.stageEstimate(dialogStage, config, elements.experiment.value,
+          draftMode ? Boolean(V.quickProfile(stageSchema)) : viewed().report?.quick?.protocol === V.quickProtocol));
       stageDialogError("");
     } catch (error) { stageDialogError(error.message); }
   }
@@ -211,7 +255,9 @@ if (typeof document !== "undefined") (() => {
     text("stage-parameter-note", !prepared && ["training", "validation", "static"].includes(id)
       ? experiment === "breakaway" ? "正反向各两次起动试验，时长为总预算；固定起动判据与力矩保护不变。"
         : experiment === "validate" ? "基线与补偿使用同一轨迹及增益；时长为每段时长，另计回位。手动拖动在独立测试模块启动。"
-        : "快速机械辨识使用这些激励与增益；这不是精密全速扫描。开始前仍需通过既有力矩、速度和行程检查。"
+        : (draftMode ? Boolean(V.quickProfile(stageSchema)) : viewed().report?.quick?.protocol === V.quickProtocol)
+          ? "快速机械标定先训练、后用不同轨迹独立验证；训练时长决定验证时长。仅覆盖本次实测速度域，保护边界不变。"
+          : "历史机械辨识参数；按该实验原采集与验收语义展示，不补造独立验证。"
       : group.note);
     $("identification-preset").hidden = experiment !== "calibrate" || id !== "training";
     $("validation-preset").hidden = experiment !== "validate" || !["training", "validation"].includes(id);
@@ -281,16 +327,17 @@ if (typeof document !== "undefined") (() => {
     const values = test ? stageSchema.test_profiles[elements.experiment.value] :
       {...stageSchema.defaults, protocol_mode: "full", ...Object.fromEntries(V.selectable.map(name => [`collect_${name}`, true]))};
     if (!values) { notice("此测试预设仅适用于精密稳速与傅里叶任务。", true); return; }
-    for (const [name, value] of Object.entries(values)) {
-      if (elements[name]) elements[name].checked = value;
-      else stageDraft[name] = value;
-    }
+    applyDraftValues(values);
     changed();
     notice(test ? "已填入约 2 分钟 / 采集阶段的流程测试参数，尚未运动。静摩擦与定位时间由反馈决定；结果仅供流程诊断。"
       : "已恢复节点启动时的完整标定参数，尚未提交；固定保护与验收门限未改变。");
   }
   $("stage-profile-full").addEventListener("click", () => applyStageProfile(false));
   $("stage-profile-test").addEventListener("click", () => applyStageProfile(true));
+  $("quick-profile").addEventListener("click", () => {
+    if ($("quick-profile").disabled) return;
+    fillForm(snapshot.state, true); $("confirm_hardware").checked = false; render();
+  });
 
   async function control(start) {
     const state = snapshot?.state;
@@ -305,6 +352,7 @@ if (typeof document !== "undefined") (() => {
         const key = `collect_${name}`;
         if (!(key in state.configuration)) delete body.settings[key];
       }
+      if (!("quick_excitation" in state.configuration)) delete body.settings.quick_excitation;
       if (start) body.confirm_hardware = $("confirm_hardware").checked;
       const response = await api(start ? "/api/start" : "/api/configure", body);
       notice(start ? "开始请求已接受，等待实际使能与采样；不是立即完成。"
@@ -312,11 +360,12 @@ if (typeof document !== "undefined") (() => {
       dirty = false;
       stageDraft = {};
       pendingVersion = {controller_id: state.controller_id, generation: response.generation};
-      if (start) { draftMode = false; savedDraft = null; followLatest = true; selectRun(""); }
+      if (start) { draftMode = false; followLatest = true; selectRun(""); }
     } catch (error) { notice(`操作未成功：${error.message}`, true); }
     finally { busy = false; render(); }
   }
   $("settings").addEventListener("submit", event => { event.preventDefault(); control(true); });
+  $("confirm_hardware").addEventListener("change", render);
   $("apply").addEventListener("click", () => control(false));
   async function stop() {
     try {
@@ -375,18 +424,25 @@ if (typeof document !== "undefined") (() => {
     $("drag-start").disabled = locked || driverBlocked || !model || !snapshot?.services_ready || !state?.commands_ready ||
       state?.motor_ready === false || state?.motor?.host_fault || state?.motor?.device_fault || hardwareBlocked ||
       (state?.motor?.simulated === false && !$("drag-confirm-hardware").checked);
+    const shared = V.sharedRanges(model?.shared_ranges);
     text("drag-model-note", model
       ? `${qualityLabel(model)}。辨识速度包络 ${V.number(model.domain?.velocity_min, 3)}～${V.number(model.domain?.velocity_max, 3)} rad/s；` +
+        `共有滑动范围（rad/s）：负向 ${V.sharedRangeText(shared.negative)}；正向 ${V.sharedRangeText(shared.positive)}。` +
         `验证 RMS ${V.number(model.quality?.validation_rmse, 4)} / 参考门限 ${V.number(model.quality?.rmse_limit, 4)} Nm。` +
         (model.quality_issues?.length ? ` 有 ${model.quality_issues.length} 项质量提示，请查看原报告后决定是否测试。` : "")
       : runs.some(run => run.eligible) ? "请选择模型并查看报告；自动未达标的候选也可由用户测试和评估。"
         : "当前没有身份匹配、参数完整有效的摩擦模型，不能开始补偿拖动。");
     const outside = model && state?.motor && (state.motor.velocity < model.domain?.velocity_min ||
       state.motor.velocity > model.domain?.velocity_max);
+    const uncovered = model && V.finite(state?.motor?.velocity) && !V.speedInSharedRanges(state.motor.velocity, shared);
+    const coverageNotice = !Object.keys(shared).length ? "未记录分方向共有滑动范围，无法确认当前速度的独立覆盖。"
+      : uncovered ? "当前速度未落在训练与独立验证的共有滑动范围，未获独立覆盖。" : "";
     dragElements.model.title = model ? `${model.id} · ${V.models[model.model] || model.model}` : "请选择模型";
-    $("drag-domain-alert").hidden = !(connected && outside && dragRun && running);
+    $("drag-domain-alert").hidden = !(model && connected && (outside || coverageNotice) && dragRun && running);
+    text("drag-domain-alert", `${outside ? "当前速度已超出模型速度包络。" : ""}${coverageNotice}`);
     text("drag-domain-note", model
       ? `${outside ? "当前速度已超出辨识包络。 " : ""}静止 / 死区内不主动补偿；域外模型查询会夹断，不代表域外精度已验证。` +
+        " 共有范围按离散滑动窗口均速统计，包络内和零附近也可能缺少独立覆盖。" +
         ` 标定温度 ${V.number(model.domain?.temperature_min, 0)}～${V.number(model.domain?.temperature_max, 0)} °C；` +
         `模型报告另有 ${model.model_warnings?.length || 0} 项提示。`
       : "");
@@ -469,7 +525,6 @@ if (typeof document !== "undefined") (() => {
 
   function selectRun(id) {
     if (selectedRun === id && (detailKey || !id)) return;
-    if (draftMode && dirty) savedDraft = {values: V.readValues(elements), stages: {...stageDraft}};
     $("stage-parameter-dialog").close();
     selectedRun = id;
     if (id) draftMode = false;
@@ -483,7 +538,9 @@ if (typeof document !== "undefined") (() => {
   function selectLatest() {
     const id = V.latestExperiment(runs, snapshot?.state, snapshot?.report_motor);
     selectRun(id);
-    if (!id && !snapshot?.state?.run_id && !runs.length && !dirty) draftMode = true;
+    if (!id && !snapshot?.state?.run_id && !runs.length && !dirty && !draftMode && snapshot?.state) {
+      draftMode = true; fillForm(snapshot.state, true);
+    }
   }
   async function history() {
     if (historyBusy) return;
@@ -537,12 +594,8 @@ if (typeof document !== "undefined") (() => {
     if ($("new-experiment").disabled || !snapshot?.state) return;
     $("stage-parameter-dialog").close();
     draftMode = true; followLatest = false;
-    fillForm(snapshot.state);
-    if (savedDraft) {
-      for (const [name, value] of Object.entries(savedDraft.values))
-        if (V.bools.has(name)) elements[name].checked = value; else elements[name].value = value;
-      stageDraft = {...savedDraft.stages}; dirty = true;
-    }
+    fillForm(snapshot.state, true);
+    $("experiment-tools").open = false;
     $("confirm_hardware").checked = false;
     render();
   });
@@ -623,11 +676,14 @@ if (typeof document !== "undefined") (() => {
     }
   }
   function renderFit(fit, report) {
-    const issues = report?.[report.experiment]?.quality_issues || [];
-    const key = JSON.stringify([fit, report?.breakaway_fit, report?.status, issues]);
+    const quick = report?.quick?.protocol === V.quickProtocol ? report.quick : null;
+    const sweep = report?.experiment === "speed_sweep" ? report.speed_sweep : null;
+    const issues = quick?.quality_issues || report?.[report.experiment]?.quality_issues || [];
+    const diagnostics = V.speedSweepDiagnostics(report);
+    const key = JSON.stringify([fit, report?.breakaway_fit, report?.status, issues, quick, sweep, diagnostics]);
     if (key === lastFit) return;
     lastFit = key;
-    const displayed = report?.breakaway_fit || fit;
+    const displayed = report?.breakaway_fit || fit || quick?.candidate_model || sweep?.candidate_model;
     text("fit-model", displayed ? (V.models[displayed.model] || displayed.model) + (report?.status === "completed_unqualified" ? " · 候选" : "")
       : report?.status === "completed_unqualified" ? "采集完成 · 候选结果需验证" : "等待拟合");
     $("parameter-table").replaceChildren(); $("fit-warnings").replaceChildren(); $("fit-quality").replaceChildren();
@@ -635,11 +691,62 @@ if (typeof document !== "undefined") (() => {
     text("fit-empty", report?.status === "completed_unqualified"
       ? "数据与候选结果已保存；质量指标有偏差，未发布合格补偿文件。"
       : "不会把未完成的拟合或默认值显示成标定结果。");
-    const warnings = [...new Set([...issues, ...(displayed?.warnings || [])])];
+    const warnings = [...new Set([...issues, ...(displayed?.warnings || []), ...(sweep?.limitations || [])])];
     $("quality-details").hidden = !warnings.length;
     text("quality-summary", `质量说明 · ${warnings.length} 项`);
     for (const warning of warnings) {
       const item = document.createElement("li"); item.textContent = warning; $("fit-warnings").append(item);
+    }
+    $("fit-scope").hidden = !(quick || sweep);
+    $("speed-sweep-details").hidden = !sweep;
+    $("speed-sweep-cells").replaceChildren();
+    $("speed-sweep-diagnostics").hidden = !diagnostics.length;
+    text("speed-sweep-diagnostics-summary", `准备 / 启动诊断 · ${diagnostics.length} 项（不属于正式运动轮）`);
+    $("speed-sweep-diagnostic-rows").replaceChildren();
+    for (const values of diagnostics) {
+      const row = document.createElement("tr");
+      for (const value of values) {
+        const cell = document.createElement("td"); cell.textContent = value; row.append(cell);
+      }
+      $("speed-sweep-diagnostic-rows").append(row);
+    }
+    if (sweep) {
+      const validation = sweep.external_validation || {}, coverage = sweep.coverage || {};
+      text("fit-model", `${displayed ? V.models[displayed.model] || displayed.model : "未得到候选"} · ${sweep.prediction_qualified ? "滑动预测通过" : "预测未通过"}`);
+      populateDL("fit-quality", [
+        ["独立验证 RMS / Nm", V.number(validation.rmse, 6)],
+        ["独立验证最大误差 / Nm", V.number(validation.maximum_error, 6)],
+        ["独立完成 / 计划轮次", `${coverage.complete_trials ?? "—"} / ${coverage.expected_trials ?? "—"}`],
+        ["双向实测 ≥ 4π rad/s", coverage.highest_speed_reached_both_directions ? "通过" : "未通过"],
+        ["验证速度包络 / rad/s", `${V.number(coverage.validated_velocity_min, 3)} ～ ${V.number(coverage.validated_velocity_max, 3)}`],
+      ]);
+      text("fit-scope", "独立轴稳速平台的滑动报告力矩候选。训练轮拟合，整轮独立验证只评分；速度包络不代表连续全域认证。惯量 J 和静摩擦未测量，生产参数未发布。重新联轴后的效果需另行验证。");
+      for (const cell of sweep.cells || []) {
+        const measured = (validation.errors || []).find(row => row.trial === cell.trial && row.direction === cell.direction);
+        const row = document.createElement("tr");
+        for (const content of [`${cell.trial} · ${cell.role === "validation" ? "独立验证" : "训练"}`,
+          V.number(cell.speed * cell.direction, 3), V.number(cell.measured_speed, 4), V.number(cell.time_mean_torque, 5),
+          V.number(measured?.error, 5), cell.valid ? "通过" : (cell.quality_issues || []).join("；") || "未通过"]) {
+          const td = document.createElement("td"); td.textContent = content; row.append(td);
+        }
+        $("speed-sweep-cells").append(row);
+      }
+    }
+    if (quick) {
+      const validation = quick.external_validation || {}, coverage = quick.coverage || {};
+      const shared = V.sharedRanges(coverage.directions);
+      populateDL("fit-quality", [
+        ["独立验证 RMS / Nm", V.number(validation.rmse, 6)],
+        ["独立验证最大误差 / Nm", V.number(validation.maximum_error, 6)],
+        ["独立验证窗口", validation.windows ?? "—"],
+        ["负向共有滑动 / rad/s", V.sharedRangeText(shared.negative)],
+        ["正向共有滑动 / rad/s", V.sharedRangeText(shared.positive)],
+      ]);
+      text("fit-scope", "后续不同轨迹独立评分，模型与积分窗口由训练段确定。共有范围按有效滑动窗口均速统计，不代表区间内每个速度都已验证。" +
+        (Object.keys(shared).length === 2 ? "零附近及空白区域未获独立滑动覆盖。"
+          : "部分或全部方向未记录可用共有范围，无法确认缺项速度的独立覆盖。") +
+        "静摩擦、全速与热参数需相应高级流程。" +
+        (quick.parameter_identifiability ? "惯量与各摩擦系数仍需独立验证；低残差不代表参数准确。" : ""));
     }
     if (!displayed) return;
     const labels = {inertia: "惯量 J", bias: "负载 / 零偏", coulomb: "库仑 Fc", viscous: "黏性 B",
@@ -658,13 +765,14 @@ if (typeof document !== "undefined") (() => {
       }
       $("parameter-table").append(row);
     }
-    const d = displayed.diagnostics, metrics = report?.fourier?.metrics;
-    populateDL("fit-quality", displayed.model === "tabulated"
+    const d = displayed.diagnostics, metrics = report?.fourier?.metrics, independent = d.independent_validation === 1;
+    if (!(quick || sweep)) populateDL("fit-quality", displayed.model === "tabulated"
       ? [["速度档位 / 方向", `${d.speed_bins ?? displayed.friction_table?.length ?? "—"} × 2`], ["两向实测上限 / rad/s", V.number(d.validated_max_speed, 5)],
         ["独立验证 RMS / Nm", V.number(d.validation_rmse, 6)], ["最大验证误差 / Nm", V.number(d.max_bin_error, 6)]]
       : displayed.kind === "breakaway"
       ? [["起动次数", d.trials], ["重复性 RMS / Nm", V.number(d.repeatability_rmse, 6)]]
-      : [["独立窗口", d.samples], [metrics ? "独立验证 RMS / Nm" : "留出 RMS / Nm", V.number(metrics?.validation_rmse ?? d.validation_rmse, 6)],
+      : [[independent ? "独立验证窗口" : "拟合窗口", independent ? d.external_validation_windows ?? "—" : d.samples],
+        [metrics || independent ? "独立验证 RMS / Nm" : "留出 RMS / Nm", V.number(metrics?.validation_rmse ?? d.validation_rmse, 6)],
         ["归一化条件数", V.number(metrics?.condition ?? d.condition, 2)], ["残差门限 / Nm", V.number(d.rmse_limit, 5)]]);
   }
   function renderComparison(report) {
@@ -687,6 +795,55 @@ if (typeof document !== "undefined") (() => {
       $("comparison").append(row);
     });
   }
+  function renderLowSpeed(view, state) {
+    const active = state?.experiment === "low_speed";
+    $("low-speed-panel").hidden = !active;
+    $("model-panel").hidden = active;
+    if (!active) return;
+    const report = view.report?.low_speed, progress = state.low_speed || {};
+    text("low-speed-progress", `${progress.completed_cells ?? 0}/${progress.required_cells ?? "—"} 段`);
+    text("low-speed-summary", report
+      ? `${report.acquisition_quality_passed ? "采集质量检查通过。" : "采集质量与未完成项目见下表。"}正反配对值是同位置区间、按角度加权的报告力矩半差；需结合稳速与测量通道检查，尚未发布补偿模型。`
+      : "逐速、逐向采集，随后检查固定区间覆盖、稳速和重复性。每段实际采样都会保存。" );
+    $("low-speed-pairs").replaceChildren();
+    for (const pair of report?.pairs || []) {
+      const tr = document.createElement("tr");
+      for (const value of [pair.role === "validation" ? "独立验证" : "训练", V.number(pair.speed, 3),
+        Number.isInteger(pair.repetition) ? pair.repetition + 1 : "—", V.number(pair.odd_resistance, 6),
+        V.number(pair.common_core_odd_resistance, 6), pair.quality_passed ? "通过" : "未通过"]) {
+        const td = document.createElement("td"); td.textContent = String(value); tr.append(td);
+      }
+      $("low-speed-pairs").append(tr);
+    }
+    const comparisons = (report?.pairs || []).filter(pair => Number.isFinite(pair.time_odd_reported_torque));
+    $("low-speed-estimator-comparison").hidden = !comparisons.length;
+    $("low-speed-estimator-rows").replaceChildren();
+    for (const pair of comparisons) {
+      const tr = document.createElement("tr");
+      for (const value of [pair.role === "validation" ? "独立验证" : "训练", V.number(pair.speed, 3),
+        Number.isInteger(pair.repetition) ? pair.repetition + 1 : "—", V.number(pair.time_odd_reported_torque, 6),
+        V.number(pair.angle_minus_time_odd_reported_torque, 6)]) {
+        const td = document.createElement("td"); td.textContent = String(value); tr.append(td);
+      }
+      $("low-speed-estimator-rows").append(tr);
+    }
+    $("low-speed-issues").replaceChildren();
+    const issues = [...new Set([...(report?.quality_issues || []),
+      ...(report?.cells || []).flatMap(cell => (cell.quality_issues || []).map(issue => `段 ${cell.index + 1}：${issue}`))])];
+    const reasons = {acquisition_not_complete: "采集未完成", fewer_than_three_training_repetitions: "训练重复不足3次",
+      cell_quality_failed: "部分速度段未通过质量检查", paired_quality_failed: "部分正反配对未通过",
+      independent_validation_unavailable: "独立速度验证数据尚不完整", cell_not_completed: "该段未完成",
+      not_settled_before_entry: "进入预定区间前尚未稳速", source_time_gap: "采集时间存在空档",
+      position_ols_target_error: "实测平均速度偏离目标", position_ols_subwindow_ripple: "区间内速度起伏过大",
+      command_saturation: "采集期间出现指令预算缩放", position_reversal: "区间内累计反向位置报告超过门限",
+      unattributed_observations_in_interval: "区间内存在未能确认采集阶段的反馈"};
+    for (const issue of issues) {
+      let label = issue;
+      for (const [code, meaning] of Object.entries(reasons)) label = label.replace(code, meaning);
+      const li = document.createElement("li"); li.textContent = label; $("low-speed-issues").append(li);
+    }
+  }
+
   function renderPrecision(view, state) {
     const precise = state?.experiment === "precision";
     $("precision-panel").hidden = !precise;
@@ -772,6 +929,7 @@ if (typeof document !== "undefined") (() => {
       : snapshot.error || (live?.motor?.host_fault || live?.motor?.device_fault ? V.reason(motor.error || live.blocked_reason) : "");
     text("connection-notice", connectionMessage); $("connection-notice").hidden = !connectionMessage;
     $("new-experiment").disabled = !connected || running || busy || Boolean(pendingVersion) || !live?.stop_confirmed;
+    $("new-experiment").hidden = draftMode;
     document.querySelector(".workspace").classList.toggle("viewing-record", !draftMode);
     text("control-title", draftMode ? "新实验" : "实验过程");
     $("calibration-summary").hidden = !draftMode;
@@ -787,7 +945,7 @@ if (typeof document !== "undefined") (() => {
       if (context !== formContext) {
         for (const name of V.editable) {
           if (V.bools.has(name)) elements[name].checked = state.configuration[name] ?? name.startsWith("collect_");
-          else elements[name].value = state.configuration[name] ?? "";
+          else elements[name].value = state.configuration[name] ?? (name === "quick_excitation" ? "fixed" : "");
         }
         elements.experiment.value = state.experiment;
         formContext = context; hints();
@@ -799,33 +957,72 @@ if (typeof document !== "undefined") (() => {
     const conflict = draftMode && dirty && live && formVersion !== version(live);
     const locked = !draftMode || !connected || running || busy || Boolean(pendingVersion);
     $("editable").disabled = locked;
+    $("advanced-editable").disabled = locked;
     $("start").disabled = locked || !snapshot?.services_ready || !live?.can_start || !live?.commands_ready || Boolean(conflict);
+    if (motor?.simulated === false && !$("confirm_hardware").checked) $("start").disabled = true;
+    const quick = elements.experiment.value === "calibrate", quickProfile = V.quickProfile(stageSchema);
+    const automatic = quick && elements.quick_excitation.value === "auto";
+    const autoSupported = Boolean(live?.configuration && "quick_excitation" in live.configuration);
+    $("quick-excitation-auto").disabled = !autoSupported;
+    $("low-speed-choice").disabled = !live?.low_speed_settings;
+    if (draftMode && elements.experiment.value === "low_speed" && !live?.low_speed_settings) $("start").disabled = true;
+    $("quick-excitation-choice").hidden = !draftMode || !quick;
+    const quickUnavailable = draftMode && quick && (automatic ? !autoSupported : !quickProfile || quickProfile.available === false);
+    if (quickUnavailable) $("start").disabled = true;
+    $("draft-summary").hidden = !draftMode;
+    const timing = quick && (quickProfile || automatic) ? V.quickTiming({duration: Number(elements.duration.value), quick_excitation: automatic ? "auto" : "fixed"}) : null;
+    text("draft-method", V.experiments[elements.experiment.value] || "选择实验方法");
+    $("draft-timing").hidden = !timing;
+    if (timing) text("draft-timing", automatic ? "60 秒正式采集 + 预探测" : `约 ${V.number(timing.training + timing.validation, 0)} 秒`);
+    text("draft-plan", quickUnavailable ? quickProfile?.selection?.reason
+      ? `快速方案暂不可用：${quickProfileReason(quickProfile)}`
+      : "当前节点尚未提供独立验证快速流程，请更新节点后开始。历史结果仍可查看。"
+      : automatic ? "最多 2 × 10 秒预探测，选定后 40 秒训练 + 20 秒独立验证；另计启动、回位与停止确认。"
+      : timing ? `${V.number(timing.training, 0)} 秒训练 + ${V.number(timing.validation, 0)} 秒独立验证；另计启动、回位与停止确认。`
+        : elements.experiment.value === "low_speed"
+          ? `训练速度 ${live?.low_speed_settings?.speeds?.join(" / ") || "—"} rad/s；正反向各 ${live?.low_speed_settings?.repetitions ?? "—"} 次，另有独立验证速度。总预算 ${live?.low_speed_settings?.time_budget ?? "—"} 秒，实际到达固定区间后采样。`
+          : "自定义高级流程。开始前请核对采集范围、运行边界与质量要求。");
+    text("draft-scope", quick ? (automatic ? "根据预探测选择有限候选方案；不放宽保护，不用最终验证调参。" : quickDraftSource(quickProfile)) + "仅覆盖本次实际速度域。静摩擦、全速与热参数需相应高级流程。"
+      : "参数与阶段选择仅保存在草稿中，点击开始后才提交。");
     $("apply").disabled = locked || !snapshot?.services_ready || !live?.stop_confirmed || Boolean(conflict);
     $("reload-settings").disabled = locked;
     $("hardware-confirmation").hidden = !draftMode || !motor || motor.simulated;
     text("hardware-confirmation-text", ["precision", "fourier"].includes(elements.experiment.value)
       ? "已确认空载、可多圈旋转、无绕线风险及物理停止措施" : "已确认真机固定、可用行程及物理停止措施");
     const dirtyMessage = pendingVersion ? "请求已接受，等待控制器确认。" : conflict ? "节点配置已变化，请恢复配置后重新编辑。"
+      : quickUnavailable ? "快速标定接口未就绪，开始按钮已停用。"
       : draftMode && dirty ? "设置将在开始时应用。" : draftMode && connected && !live?.can_start ? V.reason(live?.blocked_reason) : "";
     text("dirty", dirtyMessage); $("dirty").hidden = !dirtyMessage;
     const prepared = ["precision", "fourier"].includes(elements.experiment.value);
     const stageSupported = live && V.selectable.every(name => typeof live.configuration[`collect_${name}`] === "boolean");
     const parameterLocked = locked || !live?.stop_confirmed || !stageSchema;
     $("stage-profile-full").disabled = $("stage-profile-test").disabled = parameterLocked || !prepared;
+    $("quick-profile").disabled = parameterLocked || !quickProfile || quickProfile.available === false;
     $("stage-parameter-save").disabled = parameterLocked || !Object.keys(stageInputs).length;
     for (const input of Object.values(stageInputs)) input.disabled = parameterLocked;
     if (stageInputs.known_bias && stageInputs.fit_bias) stageInputs.known_bias.disabled = parameterLocked || stageInputs.fit_bias.checked;
     $("identification-preset").disabled = $("validation-preset").disabled = parameterLocked;
     for (const id of stageIds) {
       $(`parameters-${id}`).disabled = !stageSchema || !state && !draftMode;
-      $(`parameters-${id}`).hidden = !draftMode && !stageSchema;
+      if (id === "training" && draftMode && automatic) $(`parameters-${id}`).disabled = true;
+      $(`parameters-${id}`).hidden = !draftMode && !stageSchema || elements.experiment.value === "low_speed" && id !== "constraints";
     }
     for (const name of V.selectable) elements[`collect_${name}`].disabled = locked || !prepared || !stageSupported;
     const config = draftMode && live ? {...calibrationConfig(live), ...stageDraft} : state?.configuration || {};
-    text("protocol-mode", config.protocol_mode === "workflow_test" ? "短流程测试 · 结果仅用于流程诊断" : "完整标定");
-    const stepState = draftMode && live ? {...live, experiment: elements.experiment.value} : state;
     const selection = Object.fromEntries(V.selectable.map(name => [`collect_${name}`, elements[`collect_${name}`].checked]));
-    for (const step of V.stageRows(stepState || {experiment:"",phase:"idle",stage:""}, selection, draftMode || !state)) {
+    const omitted = ["static", "training", "validation"].filter(id => selection[`collect_${id}`] === false);
+    text("protocol-mode", quick ? (draftMode ? quickProfile ? "快速机械标定 · 训练与独立验证" : "快速流程未就绪"
+        : automatic && state?.samples === 0 ? "自动选择激励 · 尚无正式采集样本"
+          : automatic || state?.report?.quick ? "快速机械标定 · 训练与独立验证" : "历史机械辨识 · 保留原采集与验收语义")
+      : config.protocol_mode === "workflow_test" ? "流程诊断预设 · 不作为合格标定"
+        : prepared && omitted.length ? "自定义采集方案 · 已跳过部分阶段"
+          : prepared ? "完整采集方案 · 结果仍须质量验收" : "独立高级任务");
+    const stepState = draftMode && live ? {...live, experiment: elements.experiment.value,
+      configuration: {...config, duration: Number(elements.duration.value), quick_excitation: automatic ? "auto" : "fixed"},
+      quick_adaptation: null,
+      quick_calibration_plan: quickProfile ? {protocol: quickProfile.protocol} : null} : state;
+    const steps = V.stageRows(stepState || {experiment:"",phase:"idle",stage:""}, selection, draftMode || !state);
+    for (const step of steps) {
       $(`step-${step.id}`).hidden = !step.visible;
       $(`step-${step.id}`).className = step.kind;
       text(`step-name-${step.id}`, step.label); text(`step-state-${step.id}`, step.status); text(`step-detail-${step.id}`, step.detail);
@@ -836,6 +1033,10 @@ if (typeof document !== "undefined") (() => {
     $("progress-fill").style.width = `${progress}%`; $("progress").setAttribute("aria-valuenow", String(progress));
     $("progress").className = `progress-track ${draftMode ? "" : state?.phase === "failed" ? "failed" : state?.phase === "completed_unqualified" ? "warning" : V.completed.has(state?.phase) ? "completed" : ""}`;
     text("sample-count", !draftMode && state ? `${(state.samples || 0).toLocaleString()} 条原始样本` : "");
+    const currentStep = steps.find(step => step.visible && ["current", "failed"].includes(step.kind));
+    text("current-step", draftMode ? (timing ? `${automatic ? "预探测 → " : ""}训练采集 → 独立验证 → 停止确认 → 保存结果` : "阶段明细见高级设置。")
+      : currentStep ? `${currentStep.label} · ${currentStep.status}`
+        : state ? V.stages[state.phase] || state.phase : "等待实验记录");
     renderParameterSave(); renderDrag(); renderReanalysis();
     renderExperiment(view);
   }
@@ -843,6 +1044,10 @@ if (typeof document !== "undefined") (() => {
     const state = view.state, report = view.report, id = selectedRun || state?.run_id;
     text("experiment-title", state ? V.experiments[state.experiment] || state.experiment : selectedRun ? "正在读取实验" : "尚无实验");
     const status = {completed:"已完成",completed_unqualified:"有质量提示",qualified:"已完成",failed:"已中断",incomplete:"记录不完整",recorded:"待计算"};
+    if (state?.experiment === "low_speed") status.completed_unqualified = "诊断已保存";
+    if (state?.experiment === "speed_sweep") {
+      status.completed = "滑动预测通过"; status.completed_unqualified = "候选与质量说明已保存";
+    }
     text("experiment-status", state ? status[state.phase] || V.stages[state.stage] || state.phase : "等待记录");
     $("experiment-status").className = `badge ${state?.phase === "failed" ? "bad" : ["completed", "qualified"].includes(state?.phase) ? "good" : "warn"}`;
     text("view-notice", id ? `${id}${view.archived ? " · 已恢复实验记录" : " · 实时记录"}${view.details?.pending ? " · 文件尚未完成写入" : ""}`
@@ -850,6 +1055,10 @@ if (typeof document !== "undefined") (() => {
     populateDL("experiment-facts", state ? [["电机", state.identity?.namespace || state.configuration.motor_namespace || "—"],
       ["采集时长", `${V.number(state.elapsed,1)} s`], ["原始样本", (state.samples || 0).toLocaleString()],
       ["环境", typeof state.identity?.simulated === "boolean" ? state.identity.simulated ? "仿真" : "真机" : "—"]] : []);
+    const adaptation = V.quickAdaptation(state);
+    $("quick-adaptation-summary").hidden = !adaptation;
+    text("quick-adaptation-summary", adaptation ? adaptation.text + (Number.isFinite(state.recorded_samples)
+      ? ` 正式 ${state.samples || 0} / 全部 ${state.recorded_samples} 条记录。` : "") : "");
     const error = [state?.error, view.details?.model_error, view.details?.trace_error].filter(Boolean).join("；");
     text("result-error", (error && state?.failure_stage ? `${V.stages[state.failure_stage] || state.failure_stage}：` : "") + V.reason(error));
     $("result-error").hidden = !error;
@@ -857,7 +1066,7 @@ if (typeof document !== "undefined") (() => {
     $("html-report-link").hidden = !reportAvailable;
     if (reportAvailable) $("html-report-link").href = `/api/report?${new URLSearchParams({run: id})}`;
     $("test-viewed-model").hidden = !runs.some(run => run.id === id && run.eligible);
-    renderFit(view.fit, report); renderComparison(report); renderPrecision(view, state);
+    renderFit(view.fit, report); renderComparison(report); renderPrecision(view, state); renderLowSpeed(view, state);
     $("comparison-panel").hidden = !report?.comparison;
     const events = state?.events || [];
     text("events-note", report?.events_truncated ? `显示最近 ${events.length} 条事件；完整记录见 events.csv。` : "");
@@ -871,10 +1080,13 @@ if (typeof document !== "undefined") (() => {
         $("events").append(item);
       }
     }
-    const configurationKey = JSON.stringify([state?.configuration, stageSchemaController]);
+    const configurationKey = JSON.stringify([state?.configuration, state?.requested_configuration, stageSchemaController]);
     if (configurationKey !== lastConfiguration) {
       lastConfiguration = configurationKey;
       populateDL("experiment-configuration", Object.entries(state?.configuration || {}).map(([name,value]) =>
+        [stageSchema?.fields?.[name]?.label || name, typeof value === "object" ? JSON.stringify(value) : String(value)]));
+      $("requested-configuration-details").hidden = !state?.requested_configuration;
+      populateDL("requested-configuration", Object.entries(state?.requested_configuration || {}).map(([name,value]) =>
         [stageSchema?.fields?.[name]?.label || name, typeof value === "object" ? JSON.stringify(value) : String(value)]));
     }
     const recording = report?.recording_status || state?.recording_status;
@@ -891,7 +1103,7 @@ if (typeof document !== "undefined") (() => {
     }
   }
 
-  function chart(id, series, axis, scatter = false) {
+  function chart(id, series, axis, scatter = false, emptyLabel = "等待真实采样数据") {
     const limit = Math.max(2, Math.floor(V.maxChartPoints / Math.max(1, series.length)));
     series = series.map(item => ({...item, points: V.limitRows(item.points, limit, scatter ? [0, 1, 2] : [1])}));
     const canvas = $(id), rect = canvas.getBoundingClientRect(), ratio = Math.min(window.devicePixelRatio || 1, 2);
@@ -902,7 +1114,7 @@ if (typeof document !== "undefined") (() => {
     ctx.clearRect(0, 0, width, height); ctx.font = "10px system-ui";
     const domain = V.bounds(series);
     canvas.dataset.points = String(series.reduce((sum, item) => sum + item.points.length, 0));
-    if (!domain) { ctx.fillStyle = "#8ea9bf"; ctx.textAlign = "center"; ctx.fillText("等待真实采样数据", width / 2, height / 2); return; }
+    if (!domain) { ctx.fillStyle = "#8ea9bf"; ctx.textAlign = "center"; ctx.fillText(emptyLabel, width / 2, height / 2); return; }
     const x = v => area.l + (v - domain.x0) / (domain.x1 - domain.x0) * (area.r - area.l);
     const y = v => area.b - (v - domain.y0) / (domain.y1 - domain.y0) * (area.b - area.t);
     ctx.strokeStyle = "#294158"; ctx.lineWidth = 1;
@@ -933,12 +1145,12 @@ if (typeof document !== "undefined") (() => {
         }
         ctx.globalAlpha = 1;
       } else {
-        ctx.beginPath(); let previous = null;
+        ctx.beginPath(); let previous = null, previousSegment = null;
         for (const p of item.points) {
           if (!V.finite(p[0]) || !V.finite(p[1])) { previous = null; continue; }
-          if (previous === null || (!scatter && p[0] - previous > (item.maxGap || 0.5))) ctx.moveTo(x(p[0]), y(p[1]));
+          if (previous === null || item.segmented && p[2] !== previousSegment || (!scatter && p[0] - previous > (item.maxGap || 0.5))) ctx.moveTo(x(p[0]), y(p[1]));
           else ctx.lineTo(x(p[0]), y(p[1]));
-          previous = p[0];
+          previous = p[0]; previousSegment = p[2];
         }
         ctx.stroke();
       }
@@ -961,7 +1173,8 @@ if (typeof document !== "undefined") (() => {
       motionCache = {trace, seconds, cursor: chartCursor, fields: fieldsKey, dimensions, selection};
       const interval = trace.length > 1 ? (trace[trace.length - 1][timeIndex] - trace[0][timeIndex]) / (trace.length - 1) : 0.1;
       const line = (field, color, dash = false) => ({
-        points: selection.rows.map(row => [row[timeIndex], rowValue(row, field, fields)]), color, dash,
+        points: selection.rows.map(row => [row[timeIndex], rowValue(row, field, fields), rowValue(row, "trial_index", fields)]), color, dash,
+        segmented: fields.includes("trial_index"),
         maxGap: selection.sampled ? Infinity : Math.max(0.5, interval * 3)});
       chart("position-chart", [line("position", V.colors.measured), line("target_position", V.colors.target, true)], "s");
       chart("velocity-chart", [line("velocity", V.colors.measured), line("target_velocity", V.colors.target, true)], "s");
@@ -987,8 +1200,17 @@ if (typeof document !== "undefined") (() => {
         ? "整圈实测均值与模型曲线；误差棒表示重复测量的统计界限。"
         : plot.kind === "corrected_windows"
         ? `已扣除惯量与负载 · ${plot.window_count} 个积分窗`
+        : plot.kind === "independent_speed_sweep"
+        ? "训练平台与整轮独立验证的实测速度—报告力矩；模型线仅表示滑动候选，未测区间不代表已验证。"
         : "本实验使用的摩擦模型");
       if (view.details.plot_error) text("friction-caption", view.details.plot_error);
+      if (view.report?.quick) {
+        const shared = V.sharedRanges(view.report.quick.coverage?.directions);
+        curves = V.sharedModelCurves(curves, shared);
+        text("friction-caption", $("friction-caption").textContent + (Object.keys(shared).length
+          ? "；模型实线仅画在已记录的共有滑动范围内，空白区域未获独立覆盖。"
+          : "；未记录分方向共有滑动范围，不绘制模型实线。"));
+      }
     } else if (view.state?.experiment === "precision") {
       points = (view.state.precision?.observations || []).map(row => [row.measured_speed, row.torque]);
       text("friction-caption", "已完成速度档的实测均值");
@@ -997,10 +1219,11 @@ if (typeof document !== "undefined") (() => {
       text("friction-caption", "原始速度—力矩观测，包含惯量与负载。");
     }
     chart("friction-chart", [
-      {points: points.filter(p => p[0] >= 0), color: V.colors.measured, errorbars: plot?.kind === "precision_steady"},
-      {points: points.filter(p => p[0] < 0), color: V.colors.target, errorbars: plot?.kind === "precision_steady"},
+      {points: plot?.kind === "independent_speed_sweep" ? plot.training_points : points.filter(p => p[0] >= 0), color: V.colors.measured, errorbars: plot?.kind === "precision_steady"},
+      {points: plot?.kind === "independent_speed_sweep" ? plot.validation_points : points.filter(p => p[0] < 0), color: V.colors.target, errorbars: plot?.kind === "precision_steady"},
       ...curves.map(points => ({points, color: V.colors.fit, line: true, width: 2.2})),
-    ], "rad/s", true);
+    ], "rad/s", true, view.report?.quick && !Object.keys(V.sharedRanges(view.report.quick.coverage?.directions)).length
+      ? "未记录共有滑动范围" : undefined);
   }
   function queueCharts() {
     if (!chartQueued) { chartQueued = true; requestAnimationFrame(drawCharts); }
@@ -1030,6 +1253,15 @@ if (typeof document !== "undefined") (() => {
       if (data.state && data.capabilities?.stage_parameters && (!stageSchema || stageSchemaController !== data.state?.controller_id)) {
         stageSchema = await api("/api/stage-parameters");
         stageSchemaController = data.state.controller_id;
+      }
+      if (stageSchema && data.state && Object.hasOwn(data.state, "quick_profile")) {
+        stageSchema = {...stageSchema, quick_profile: data.state.quick_profile};
+        const profile = V.quickProfile(stageSchema);
+        // A newly fresh binding may become available after the first page load.
+        // Only an untouched quick draft follows it; never replace user edits.
+        if (draftMode && !quickDraftEdited && !busy && !pendingVersion &&
+            elements.experiment.value === "calibrate" && profile?.selection?.status === "validated_local" &&
+            profile.available !== false && quickDraftSeed !== quickProfileKey(profile)) fillForm(data.state, true);
       }
       if (followLatest && !draftMode && !pendingVersion && historyLoaded) selectLatest();
       render(); queueCharts();

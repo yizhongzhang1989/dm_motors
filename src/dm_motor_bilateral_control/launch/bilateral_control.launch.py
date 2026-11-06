@@ -24,7 +24,8 @@ def launch_controller(context):
         package=PACKAGE, executable="bilateral_control_node", name="bilateral_control",
         namespace=value("namespace"), output="screen",
         parameters=[{**config.node_parameters(PACKAGE, "bilateral_control_node", profile, variant=variant),
-                     "config_file": str(config.path), "motor_a": value("motor_a"), "motor_b": value("motor_b")}])]
+                     "config_file": str(config.path), "motor_a": value("motor_a"), "motor_b": value("motor_b"),
+                     "rate": float(value("rate"))}])]
     if port is not None:
         nodes.append(Node(
             package=PACKAGE, executable="dashboard.py", name="bilateral_dashboard",
@@ -38,6 +39,8 @@ def generate_launch_description():
     return LaunchDescription([
         config_argument(), *profile_arguments(PACKAGE, LAUNCH),
         DeclareLaunchArgument("namespace", default_value=ConfigValue("namespace", PACKAGE, LAUNCH)),
+        DeclareLaunchArgument("rate", default_value=ConfigValue(
+            "rate", PACKAGE, LAUNCH, (PACKAGE, "bilateral_control_node"))),
         *(DeclareLaunchArgument(name, default_value=ConfigValue(name, PACKAGE, LAUNCH, (PACKAGE, "bilateral_control_node")))
           for name in ("motor_a", "motor_b")),
         *dashboard_arguments(PACKAGE, LAUNCH),

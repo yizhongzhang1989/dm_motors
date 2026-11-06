@@ -4,6 +4,37 @@ const assert = require("assert").strict;
 const view = require("../web/view_model.js");
 assert(view.completed.has("completed_unqualified") && view.terminal.has("completed_unqualified"));
 assert.equal(view.number(NaN), "—");
+{
+  const report = {experiment: "speed_sweep", excluded_diagnostic_trials: [
+    {trial: "setup", had_enable_request: false, commands: 0, startup_only: false, stop_confirmed: true, errors: ["setup error"]},
+    {trial: "startup", had_enable_request: true, commands: 8, startup_only: true, stop_confirmed: true, errors: ["deadline"]},
+  ]};
+  const rows = view.speedSweepDiagnostics(report);
+  assert.deepEqual(rows[0], ["setup", "未请求", "0 条目标", "已确认", "setup error"]);
+  assert.deepEqual(rows[1], ["startup", "已请求", "8 条 baseline 起点保持目标", "已确认", "deadline"]);
+  assert.equal(report.excluded_diagnostic_trials[1].had_enable_request, true);
+  assert.deepEqual(view.speedSweepDiagnostics({experiment: "calibrate"}), []);
+}
+{
+  const detail = {id: "20261106T120000-01234567", raw_samples: 50,
+    display_fields: ["time", "position", "velocity", "torque"], trace: [[0, 0, 0, 0, 0], [1, 5, 1, 13.2, .3]],
+    fit: {kind: "sliding_friction", parameters: {coulomb: .1, viscous: .02, bias: 0}},
+    report: {experiment: "speed_sweep", status: "completed_unqualified", stop_confirmed: true,
+      identity: {namespace: "/motor_3", motor_id: 3}, configuration: {topology: "separated"},
+      speed_sweep: {qualified: false, prediction_qualified: true, acquisition_quality_passed: true,
+        coverage: {complete_trials: 11, expected_trials: 11}}}};
+  const restored = view.experimentState(detail);
+  assert.equal(restored.experiment, "speed_sweep");
+  assert.equal(restored.elapsed, 5);
+  assert.equal(restored.fit.kind, "sliding_friction");
+  assert(!("inertia" in restored.fit.parameters));
+  const steps = view.stageRows(restored, {}).filter(item => item.visible);
+  assert(steps.some(item => item.id === "validation" && item.label === "整轮独立验证"));
+  assert(!steps.some(item => item.id === "static" || item.id === "warmup"));
+  assert.equal(steps.find(item => item.id === "analysis").status, "预测通过");
+  assert.equal(view.latestExperiment([{id: detail.id, same_motor: true, identity: detail.report.identity}], null, "/motor_3"), detail.id);
+  assert(view.experiments.speed_sweep.includes("高速"));
+}
 assert.equal(view.bounds([{points: []}]), null);
 const extent = view.bounds([{points: [[0, -0.2], [1, 0.3], [NaN, 0]]}]);
 assert.equal(extent.x0, 0);
@@ -41,16 +72,43 @@ const elements = Object.fromEntries(view.editable.map(key => [key, {value: "1", 
 elements.experiment.value = "calibrate";
 elements.model.value = "stribeck";
 elements.calibration_file.value = "";
+elements.quick_excitation.value = "fixed";
 elements.fit_bias.checked = true;
 assert.equal(view.readValues(elements).fit_bias, true);
 assert.equal(view.readValues(elements).known_bias, 1);
 assert.equal(view.readValues(elements).model, "stribeck");
+elements.quick_excitation.value = "auto";
+for (const experiment of ["validate", "compensate", "breakaway", "precision", "fourier", "calibrate"]) {
+  elements.experiment.value = experiment;
+  assert.equal(view.readValues(elements).quick_excitation, "auto", "Other tasks retain the chosen quick mode");
+}
+elements.quick_excitation.value = "unknown";
+assert.throws(() => view.readValues(elements), /quick_excitation/);
+elements.quick_excitation.value = "fixed";
 elements.duration.value = "";
 assert.throws(() => view.readValues(elements), /duration/);
 elements.duration.value = "Infinity";
 assert.throws(() => view.readValues(elements), /duration/);
 assert(!view.editable.includes("allow_hardware"));
 assert(!view.editable.includes("max_torque"));
+assert.deepEqual(view.quickTiming({duration: 40}), {training: 40, validation: 20});
+assert.deepEqual(view.quickTiming({duration: 8}), {training: 8, validation: 16});
+assert.deepEqual(view.quickTiming({duration: 80}), {training: 80, validation: 24});
+assert.equal(view.quickTiming({duration: null}), null);
+const sharedBands = {
+  negative: {velocity_min: -.512479, velocity_max: -.286676, windows: {training: 25, external_validation: 23}},
+  positive: {velocity_min: .271294, velocity_max: .524166, windows: {training: 30, external_validation: 22}},
+};
+const bandsBefore = JSON.stringify(sharedBands);
+assert(!view.speedInSharedRanges(.1, sharedBands));
+assert(!view.speedInSharedRanges(0, sharedBands));
+assert(view.speedInSharedRanges(.3, sharedBands) && view.speedInSharedRanges(-.3, sharedBands));
+assert(!view.speedInSharedRanges(.3, {}));
+assert.match(view.sharedRangeText(null), /未记录/);
+assert.deepEqual(view.sharedModelCurves([[[-.5, -.1], [-.3, -.1], [-.01, -.1], [.01, .1], [.3, .1], [.5, .1]]], sharedBands),
+  [[[-.5, -.1], [-.3, -.1]], [[.3, .1], [.5, .1]]]);
+assert.deepEqual(view.sharedModelCurves([[[-.5, -.1], [.5, .1]]], {}), []);
+assert.equal(JSON.stringify(sharedBands), bandsBefore);
 console.log("Dashboard helper assertions passed");
 
 const fs = require("fs"), path = require("path"), vm = require("vm");
@@ -89,7 +147,7 @@ class OptionElement extends Element {
   constructor(label, value) { super(); this.textContent = label; this.value = value; }
 }
 function dashboardState(experiment = "fourier") {
-  const configuration = {experiment, model: "auto", calibration_file: "", duration: 20, amplitude: 0.4,
+  const configuration = {experiment, model: "auto", calibration_file: "", quick_excitation: "fixed", duration: 20, amplitude: 0.4,
     collect_warmup: true, collect_static: true, collect_training: true, collect_validation: true,
     frequency: 0.1, kp: 2, kd: 0.5, fit_bias: true, known_bias: 0, fit_gravity: true, fit_stiffness: false,
     compensation_fraction: 0.8, motor_namespace: "/current_motor", allow_hardware: false,
@@ -107,7 +165,17 @@ function dashboardState(experiment = "fourier") {
       static_trials: 112, completed_cells: 0, cells: 18, target_speed: 0, repetition: 0,
       sample_revolutions: 0, required_revolutions: 1, observations: []}};
 }
-async function browserHarness(state, historical = null, rawRuns = [], stageSchema = null) {
+function quickProfile(state) {
+  const c = state?.calibration_configuration || state?.configuration || dashboardState().configuration;
+  return {id: "quick_mechanical", protocol: "quick_independent_v1", title: "快速机械标定",
+    settings: {experiment: "calibrate", protocol_mode: "full", duration: 40, model: "auto",
+      amplitude: c.amplitude, frequency: c.frequency, kp: c.kp, kd: c.kd,
+      fit_bias: c.fit_bias, known_bias: c.known_bias, fit_gravity: c.fit_gravity, fit_stiffness: c.fit_stiffness},
+    training_seconds: 40, validation_seconds: 20};
+}
+async function browserHarness(state, historical = null, rawRuns = [], stageSchema = undefined) {
+  if (stageSchema === undefined) stageSchema = {groups: {}, fields: {}, defaults: {}};
+  if (stageSchema && !Object.hasOwn(stageSchema, "quick_profile")) stageSchema = {...stageSchema, quick_profile: quickProfile(state)};
   const nodes = new Map([...markup.matchAll(/<[^>]*\bid="([^"]+)"[^>]*>/g)].map(match => [match[1], new Element()]));
   nodes.get("steps").append(...Array.from({length: 6}, () => new Element()));
   const selectors = Object.fromEntries([".metrics", ".observations", ".topbar", ".workspace", ".observations .legend .amber"]
@@ -171,6 +239,9 @@ async function browserAssertions() {
         `${experiment} must render without a scope error: ${app.nodes.get("connection-notice").textContent}; ${errors.map(String).join("; ")}`);
       assert.equal(app.nodes.get("position-value").textContent, "1.2345");
       assert.equal(app.nodes.get("start").disabled, false);
+      assert.equal(app.nodes.get("experiment").value, "calibrate", "A new draft always uses the supported quick workflow");
+      assert.equal(app.nodes.get("duration").value, "40");
+      assert.match(app.nodes.get("draft-plan").textContent, /40 秒训练 \+ 20 秒独立验证/);
       assert(!app.nodes.has("fourier-panel"), "Candidate and final model share one result panel");
       assert.equal(app.nodes.get("precision-panel").hidden, experiment !== "precision");
       assert(app.requests.every(request => request.method === "GET"), "Opening the page must never configure/start/stop");
@@ -303,15 +374,16 @@ async function browserAssertions() {
     assert(restored.requests.every(request => request.method === "GET"));
     assert.match(restored.nodes.get("parameter-table").textContent, /0.777000/, "Preparing an experiment keeps the previous result visible");
     const idle = await browserHarness(dashboardState());
-    for (const name of view.selectable) assert.equal(idle.nodes.get(`collect_${name}`).checked, true);
+    for (const name of view.selectable) assert.equal(idle.nodes.get(`collect_${name}`).checked, ["training", "validation"].includes(name));
     idle.nodes.get("collect_static").checked = false;
     idle.event("collect_static", "input");
-    assert.equal(idle.nodes.get("step-state-static").textContent, "跳过");
+    assert(idle.nodes.get("step-static").hidden, "Quick sliding calibration does not claim static friction acquisition");
     idle.event("settings", "submit"); await idle.flush();
     const startRequest = idle.requests.find(r => r.method === "POST");
     assert.equal(startRequest.url, "/api/start");
     assert.equal(startRequest.body.controller_id, "current-controller");
-    assert.equal(startRequest.body.settings.experiment, "fourier");
+    assert.equal(startRequest.body.settings.experiment, "calibrate");
+    assert.equal(startRequest.body.settings.duration, 40);
     assert.equal(startRequest.body.settings.calibration_file, "");
     assert.equal(startRequest.body.settings.collect_static, false);
     assert.equal(idle.nodes.get("start").disabled, true, "Duplicate starts must wait for the next controller generation");
@@ -358,6 +430,7 @@ async function browserAssertions() {
     const dialogState = dashboardState();
     Object.assign(dialogState.configuration, {precision_baseline_time: 10, precision_baseline_settle_time: 5, protocol_mode: "full"});
     const dialogApp = await browserHarness(dialogState, null, [], schema);
+    dialogApp.nodes.get("experiment").value = "fourier"; dialogApp.event("experiment", "change");
     for (const id of Object.keys(schema.groups)) {
       dialogApp.event(`parameters-${id}`, "click");
       assert.equal(dialogApp.nodes.get("stage-parameter-dialog").open, true);
@@ -373,10 +446,11 @@ async function browserAssertions() {
     dialogApp.event("apply", "click"); await dialogApp.flush();
     assert.equal(dialogApp.requests.find(request => request.method === "POST").body.settings.precision_baseline_time, 120);
     const presetApp = await browserHarness(dialogState, null, [], schema);
+    presetApp.nodes.get("experiment").value = "fourier"; presetApp.event("experiment", "change");
     presetApp.event("stage-profile-test", "click");
-    assert.match(presetApp.nodes.get("protocol-mode").textContent, /流程测试/);
+    assert.match(presetApp.nodes.get("protocol-mode").textContent, /流程诊断/);
     presetApp.event("stage-profile-full", "click");
-    assert.match(presetApp.nodes.get("protocol-mode").textContent, /完整标定/);
+    assert.match(presetApp.nodes.get("protocol-mode").textContent, /完整采集方案/);
     Object.assign(presetApp.snapshot.state, {phase: "running", stop_confirmed: false});
     await presetApp.poll();
     presetApp.event("parameters-baseline", "click");
@@ -416,12 +490,27 @@ async function browserAssertions() {
       target: {feedforward: 0.04}, configuration: {...dragState.configuration, experiment: "compensate",
         duration: null, drag_stop_policy: "operator", compensation_fraction: 0.4}});
     await dragApp.poll();
-    assert.equal(dragApp.nodes.get("experiment").value, "fourier");
+    assert.equal(dragApp.nodes.get("experiment").value, "calibrate");
     assert.equal(dragApp.nodes.get("amplitude").value, "0.123", "Drag must preserve an unapplied calibration draft");
     assert.equal(dragApp.nodes.get("compensation_fraction").value, "0.8");
     assert.equal(dragApp.nodes.get("drag-elapsed").textContent, "603.2");
     assert.match(dragApp.nodes.get("drag-status").textContent, /无定时结束，请手动停止/);
     assert.equal(dragApp.nodes.get("drag-output").textContent, "0.0400");
+    assert.match(dragApp.nodes.get("drag-model-note").textContent, /未记录可用共有范围/);
+    assert.match(dragApp.nodes.get("drag-domain-alert").textContent, /未记录分方向共有滑动范围/);
+    dragModel.shared_ranges = sharedBands;
+    dragModel.domain = {velocity_min: -.512479, velocity_max: .524166};
+    dragState.motor.velocity = .1;
+    await dragApp.poll();
+    assert(!dragApp.nodes.get("drag-domain-alert").hidden, "The low-speed hole is inside the model envelope but lacks shared validation");
+    assert.match(dragApp.nodes.get("drag-domain-alert").textContent, /未获独立覆盖/);
+    assert.match(dragApp.nodes.get("drag-model-note").textContent, /0.271.*训练 30 \/ 独立验证 22 窗/);
+    dragState.motor.velocity = .3;
+    await dragApp.poll();
+    assert(dragApp.nodes.get("drag-domain-alert").hidden);
+    dragState.motor.velocity = -.3;
+    await dragApp.poll();
+    assert(dragApp.nodes.get("drag-domain-alert").hidden);
     assert.match(dragApp.nodes.get("experiment-configuration").textContent, /durationnull/);
     assert.match(dragApp.nodes.get("experiment-configuration").textContent, /compensation_fraction0.4/);
     const posts = dragApp.requests.filter(r => r.method === "POST").length;
@@ -449,9 +538,9 @@ async function browserAssertions() {
     assert.equal(dragApp.nodes.get("start").disabled, false);
     dragApp.event("settings", "submit"); await dragApp.flush();
     const calibrationStart = dragApp.requests.find(r => r.url === "/api/start").body.settings;
-    assert.equal(calibrationStart.experiment, "fourier");
+    assert.equal(calibrationStart.experiment, "calibrate");
     assert.equal(calibrationStart.amplitude, 0.123);
-    assert.equal(calibrationStart.duration, 20);
+    assert.equal(calibrationStart.duration, 40);
     assert.equal(calibrationStart.compensation_fraction, 0.8);
     const modelSchema = {
       ...schema,
@@ -464,6 +553,7 @@ async function browserAssertions() {
         known_bias: {label: "独立偏置", type: "number", min: -10, max: 10}},
     };
     const modelApp = await browserHarness(dashboardState(), null, [], modelSchema);
+    modelApp.nodes.get("experiment").value = "fourier"; modelApp.event("experiment", "change");
     modelApp.event("parameters-analysis", "click");
     const modelInputs = Object.fromEntries(modelApp.nodes.get("stage-parameter-fields").children
       .flatMap(label => label.children).filter(node => node.name).map(node => [node.name, node]));
@@ -515,6 +605,11 @@ async function browserAssertions() {
     hardwareState.configuration.allow_hardware = true;
     const hardwareApp = await browserHarness(hardwareState, null, [dragModel]);
     hardwareApp.event("new-experiment", "click");
+    assert(hardwareApp.nodes.get("start").disabled, "Real calibration uses the existing explicit hardware confirmation");
+    hardwareApp.event("settings", "submit"); await hardwareApp.flush();
+    assert(hardwareApp.requests.every(request => request.method === "GET"));
+    hardwareApp.nodes.get("confirm_hardware").checked = true; hardwareApp.event("confirm_hardware", "change");
+    assert(!hardwareApp.nodes.get("start").disabled);
     hardwareApp.nodes.get("drag-calibration-file").value = dragModel.calibration_file;
     hardwareApp.nodes.get("drag-fraction").value = "0.5";
     hardwareApp.event("drag-calibration-file", "input");
@@ -572,7 +667,248 @@ async function browserAssertions() {
     assert.equal(resetApp.nodes.get("amplitude").value, "0.123");
     assert.equal(resetApp.nodes.get("fault-reset-confirm").checked, false);
     assert.equal(resetApp.requests.filter(r => r.url === "/api/start" || r.url === "/api/drag/start").length, 0);
+    const oldNode = await browserHarness(dashboardState("compensate"), null, [], {groups: {}, fields: {}, quick_profile: null});
+    assert.equal(oldNode.nodes.get("experiment").value, "calibrate");
+    assert(oldNode.nodes.get("start").disabled);
+    assert.match(oldNode.nodes.get("draft-plan").textContent, /尚未提供独立验证/);
+    oldNode.event("settings", "submit"); await oldNode.flush();
+    assert(oldNode.requests.every(r => r.method === "GET"), "An old node cannot execute a falsely labelled independent workflow");
+    const seeded = dashboardState("compensate");
+    seeded.configuration.duration = null;
+    seeded.configuration.amplitude = 9;
+    seeded.calibration_configuration = {...dashboardState().configuration, collect_validation: false};
+    const canonical = quickProfile(dashboardState()); canonical.settings.amplitude = 0.55;
+    canonical.available = true;
+    canonical.selection = {status: "validated_local", source_report: "/fixture/report.json", source_sha256: "a".repeat(64)};
+    const fresh = await browserHarness(seeded, null, [], {groups: {}, fields: {}, quick_profile: canonical});
+    assert.equal(fresh.nodes.get("duration").value, "40");
+    assert.equal(fresh.nodes.get("amplitude").value, "0.55");
+    assert(fresh.nodes.get("collect_validation").checked);
+    assert.equal(fresh.nodes.get("model").value, "auto");
+    assert.match(fresh.nodes.get("draft-scope").textContent, /本机已验证方案/);
+    fresh.nodes.get("amplitude").value = "0.56"; fresh.event("amplitude", "input");
+    assert.match(fresh.nodes.get("draft-scope").textContent, /参数已修改，尚未验证/);
+    assert.doesNotMatch(fresh.nodes.get("draft-scope").textContent, /本机已验证/);
+    fresh.event("quick-profile", "click");
+    assert.equal(fresh.nodes.get("amplitude").value, "0.55");
+    assert.match(fresh.nodes.get("draft-scope").textContent, /本机已验证方案/);
+    seeded.quick_profile = {...canonical, settings: {...canonical.settings, amplitude: 0.44},
+      selection: {...canonical.selection, source_sha256: "b".repeat(64)}};
+    await fresh.poll();
+    assert.equal(fresh.nodes.get("amplitude").value, "0.44", "An untouched draft follows a fresh local profile");
+    fresh.nodes.get("amplitude").value = "0.12"; fresh.event("amplitude", "input");
+    seeded.quick_profile = {...canonical, settings: {...canonical.settings, amplitude: 0.43}};
+    await fresh.poll();
+    assert.equal(fresh.nodes.get("amplitude").value, "0.12", "A changed backend profile cannot overwrite user edits");
+    assert.match(fresh.nodes.get("draft-scope").textContent, /参数已修改/);
+    assert(!fresh.nodes.get("step-validation").hidden);
+    assert(fresh.requests.every(r => r.method === "GET"));
+    seeded.quick_profile = {...canonical, available: false,
+      selection: {status: "unavailable", reason: "Excitation must fit inside travel limits"}};
+    await fresh.poll();
+    assert(fresh.nodes.get("start").disabled && fresh.nodes.get("quick-profile").disabled);
+    assert.match(fresh.nodes.get("draft-plan").textContent, /快速方案暂不可用.*行程范围/);
+    fresh.event("settings", "submit"); await fresh.flush();
+    assert(fresh.requests.every(r => r.method === "GET"), "An unavailable profile cannot submit START");
+    const candidate = await browserHarness(dashboardState(), null, [], {groups: {}, fields: {}, quick_profile: {
+      ...canonical, selection: {status: "startup_candidate", reason: "No explicit local validated recipe"}}});
+    assert.match(candidate.nodes.get("draft-scope").textContent, /未验证启动候选/);
+    assert.doesNotMatch(candidate.nodes.get("draft-scope").textContent, /本机已验证方案/);
+    const quickResult = {id: "20261104T160000-01234567", trace: [], display_fields: ["time", "position"], artifacts: [],
+      fit: {model: "coulomb_viscous", parameters: {coulomb: 0.12}, units: {coulomb: "Nm"}, warnings: [],
+        diagnostics: {validation_rmse: 9.876543}},
+      report: {experiment: "calibrate", status: "completed", identity: {namespace: "/current_motor"},
+        configuration: {...canonical.settings, motor_namespace: "/current_motor"}, events: [], stop_confirmed: true,
+        quick: {protocol: view.quickProtocol, qualified: true, quality_issues: [],
+          training: {duration: 39.99, raw_samples: 8000},
+          external_validation: {duration: 19.99, raw_samples: 4000, rmse: 0.012345, maximum_error: 0.033333, windows: 101},
+          coverage: {validated_velocity_min: -0.3, validated_velocity_max: 0.31}}}};
+    const scored = await browserHarness(dashboardState(), quickResult);
+    assert.match(scored.nodes.get("fit-quality").textContent, /独立验证 RMS \/ Nm0.012345/);
+    assert.match(scored.nodes.get("fit-quality").textContent, /0.033333/);
+    assert.doesNotMatch(scored.nodes.get("fit-quality").textContent, /9.876543/);
+    assert.match(scored.nodes.get("fit-scope").textContent, /静摩擦、全速与热参数/);
+    assert.match(scored.nodes.get("fit-quality").textContent, /负向共有滑动.*未记录可用共有范围/);
+    assert.match(scored.nodes.get("fit-scope").textContent, /无法确认缺项速度的独立覆盖/);
+    const coverageHistory = structuredClone(quickResult);
+    coverageHistory.report.quick.coverage.directions = sharedBands;
+    const coverageBefore = JSON.stringify(coverageHistory);
+    const covered = await browserHarness(dashboardState(), coverageHistory);
+    assert.match(covered.nodes.get("fit-quality").textContent, /负向共有滑动.*-0.512.*-0.287.*训练 25 \/ 独立验证 23 窗/);
+    assert.match(covered.nodes.get("fit-quality").textContent, /正向共有滑动.*0.271.*0.524.*训练 30 \/ 独立验证 22 窗/);
+    assert.doesNotMatch(covered.nodes.get("fit-quality").textContent, /验证速度域/);
+    assert.equal(JSON.stringify(coverageHistory), coverageBefore);
+    assert(covered.requests.every(request => request.method === "GET"));
+    assert.doesNotMatch(scored.nodes.get("fit-scope").textContent, /低残差不代表参数准确/);
+    const diagnosticResult = JSON.parse(JSON.stringify(quickResult));
+    diagnosticResult.report.quick.parameter_identifiability = {schema: "quick_parameter_diagnostics_v1"};
+    const diagnosticView = await browserHarness(dashboardState(), diagnosticResult);
+    assert.match(diagnosticView.nodes.get("fit-scope").textContent, /惯量与各摩擦系数仍需独立验证；低残差不代表参数准确/);
+    assert(!scored.nodes.get("step-validation").hidden);
+    assert.match(scored.nodes.get("step-detail-validation").textContent, /4,?000 条样本/);
+    scored.event("new-experiment", "click");
+    assert.equal(scored.nodes.get("experiment-tools").open, false);
+    assert.equal(scored.nodes.get("experiment").value, "calibrate");
+    assert.match(scored.nodes.get("fit-quality").textContent, /0.012345/, "Preparing the next draft keeps the saved result intact");
+    assert(scored.requests.every(r => r.method === "GET"));
+    const sourceFit = {kind: "mechanical", model: "coulomb_viscous", parameters: {inertia: 0.003},
+      units: {inertia: "kg*m^2"}, warnings: [], diagnostics: {samples: 61, validation_rmse: 0.006254,
+        model_selection_rmse: 0.017, independent_validation: 1, external_validation_windows: 45}};
+    const validationHistory = {id: "20261104T170000-12345678", trace: [], display_fields: [], artifacts: [], fit: sourceFit,
+      report: {experiment: "validate", status: "completed", identity: {namespace: "/current_motor"},
+        configuration: dashboardState().configuration, source_fit: sourceFit, events: [], stop_confirmed: true}};
+    const sourceScored = await browserHarness(dashboardState(), validationHistory);
+    assert.match(sourceScored.nodes.get("fit-quality").textContent, /独立验证窗口45/);
+    assert.match(sourceScored.nodes.get("fit-quality").textContent, /独立验证 RMS \/ Nm0.006254/);
+    assert.doesNotMatch(sourceScored.nodes.get("fit-quality").textContent, /留出|窗口61|0.017/);
+    const missingWindows = JSON.parse(JSON.stringify(validationHistory));
+    delete missingWindows.fit.diagnostics.external_validation_windows;
+    const missingScored = await browserHarness(dashboardState(), missingWindows);
+    assert.match(missingScored.nodes.get("fit-quality").textContent, /独立验证窗口—/);
+    assert.doesNotMatch(missingScored.nodes.get("fit-quality").textContent, /窗口61/);
+    const legacyHistory = JSON.parse(JSON.stringify(validationHistory));
+    delete legacyHistory.fit.diagnostics.independent_validation;
+    const legacyScored = await browserHarness(dashboardState(), legacyHistory);
+    assert.match(legacyScored.nodes.get("fit-quality").textContent, /拟合窗口61/);
+    assert.match(legacyScored.nodes.get("fit-quality").textContent, /留出 RMS \/ Nm0.006254/);
+    assert.doesNotMatch(legacyScored.nodes.get("fit-quality").textContent, /独立验证窗口/);
+    assert.match(markup, /<th>拟合估计<\/th>/);
+    assert(sourceScored.requests.every(r => r.method === "GET"));
+    const advanced = await browserHarness(dashboardState());
+    advanced.nodes.get("experiment").value = "fourier"; advanced.event("experiment", "change");
+    assert.match(advanced.nodes.get("protocol-mode").textContent, /跳过部分阶段/);
+    assert.doesNotMatch(advanced.nodes.get("protocol-mode").textContent, /完整/);
     assert.match(view.reason("Speed limit reached: |velocity|=1.23321 rad/s >= 1 rad/s"), /速度保护.*1.23321/);
+    {
+    const automaticState = dashboardState("calibrate");
+    automaticState.configuration.quick_excitation = "auto";
+    const automatic = await browserHarness(automaticState, null, [], {groups: {}, fields: {}, quick_profile: canonical});
+    assert.equal(automatic.nodes.get("quick_excitation").value, "auto", "The launch default seeds the first draft");
+    assert.match(automatic.nodes.get("draft-plan").textContent, /2 × 10 秒预探测.*40 秒训练.*20 秒独立验证/);
+    assert.doesNotMatch(automatic.nodes.get("draft-scope").textContent, /本机已验证方案/);
+    assert(!automatic.nodes.get("step-pilot").hidden);
+    assert(automatic.nodes.get("parameters-training").disabled);
+    assert(automatic.requests.every(r => r.method === "GET"));
+    automatic.nodes.get("experiment").value = "validate"; automatic.event("experiment", "change");
+    assert(automatic.nodes.get("quick-excitation-choice").hidden);
+    assert(automatic.nodes.get("step-pilot").hidden);
+    assert.equal(automatic.nodes.get("quick_excitation").value, "auto");
+    automatic.event("settings", "submit"); await automatic.flush();
+    assert.equal(automatic.requests.find(r => r.url === "/api/start").body.settings.quick_excitation, "auto");
+    for (const choice of ["auto", "fixed"]) {
+      const state = dashboardState("compensate");
+      state.calibration_configuration = {...state.configuration, quick_excitation: choice};
+      const preference = await browserHarness(state);
+      assert.equal(preference.nodes.get("quick_excitation").value, choice, "A draft after dragging uses calibration settings");
+      for (const experiment of ["validate", "compensate", "breakaway", "precision", "fourier", "calibrate"]) {
+        preference.nodes.get("experiment").value = experiment; preference.event("experiment", "change");
+        assert.equal(preference.nodes.get("quick_excitation").value, choice);
+      }
+      assert(preference.requests.every(r => r.method === "GET"), "Changing task or mode does not request motion");
+    }
+    const oldState = dashboardState("calibrate"); delete oldState.configuration.quick_excitation;
+    const oldQuick = await browserHarness(oldState);
+    assert.equal(oldQuick.nodes.get("quick_excitation").value, "fixed");
+    assert(oldQuick.nodes.get("quick-excitation-auto").disabled);
+    oldQuick.event("settings", "submit"); await oldQuick.flush();
+    assert(!Object.hasOwn(oldQuick.requests.find(r => r.url === "/api/start").body.settings, "quick_excitation"));
+    const adaptiveHistory = JSON.parse(JSON.stringify(quickResult));
+    adaptiveHistory.report.configuration.quick_excitation = "auto";
+    adaptiveHistory.report.requested_configuration = {kp: .3, quick_excitation: "auto"};
+    adaptiveHistory.report.samples = 12000; adaptiveHistory.report.recorded_samples = 14100;
+    adaptiveHistory.report.quick_adaptation = {status: "selected", selected_candidate: "C1", attempts: [{candidate_id:"C1"}],
+      candidates: {C1: {formal_settings: {amplitude:.45,frequency:.11,kp:4,kd:.5}}}};
+    const selected = await browserHarness(dashboardState(), adaptiveHistory);
+    assert.match(selected.nodes.get("quick-adaptation-summary").textContent, /自动选择 C1.*Kp 4.00 \/ Kd 0.50.*正式 12000 \/ 全部 14100/);
+    assert(!selected.nodes.get("requested-configuration-details").hidden);
+    assert.match(selected.nodes.get("requested-configuration").textContent, /kp0.3/);
+    const restored = view.experimentState(adaptiveHistory);
+    assert.equal(restored.quick_adaptation.selected_candidate, "C1");
+    assert.equal(restored.requested_configuration.kp, .3);
+    const legacy = view.experimentState(quickResult);
+    assert.equal(legacy.configuration.quick_excitation, "fixed");
+    assert.equal(legacy.quick_adaptation, null);
+    for (const stage of ["quick_pilot", "quick_pilot_return"]) {
+      const state = {...restored, phase:"running", stage};
+      const steps = view.stageRows(state, state.configuration);
+      assert.equal(steps.find(s=>s.id==="pilot").kind, "current");
+      assert.notEqual(steps.find(s=>s.id==="training").kind, "current");
+    }
+    const aborted = {...restored, phase:"failed",stage:"failed",failure_stage:"quick_pilot",
+      quick_adaptation:{status:"aborted",selected_candidate:null,attempts:[],abort_reasons:["guard limit"]}};
+    assert.equal(view.stageRows(aborted, aborted.configuration).find(s=>s.id==="pilot").kind,"failed");
+    assert.match(view.quickAdaptation(aborted).text,/尚未选定正式方案.*guard limit/);
+    // Actual v2 archive shape: failure_stage retained "returning", while the
+    // collector was still returning from C2 and had recorded no formal samples.
+    const rejectedHistory = {id: "20261104T142031-9fa469a9", trace: [], display_fields: [], artifacts: [],
+      report: {experiment: "calibrate", status: "failed", qualified: false, acquisition_complete: false,
+        identity: {namespace: "/current_motor"}, configuration: {...canonical.settings, quick_excitation: "auto"},
+        samples: 0, recorded_samples: 10933, pilot_samples: 10933, stop_confirmed: true,
+        failure_stage: "returning", error: "Automatic quick excitation rejected: Both permitted pilots failed observed tracking/sliding/budget screening",
+        quick_adaptation: {protocol: "quick_probe_ladder_v2_tracking_first", status: "rejected",
+          selected_candidate: null, attempts: [{candidate_id: "C1"}, {candidate_id: "C2"}],
+          collector: {stage: "pilot_return"}, abort_reasons: ["Both permitted pilots failed observed tracking/sliding/budget screening"]}}};
+    const originalRejection = JSON.stringify(rejectedHistory);
+    const rejectedView = await browserHarness(dashboardState(), rejectedHistory);
+    assert.equal(rejectedView.nodes.get("current-step").textContent, "自动选择激励 · 预探测未通过");
+    assert.equal(rejectedView.nodes.get("protocol-mode").textContent, "自动选择激励 · 尚无正式采集样本");
+    assert.equal(rejectedView.nodes.get("step-pilot").className, "failed");
+    for (const stage of ["training", "validation"]) {
+      assert.equal(rejectedView.nodes.get(`step-state-${stage}`).textContent, "未执行");
+      assert.match(rejectedView.nodes.get(`step-detail-${stage}`).textContent, /正式采集未开始/);
+    }
+    assert.equal(rejectedView.nodes.get("step-state-stopping").textContent, "已确认");
+    assert.match(rejectedView.nodes.get("result-error").textContent, /Automatic quick excitation rejected/);
+    assert.equal(JSON.stringify(rejectedHistory), originalRejection, "Display recovery must not rewrite archived failure evidence");
+    assert(rejectedView.requests.every(r => r.method === "GET"));
+    const failureState = view.experimentState(rejectedHistory);
+    const rowFor = (state, id) => view.stageRows(state, state.configuration).find(row => row.id === id);
+    assert.equal(rowFor({...failureState, failure_stage: "checking"}, "checking").kind, "failed");
+    const pilotAborted = {...failureState, failure_stage: "running",
+      quick_adaptation: {status: "aborted", selected_candidate: null, collector: {stage: "pilot"}}};
+    assert.equal(rowFor(pilotAborted, "pilot").status, "预探测已中断");
+    const noSampleFormal = {...failureState, failure_stage: "running",
+      quick_adaptation: {status: "selected", selected_candidate: "C1", collector: {stage: "formal"}}};
+    assert.equal(rowFor(noSampleFormal, "training").status, "未取得样本");
+    assert.equal(rowFor(noSampleFormal, "pilot").kind, "done");
+    const partialFormal = {...noSampleFormal, samples: 12, report: {...failureState.report, samples: 12}};
+    assert.equal(rowFor(partialFormal, "training").status, "中断");
+    assert.equal(rowFor({...partialFormal, failure_stage: "quick_validation"}, "validation").status, "中断");
+    const fixedFailure = {...failureState, configuration: {...failureState.configuration, quick_excitation: "fixed"},
+      quick_adaptation: null, report: {...failureState.report, quick_adaptation: null}};
+    assert.equal(rowFor(fixedFailure, "training").status, "中断");
+    }
+    const lowArchive = {id: "low-speed-archive", trace: [], display_fields: [], artifacts: ["low_speed.json"],
+      report: {experiment: "low_speed", status: "completed_unqualified", qualified: false,
+        identity: {namespace: "/current_motor"}, configuration: {experiment: "low_speed"},
+        samples: 1200, stop_confirmed: true,
+        low_speed_progress: {phase: "done", completed_cells: 10, required_cells: 10, cell: 9},
+        low_speed: {acquisition_quality_passed: false, quality_issues: ["Three independent repetitions required"],
+          pairs: [{role: "training", speed: .05, repetition: 0, odd_resistance: .123,
+            common_core_odd_resistance: .122, quality_passed: true}], cells: []}}};
+    const lowBefore = JSON.stringify(lowArchive);
+    const lowView = await browserHarness(dashboardState(), lowArchive);
+    assert.equal(lowView.nodes.get("low-speed-panel").hidden, false);
+    assert.equal(lowView.nodes.get("model-panel").hidden, true);
+    assert.match(lowView.nodes.get("low-speed-pairs").textContent, /0\.123000/);
+    assert.match(lowView.nodes.get("low-speed-summary").textContent, /未发布补偿模型/);
+    assert.match(lowView.nodes.get("low-speed-issues").textContent, /Three independent repetitions/);
+    assert.equal(view.experimentState(lowArchive).low_speed.completed_cells, 10);
+    assert.equal(JSON.stringify(lowArchive), lowBefore, "Low-speed restoration preserves the recorded diagnostic");
+    assert.equal(lowView.nodes.get("low-speed-estimator-comparison").hidden, true,
+      "Legacy reports must not invent time-weighted values");
+    assert(lowView.requests.every(r => r.method === "GET"));
+    const comparedArchive = JSON.parse(lowBefore);
+    comparedArchive.report.low_speed.pairs[0].time_odd_reported_torque = .11;
+    comparedArchive.report.low_speed.pairs[0].angle_minus_time_odd_reported_torque = .013;
+    const comparedBefore = JSON.stringify(comparedArchive);
+    const comparedView = await browserHarness(dashboardState(), comparedArchive);
+    assert.equal(comparedView.nodes.get("low-speed-estimator-comparison").hidden, false);
+    assert.match(comparedView.nodes.get("low-speed-estimator-rows").textContent, /0\.110000/);
+    assert.match(comparedView.nodes.get("low-speed-estimator-rows").textContent, /0\.013000/);
+    assert.match(comparedView.nodes.get("low-speed-pairs").textContent, /0\.123000/);
+    assert.equal(JSON.stringify(comparedArchive), comparedBefore);
+    assert(comparedView.requests.every(r => r.method === "GET"));
     assert.deepEqual(errors, [], errors.map(error => error.stack).join("\n"));
     console.log("Dashboard controller and live/history isolation assertions passed");
   } finally { process.removeListener("unhandledRejection", capture); }

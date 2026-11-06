@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <yaml-cpp/yaml.h>
 
@@ -38,7 +39,11 @@ void put_raw(dm_motor::Frame & frame, uint32_t raw)
 }
 
 VirtualMotor::VirtualMotor(DeviceParameters parameters, double time)
-: parameters_(parameters), physics_(parameters.physics), time_(time), last_command_(time),
+: parameters_(parameters), physics_(parameters.physics),
+  feedback_dynamics_({parameters.velocity_time_constant, parameters.feedback_velocity_source,
+      parameters.feedback_velocity_time_constant, parameters.feedback_velocity_delay,
+      parameters.feedback_torque_time_constant, parameters.feedback_torque_delay},
+    parameters.physics.initial_velocity, time), time_(time), last_command_(time),
   voltage_(parameters.bus_voltage)
 {
   dm_motor::validate_mapping(parameters.motor.mapping);
@@ -133,7 +138,7 @@ double VirtualMotor::commanded_torque(double dt)
   using dm_motor::Mode;
   if (target_.mode == Mode::Mit) {
     return target_.kp * (target_.position - encoder_position()) +
-           target_.kd * (target_.velocity - state().velocity) + target_.torque;
+           target_.kd * (target_.velocity - feedback_dynamics_.internal_velocity()) + target_.torque;
   }
   double desired_velocity = target_.velocity;
   if (target_.mode != Mode::Velocity) {
@@ -143,7 +148,7 @@ double VirtualMotor::commanded_torque(double dt)
       number(registers_.at(27)) * error + number(registers_.at(28)) * position_integral_,
       -target_.velocity_limit, target_.velocity_limit);
   }
-  const double error = desired_velocity - state().velocity;
+  const double error = desired_velocity - feedback_dynamics_.internal_velocity();
   const double previous = velocity_integral_;
   velocity_integral_ = std::clamp(velocity_integral_ + error * dt, -100.0, 100.0);
   const double torque = number(registers_.at(25)) * error + number(registers_.at(26)) * velocity_integral_;
@@ -174,6 +179,7 @@ void VirtualMotor::advance(double time)
           spring_damping_ * state().velocity;
       }
       physics_.step(dt, status_ == 1 ? commanded_torque(dt) : 0, external_ + anchor_torque(), status_ == 1);
+      feedback_dynamics_.advance(dt, time_ + dt, state().velocity, state().motor_torque);
     } catch (const std::exception &) {
       time_ = time; status_ = 13; external_ = 0; external_deadline_ = time; spring_ = false;
       clear_anchor();
@@ -256,6 +262,7 @@ void VirtualMotor::power_cycle()
   status_ = injected_fault_ = 0;
   target_ = {}; target_.mode = parameters_.motor.mode;
   velocity_integral_ = position_integral_ = 0;
+  // Keep the physical shaft, velocity estimate and reporting history continuous across a virtual restart.
   external_ = 0; external_deadline_ = time_; spring_ = false;
   last_command_ = time_;
 }
@@ -295,8 +302,8 @@ dm_motor::Feedback VirtualMotor::feedback() const
   double wrapped = std::fmod(encoder_position() + mapping.p, period);
   if (wrapped < 0) {wrapped += period;}
   return {status_, std::clamp(wrapped - mapping.p, -mapping.p, mapping.p),
-    std::clamp(state().velocity, -mapping.v, mapping.v),
-    std::clamp(state().motor_torque, -mapping.t, mapping.t),
+    std::clamp(feedback_dynamics_.velocity(time_), -mapping.v, mapping.v),
+    std::clamp(feedback_dynamics_.torque(time_), -mapping.t, mapping.t),
     static_cast<uint8_t>(std::clamp(std::round(state().mos_temperature), 0.0, 255.0)),
     static_cast<uint8_t>(std::clamp(std::round(state().rotor_temperature), 0.0, 255.0))};
 }

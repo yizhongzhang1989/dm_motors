@@ -120,9 +120,33 @@ public:
   void send(const Frame & f) override
   {
     const auto p = serial_packet(legacy_serial_frame(f));
-    const auto n = ::write(fd_, p.data(), p.size());
-    if (n < 0) {throw io_error("serial write");}
-    if (size_t(n) != p.size()) {throw std::runtime_error("partial serial write; bus latched");}
+    // O_NONBLOCK can report transient USB/TTY backpressure even for one 30-byte
+    // packet. Preserve its byte offset and one absolute deadline: retrying the
+    // whole packet after a partial write would corrupt the adapter stream.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+    size_t sent = 0;
+    while (sent < p.size()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("serial write timed out after " + std::to_string(sent) +
+                "/" + std::to_string(p.size()) + " bytes; bus latched");
+      }
+      const auto n = ::write(fd_, p.data() + sent, p.size() - sent);
+      if (n > 0) {sent += size_t(n); continue;}
+      if (n < 0) {
+        if (errno == EINTR) {continue;}
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {throw io_error("serial write");}
+      }
+      const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0) {continue;}
+      const timespec timeout{remaining.count() / 1000000000, remaining.count() % 1000000000};
+      pollfd writable{fd_, POLLOUT, 0};
+      const int ready = ::ppoll(&writable, 1, &timeout, nullptr);
+      if (ready < 0 && errno != EINTR) {throw io_error("serial write poll");}
+      if (ready > 0 && (writable.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+        throw std::runtime_error("serial disconnected during write; bus latched");
+      }
+    }
   }
   std::vector<Frame> receive() override
   {

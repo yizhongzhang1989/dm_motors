@@ -2,8 +2,10 @@
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as AnalysisTimeout
-from dataclasses import asdict, replace
+from copy import deepcopy
+from dataclasses import asdict, fields, replace
 from datetime import datetime, timezone
+import csv
 import json
 import math
 from pathlib import Path
@@ -27,18 +29,31 @@ from common import ConfigManager
 from common.config import default_config_path
 from dm_motor_control.topic_client import motor_topics
 from dm_motor_control.system_parameters import SystemParameters, system_parameters_path
-from dm_motor_interfaces.msg import MotorConfiguration, MotorFeedback, MotorRequest, MotorSetpoint, MotorState, MotorTarget
+from dm_motor_interfaces.msg import (
+    MotorConfiguration, MotorFeedback, MotorPositionObservation, MotorRequest, MotorSetpoint, MotorState, MotorTarget,
+)
 from dm_motor_interfaces.srv import CalibrationControl
 
-from .auxiliary import BreakawayDetector, fit_breakaway
+from .auxiliary import BreakawayDetector, NeutralDwell, fit_breakaway, neutral_command_attribution
 from .compensation import CompensationSettings, FrictionCompensator, compare_scores, tracking_metrics
 from .data import CalibrationError, ModelResult, Trace, atomic_json, read_json
-from .experiment import AcquisitionStages, ExperimentSettings, MotionLimits, bounded_mit_pd, feedback_torque, guard, reference
-from .identification import MechanicalOptions, fit_mechanical
+from .experiment import (
+    AcquisitionStages, ExperimentSettings, MotionLimits, QUICK_CALIBRATION_PROTOCOL,
+    bounded_mit_pd, feedback_torque, guard, reference, quick_calibration_plan,
+    quick_calibration_reference, quick_calibration_settings,
+)
+from .identification import MechanicalOptions, analyze_quick_calibration
+from .parameter_diagnostics import MeasurementAssumptions
+from .quick_profile import QuickProfileCache
+from .quick_adaptation import QuickAdaptation, PILOT_LEG
 from .precision import PrecisionExperiment, PrecisionRecorder, PrecisionSettings, Sample
+from .low_speed import LowSpeedSettings, LowSpeedSweep, constant_speed_attribution
 from .fourier_experiment import FourierExperiment
 from .fourier_trajectory import FourierSettings
-from .recording import PrecisionRecording, flatten_message, sample_membership, snapshot_parent, source_snapshot
+from .recording import (
+    MotorRecording, PrecisionRecording, environment_versions, flatten_message, sample_membership,
+    save_sources, snapshot_parent, source_snapshot,
+)
 from .reidentify import file_sha256, make_checkpoint, replay_recording
 from .stage_parameters import EDITABLE_STAGE_TYPES, EDITABLE_CONSTRAINT_TYPES, TEST_PROFILE_NOTE
 from .system_parameters import load_calibration, load_model, save_tested_calibration
@@ -108,6 +123,31 @@ def require_start(state: MotorState, allow_hardware: bool, settings: MotionLimit
     guard(0, state.velocity, state.torque, max(state.mos_temperature, state.rotor_temperature), settings)
 
 
+def review_quick_pilot(adapter, rows, origin, started, candidate_id, output):
+    """Review a frozen preparation snapshot off the control thread.
+
+    The private decision never enables motion. A stopped collector ignores a
+    late result; the unique review artifact is not a qualification or resume.
+    """
+    def trace(leg):
+        selected = [dict(row) for row in rows if not row["quick_formal"] and
+                    row["quick_candidate"] == int(candidate_id[1:]) and row["leg"] == leg]
+        for row in selected:
+            row["position"] -= origin
+            row["target_position"] -= origin
+            row["time"] += started
+        return Trace.from_rows(selected)
+    decision = adapter.submit(candidate_id, trace(PILOT_LEG), role="pilot")
+    if decision["status"] == "return_required":
+        decision = adapter.confirm_return(trace(-1), role="return")
+    selected = adapter.selected_candidate
+    path = output / ("quick_selection_" + candidate_id + ".json")
+    atomic_json(path, {"quick_adaptation": decision,
+                       "quick_plan": quick_calibration_plan(selected.formal_settings) if selected else None,
+                       "scope": "Frozen preparation-only review; no motion authorization or mechanical qualification"})
+    return adapter
+
+
 class CalibrationNode(Node):
     def __init__(self, **kwargs):
         super().__init__("calibration_node", **kwargs)
@@ -151,12 +191,18 @@ class CalibrationNode(Node):
         if "protocol_mode" not in values:
             self.declare_parameter("protocol_mode", "full")
             self.parameter_names += ("protocol_mode",)
+        if "quick_excitation" not in values:
+            self.declare_parameter("quick_excitation", "fixed")
+            self.parameter_names += ("quick_excitation",)
         if "adaptive_window" not in values:
             self.declare_parameter("adaptive_window", False, descriptor)
             self.parameter_names += ("adaptive_window",)
         if "trajectory_control" not in values:
             self.declare_parameter("trajectory_control", "host_torque", descriptor)
             self.parameter_names += ("trajectory_control",)
+        if "record_position_observation" not in values:
+            self.declare_parameter("record_position_observation", True, descriptor)
+            self.parameter_names += ("record_position_observation",)
         for name, default in (("breakaway_position", 0.0), ("breakaway_samples", 1),
                               ("breakaway_approach", 0.0), ("breakaway_return_tolerance", 0.08),
                               ("breakaway_settle_time", 0.15)):
@@ -174,6 +220,11 @@ class CalibrationNode(Node):
             parameter = "fourier_" + name
             if parameter not in values:
                 self.declare_parameter(parameter, default, ParameterDescriptor(read_only=parameter not in EDITABLE_TYPES))
+                self.parameter_names += (parameter,)
+        for name, default in asdict(LowSpeedSettings()).items():
+            parameter = "low_speed_" + name
+            if parameter not in values:
+                self.declare_parameter(parameter, list(default) if isinstance(default, tuple) else default, descriptor)
                 self.parameter_names += (parameter,)
         self.full_stage_defaults = {name: self.get_parameter(name).value for name in EDITABLE_STAGE_TYPES}
         self.constraint_ceilings = {name: self.get_parameter(name).value for name in EDITABLE_CONSTRAINT_TYPES}
@@ -201,16 +252,29 @@ class CalibrationNode(Node):
 
         if boolean("use_sim_time"):
             raise CalibrationError("Calibration uses acquisition monotonic time; use_sim_time must be false")
+        if text("quick_excitation") not in ("fixed", "auto"):
+            raise CalibrationError("quick_excitation must be fixed or auto")
         self.motor_namespace = text("motor_namespace").rstrip("/")
+        self.record_position_observation = boolean("record_position_observation")
         if not self.motor_namespace.startswith("/") or "//" in self.motor_namespace or self.motor_namespace == "":
             raise CalibrationError("motor_namespace must be an absolute, non-root namespace")
-        self.settings = ExperimentSettings(**{name: number(name) for name in ExperimentSettings.__dataclass_fields__})
+        self.settings = ExperimentSettings(
+            **{field.name: number(field.name) for field in fields(ExperimentSettings)},
+            _validate_reference=text("experiment") != "low_speed")
         self.options = MechanicalOptions(
             model=text("model"), fit_bias=boolean("fit_bias"), known_bias=number("known_bias"),
             fit_gravity=boolean("fit_gravity"), fit_stiffness=boolean("fit_stiffness"),
             window=number("integration_window"), min_speed=number("min_speed"),
             max_gap=number("max_gap"), max_rmse=number("max_rmse"),
             adaptive_window=boolean("adaptive_window"))
+        # Package metadata is deliberately outside nodes/ROS parameters. A new
+        # draft starts from this immutable startup trajectory, never history.
+        profile_key = ("packages", "dm_motor_calibration", "quick_profiles")
+        local_profiles = config.get(profile_key) if config.has(profile_key) else {}
+        profile_reference = (local_profiles.get(self.motor_namespace) if isinstance(local_profiles, dict)
+                             else {"invalid_profiles": local_profiles})
+        self.quick_profile_cache = QuickProfileCache(profile_reference, self.configuration(calibration=True))
+        self.quick_profile = self.quick_profile_cache.profile
         self.compensation_settings = CompensationSettings(
             fraction=number("compensation_fraction"), deadband=number("compensation_deadband"),
             smoothing=number("compensation_smoothing"), filter_time=number("compensation_filter"),
@@ -242,8 +306,12 @@ class CalibrationNode(Node):
         self.experiment = text("experiment")
         if text("protocol_mode") not in ("full", "workflow_test"):
             raise CalibrationError("Unknown calibration protocol mode")
-        if self.experiment not in ("calibrate", "validate", "compensate", "breakaway", "precision", "fourier"):
+        if self.experiment not in ("calibrate", "validate", "compensate", "breakaway", "precision", "fourier", "low_speed"):
             raise CalibrationError("Unknown calibration experiment")
+        self.low_speed_settings = LowSpeedSettings.from_mapping({
+            name: self.get_parameter("low_speed_" + name).value for name in asdict(LowSpeedSettings())})
+        self.low_speed_engine: LowSpeedSweep | None = None
+        self.low_speed_prestart_samples = 0
         precision_values = {name: self.get_parameter("precision_" + name).value for name in asdict(PrecisionSettings())}
         steady_budget = {"precision": True, "fourier": False}.get(self.experiment)
         self.precision_settings = PrecisionSettings.from_mapping(precision_values, steady_budget=steady_budget)
@@ -321,12 +389,25 @@ class CalibrationNode(Node):
         self.ramping = False
         self.breakaway_detected = False
         self.breakaway_detector: BreakawayDetector | None = None
+        self.breakaway_neutral: NeutralDwell | None = None
+        self.breakaway_preparation: list[dict] = []
         self.breakaway_homing = "approach" if self.breakaway_approach else "origin"
         self.settled_since = 0.0
         self.return_since = 0.0
         self.support = 0.0
         self.started = self.leg_started = self.last_tick = 0.0
         self.origin = 0.0
+        self.feedback_guard_violation: dict | None = None
+        self.quick_adaptation: QuickAdaptation | None = None
+        self.quick_stage = ""
+        self.quick_candidate = None
+        self.quick_requested_configuration: dict = {}
+        self.quick_return_stable_since = None
+        self.quick_return_latest = None
+        self.quick_selection_time = None
+        self.quick_role_exclusions = 0
+        self.quick_observation_time = None
+        self.quick_review_future = None
         self.rejections = 0
         self.stop_started = self.last_stop_sent = 0.0
         self.controller_id = uuid.uuid4().hex
@@ -347,6 +428,7 @@ class CalibrationNode(Node):
         self.run_open = False
         self.precision_engine: PrecisionExperiment | None = None
         self.precision_recorder: PrecisionRecording | None = None
+        self.raw_recorder: MotorRecording | None = None
         self.recording_sources = source_snapshot()
         self.recording_error_reported = False
         self.recorded_capability_request: float | None = None
@@ -361,6 +443,12 @@ class CalibrationNode(Node):
         self.feedback_subscription = self.create_subscription(
             MotorFeedback, self.motor_namespace + "/feedback", self.on_feedback,
             QoSProfile(depth=1024, reliability=ReliabilityPolicy.RELIABLE))
+        self.position_observation_subscription = (
+            self.create_subscription(
+                MotorPositionObservation, self.motor_namespace + "/position_observation", self.on_position_observation,
+                QoSProfile(depth=1024, reliability=ReliabilityPolicy.BEST_EFFORT,
+                           durability=DurabilityPolicy.VOLATILE))
+            if self.record_position_observation else None)
         self.status_publisher = self.create_publisher(
             String, "status", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.start_service = self.create_service(Trigger, "start", self.on_start)
@@ -372,6 +460,8 @@ class CalibrationNode(Node):
         self.get_logger().info("Calibration is idle; start service is the explicit motion request. No registers are written.")
 
     def configuration(self, *, calibration: bool = False) -> dict:
+        if not calibration and getattr(self, "quick_adaptation", None) is not None and self.run_configuration:
+            return dict(self.run_configuration)
         if not calibration and self.drag_settings is not None and self.run_configuration:
             return dict(self.run_configuration)
         values = {name: self.get_parameter(name).value for name in self.parameter_names}
@@ -390,6 +480,8 @@ class CalibrationNode(Node):
     def recording_failure(self, error: Exception) -> None:
         if self.precision_recorder is not None:
             self.precision_recorder.failure = error
+        if getattr(self, "raw_recorder", None) is not None:
+            self.raw_recorder.failure = error
         if not self.recording_error_reported:
             self.recording_error_reported = True
             self.get_logger().error(f"Recording failure; acquisition will stop: {error}")
@@ -408,18 +500,20 @@ class CalibrationNode(Node):
             raise CalibrationError("Resume requires continuous driver feedback counters and acquisition clock")
 
     def record_message(self, stream: str, message, **annotations) -> None:
-        if not self.run_open or self.precision_recorder is None:
+        recorder = self.precision_recorder or getattr(self, "raw_recorder", None)
+        if not self.run_open or recorder is None:
             return
         try:
-            self.precision_recorder.message(stream, message, **annotations)
+            recorder.message(stream, message, **annotations)
         except (CalibrationError, ValueError, TypeError) as error:
             self.recording_failure(error)
 
     def record_event(self, event: dict) -> None:
-        if not self.run_open or self.precision_recorder is None:
+        recorder = self.precision_recorder or getattr(self, "raw_recorder", None)
+        if not self.run_open or recorder is None:
             return
         try:
-            self.precision_recorder.event(event)
+            recorder.event(event)
         except (CalibrationError, ValueError, TypeError) as error:
             self.recording_failure(error)
 
@@ -449,7 +543,10 @@ class CalibrationNode(Node):
             planned = replace(fourier, training_enabled=stages.collect_training, validation_enabled=stages.collect_validation)
             if precision.time_budget < precision.preparation_minimum_duration + planned.duration:
                 raise CalibrationError("Time budget cannot cover the selected preparation and Fourier cycles")
-        settings = replace(self.settings, **{name: values[name] for name in asdict(self.settings)})
+        settings = replace(self.settings, **{name: values[name] for name in asdict(self.settings)},
+                           _validate_reference=values["experiment"] != "low_speed")
+        if values["experiment"] == "low_speed":
+            self.low_speed_settings.validate_limits(settings)
         options = replace(self.options, **{name: values[name] for name in
                                           ("model", "fit_bias", "known_bias", "fit_gravity", "fit_stiffness",
                                            "min_speed", "max_gap", "max_rmse")},
@@ -762,6 +859,11 @@ class CalibrationNode(Node):
         self.display_rows.append(display)
         self.display_json.append(json.dumps(display, allow_nan=False, separators=(",", ":")))
 
+    def on_position_observation(self, message: MotorPositionObservation) -> None:
+        # Preserve every terminal state and repeated callback as supplied by
+        # the optional observer. It is not a control/velocity/STOP input.
+        self.record_message("position_observation.csv", message)
+
     def on_feedback(self, message: MotorFeedback) -> None:
         self.record_message("feedback.csv", message)
         if message.feedback_count <= self.last_feedback_count:
@@ -805,6 +907,31 @@ class CalibrationNode(Node):
                 raise CalibrationError(
                     f"Feedback acquisition ordering changed at sample {message.feedback_count}: "
                     f"{message.receive_time:.9f} < {self.last_feedback_time:.9f}")
+            if not precision_active:
+                # Check every new frame before identification exclusions (including
+                # coalesced timestamps, inactive targets and unknown target IDs).
+                # MotorState snapshots alone can miss an excursion between ticks.
+                try:
+                    guard(message.position - self.origin, message.velocity, message.torque,
+                          max(message.rotor_temperature, message.mos_temperature), self.motion_limits(),
+                          check_motion_bounds=self.experiment != "compensate")
+                    if getattr(self, "quick_adaptation", None) is not None:
+                        self.quick_observe(message)
+                except CalibrationError as error:
+                    self.feedback_guard_violation = {
+                        "error": str(error), "phase": self.phase,
+                        "origin": self.origin,
+                        "feedback": {key: (str(value) if isinstance(value, float) and not math.isfinite(value)
+                                            else value) for key, value in flatten_message(message).items()}}
+                    raise
+            neutral = getattr(self, "breakaway_neutral", None)
+            if self.experiment == "breakaway" and neutral is not None:
+                attributed = (neutral_command_attribution(self.commands, message.applied_target_sequence,
+                              message.receive_time, neutral.started) if message.target_active else None)
+                neutral.update(message.receive_time, message.position, message.velocity,
+                               message.feedback_count, eligible=attributed is not None,
+                               command_reassociated=(attributed is not None and
+                                                     attributed != message.applied_target_sequence))
             if message.receive_time == self.last_feedback_time:
                 self.duplicates += 1
                 self.timestamp_duplicates += 1
@@ -816,6 +943,17 @@ class CalibrationNode(Node):
             if precision_active:
                 self.precision_feedback(message)
                 return
+            if self.experiment == "low_speed" and self.low_speed_engine is not None:
+                if message.receive_time < self.started:
+                    # The enable confirmation can overtake already queued raw
+                    # frames. They remain journalled and hard-guarded above.
+                    self.low_speed_prestart_samples += 1
+                    return
+                tag = (constant_speed_attribution(self.commands, message.applied_target_sequence,
+                                                 message.receive_time) if message.target_active else None)
+                self.low_speed_engine.ingest(Sample(
+                    message.receive_time, message.position, message.velocity, message.torque,
+                    float(max(message.rotor_temperature, message.mos_temperature))), tag)
             if not message.target_active:
                 return
             command = self.commands.get(message.applied_target_sequence)
@@ -823,10 +961,18 @@ class CalibrationNode(Node):
                 if message.receive_time <= self.leg_started + 0.05:
                     return
                 raise CalibrationError("Unknown applied target sequence; another command source or restart interfered")
+            if (getattr(self, "quick_adaptation", None) is not None and
+                    message.receive_time - self.started < command["command_time"]):
+                # The driver annotates software dispatch, not a device ACK.
+                # An older queued observation cannot acquire the new command's role.
+                self.quick_role_exclusions += 1
+                return
             row = {"time": message.receive_time - self.started, "position": message.position,
                    "velocity": message.velocity, "torque": message.torque,
                    "temperature": float(message.rotor_temperature), "command_torque": message.target_torque,
                    **command, "motion_confirmed": 0.0}
+            if getattr(self, "quick_adaptation", None) is not None or self.experiment == "low_speed":
+                row["temperature"] = float(max(message.rotor_temperature, message.mos_temperature))
             if command["mit_pd"]:
                 row["feedback_effort"] = (
                     command["mit_kp"] * (command["mit_position"] - message.position) +
@@ -835,7 +981,8 @@ class CalibrationNode(Node):
             if any(not math.isfinite(value) for value in row.values()):
                 raise CalibrationError("Nonfinite measurement cannot enter a calibration trace")
             self.append_display(row)
-            if command["leg"] < 0 or (self.experiment == "breakaway" and command["trial"] < 0):
+            if ((command["leg"] < 0 and self.experiment != "calibrate") or
+                    (self.experiment == "breakaway" and command["trial"] < 0)):
                 return
             if (self.experiment == "breakaway" and self.ramping and command["trial"] == self.trial
                     and message.receive_time >= self.leg_started):
@@ -856,6 +1003,8 @@ class CalibrationNode(Node):
                     self.tested_calibration["assisted_samples"] += 1
             else:
                 self.rows.append(row)
+                if getattr(self, "quick_adaptation", None) is not None:
+                    self.quick_append(row)
         except (CalibrationError, ValueError) as error:
             self.fail(str(error))
 
@@ -866,9 +1015,19 @@ class CalibrationNode(Node):
                           self.drag_settings, self.result, self.compensator, self.active_trajectory_control)
                          if self.drag_settings is not None else None)
         try:
-            self.sync_configuration(force=self.drag_settings is not None and drag is None)
             if self.phase in ACTIVE_PHASES or self.stopping:
                 raise CalibrationError("An experiment or unconfirmed stop is already active")
+            # Candidate settings belong to one run, never to the next request.
+            self.sync_configuration(force=True)
+            self.quick_adaptation = None
+            self.quick_stage = ""
+            self.quick_candidate = None
+            self.quick_requested_configuration = {}
+            self.quick_return_stable_since = self.quick_return_latest = None
+            self.quick_selection_time = None
+            self.quick_role_exclusions = 0
+            self.quick_observation_time = None
+            self.quick_review_future = None
             if drag is not None:
                 values = normalize_drag_settings(drag)
                 _, settings, _, compensation, _, _ = self.validated_settings({})
@@ -884,12 +1043,22 @@ class CalibrationNode(Node):
             state = self.fresh_state()
             require_start(state, self.allow_hardware, self.motion_limits(), self.rate)
             self.check_resume_checkpoint(state)
+            if self.experiment == "calibrate" and self.get_parameter("quick_excitation").value == "auto":
+                self.quick_adaptation = QuickAdaptation(
+                    self.settings, kp_limit=state.kp_limit, kd_limit=state.kd_limit,
+                    position_lsb_rad=2 * state.pmax / 65535,
+                    min_speed=self.options.min_speed, max_gap=self.options.max_gap,
+                    strategy="tracking_first_adaptive_window")
+                self.quick_candidate = self.quick_adaptation.next_candidate
+                self.quick_stage = "pilot"
             self.check_trajectory_control(state)
+            if self.quick_adaptation is not None and self.active_trajectory_control != "mit_pd":
+                raise CalibrationError("Automatic quick excitation requires native MIT PD trajectory control")
             if not self.topics.endpoint("operation").is_ready() or self.targets.get_subscription_count() == 0:
                 raise CalibrationError("Motor topic discovery is incomplete")
             self.identity = motor_identity(state, self.motor_namespace)
             self.result = None
-            if self.experiment not in ("calibrate", "precision", "fourier"):
+            if self.experiment not in ("calibrate", "precision", "fourier", "low_speed"):
                 if self.calibration_file == Path(".") and self.system_parameters is not None:
                     self.result = load_calibration(self.system_parameters, self.identity)
                 else:
@@ -922,12 +1091,28 @@ class CalibrationNode(Node):
             self.stage_event_count = 0
             self.run_configuration = {}
             self.run_configuration = self.configuration()
+            if self.experiment == "calibrate":
+                if self.quick_adaptation is None:
+                    atomic_json(self.output / "quick_plan.json", quick_calibration_plan(self.settings))
+                else:
+                    self.quick_requested_configuration = dict(self.run_configuration)
+                    atomic_json(self.output / "requested_configuration.json", self.quick_requested_configuration)
+                    atomic_json(self.output / "quick_adaptation.json", self.quick_snapshot())
+                    self.settings = self.quick_candidate.probe_settings
+                atomic_json(self.output / "quick_sources.json", {
+                    "protocol": QUICK_CALIBRATION_PROTOCOL, "environment": environment_versions(),
+                    "sources": save_sources(self.output, self.recording_sources),
+                    "initial_motor_state": flatten_message(state),
+                })
             self.last_report = None
             self.started = self.finished = 0.0
             self.precision_engine = None
+            self.low_speed_engine = None
+            self.low_speed_prestart_samples = 0
             self.precision_resume = False
             self.precision_samples = 0
             self.precision_recorder = None
+            self.raw_recorder = None
             self.recording_error_reported = False
             self.recorded_capability_request = None
             self.resume_info = None
@@ -967,20 +1152,40 @@ class CalibrationNode(Node):
                     self.output, self.precision_engine, self.identity, self.run_configuration,
                     sources=self.recording_sources, initial_state=flatten_message(state),
                     message_schemas={message.__name__: message.get_fields_and_field_types()
-                                     for message in (MotorFeedback, MotorState, MotorSetpoint, MotorTarget)},
-                    resume=self.resume_info)
+                                     for message in (MotorFeedback, MotorState, MotorSetpoint, MotorTarget,
+                                                     MotorPositionObservation)},
+                    resume=self.resume_info, record_position_observation=self.record_position_observation)
                 self.precision_engine.event_sink = self.record_event
+            else:
+                self.raw_recorder = MotorRecording(
+                    self.output, self.identity, self.run_configuration,
+                    sources=self.recording_sources, initial_state=flatten_message(state),
+                    message_schemas={message.__name__: message.get_fields_and_field_types()
+                                     for message in (MotorFeedback, MotorState, MotorSetpoint, MotorTarget,
+                                                     MotorPositionObservation)},
+                    record_position_observation=self.record_position_observation)
+                if self.experiment == "low_speed":
+                    self.low_speed_engine = LowSpeedSweep(
+                        self.low_speed_settings, self.settings, state.position,
+                        position_resolution=2 * state.pmax / 65535)
+                    atomic_json(self.output / "low_speed_plan.json", {
+                        "settings": asdict(self.low_speed_settings), "origin": state.position,
+                        "cells": self.low_speed_engine.cells,
+                        "scope": "Local paired low-speed acquisition; no automatic model publication"})
             self.generation += 1
             self.duplicates = 0
             self.timestamp_duplicates = 0
             self.last_feedback_count = max(0, state.feedback_count - 1)
             self.last_feedback_time = state.feedback_receive_time
             self.error = ""
+            self.feedback_guard_violation = None
             self.failure_stage = ""
             self.stop_confirmed = True
             self.leg, self.trial, self.ramping = 0, -1, False
             self.breakaway_detected = False
             self.breakaway_detector = None
+            self.breakaway_neutral = None
+            self.breakaway_preparation = []
             self.breakaway_homing = "approach" if self.breakaway_approach else "origin"
             self.settled_since = 0.0
             self.finish_pending = False
@@ -1285,6 +1490,21 @@ class CalibrationNode(Node):
             require_drag_protection(state)
             self.active_trajectory_control = "friction_only"
             return
+        if self.experiment == "low_speed":
+            self.low_speed_settings.validate_limits(self.settings)
+            if state.kp_limit < 100 or state.kd_limit < max(1.0, self.low_speed_settings.velocity_kd):
+                raise CalibrationError("Low-speed acquisition requires native MIT P100/D1 return capability")
+            if max((*self.low_speed_settings.speeds, *self.low_speed_settings.validation_speeds)) > state.velocity_limit:
+                raise CalibrationError("Low-speed target exceeds the driver's velocity command capability")
+            lower = max(state.position_min, state.software_offset - state.position_limit)
+            upper = min(state.position_max, state.software_offset + state.position_limit)
+            origin = self.low_speed_engine.origin if self.run_open and self.low_speed_engine else state.position
+            travel = self.low_speed_settings.required_travel
+            if origin - travel < lower or origin + travel > upper:
+                raise CalibrationError("Low-speed preposition and sample interval exceed driver position bounds")
+            self.active_trajectory_control = ("low_speed_position_ramp" if self.low_speed_settings.position_kp > 0
+                                              else "low_speed_velocity_pi")
+            return
         if self.experiment in ("precision", "fourier"):
             self.precision_preflight(state)
             if self.experiment == "fourier":
@@ -1293,13 +1513,18 @@ class CalibrationNode(Node):
             return
         self.active_trajectory_control = (
             "host_torque" if state.simulated else "mit_pd") if self.trajectory_control == "auto" else self.trajectory_control
+        if (self.experiment == "calibrate" and self.get_parameter("quick_excitation").value == "auto"
+                and self.trajectory_control == "auto"):
+            self.active_trajectory_control = "mit_pd"
         if (self.active_trajectory_control != "mit_pd" and self.experiment != "breakaway") or self.experiment == "compensate":
             return
-        if self.settings.kp > state.kp_limit or self.settings.kd > state.kd_limit:
+        settings = (self.quick_candidate.probe_settings if self.quick_stage == "pilot" and self.quick_candidate
+                    else self.settings)
+        if settings.kp > state.kp_limit or settings.kd > state.kd_limit:
             raise CalibrationError("Native MIT gains exceed the driver's configured capability")
         lower = max(state.position_min, state.software_offset - state.position_limit)
         upper = min(state.position_max, state.software_offset + state.position_limit)
-        amplitude = self.settings.amplitude if self.experiment in ("calibrate", "validate") else 0.0
+        amplitude = settings.amplitude if self.experiment in ("calibrate", "validate") else 0.0
         excursion = self.breakaway_approach if self.experiment == "breakaway" else amplitude
         if state.position - excursion < lower or state.position + amplitude > upper:
             raise CalibrationError("Native MIT reference excursion exceeds the existing driver position bounds")
@@ -1320,6 +1545,10 @@ class CalibrationNode(Node):
 
     def begin_stop(self) -> None:
         if not self.stopping:
+            if self.quick_adaptation is not None and self.quick_stage != "formal":
+                self.quick_adaptation.abort(self.error or "Stopped before formal quick acquisition")
+            if self.quick_review_future is not None:
+                self.quick_review_future.cancel()
             self.stopping = True
             self.phase = "stopping"
             self.stop_started = time.monotonic()
@@ -1330,6 +1559,9 @@ class CalibrationNode(Node):
 
     def tick(self) -> None:
         try:
+            if (self.run_open and not self.stopping and getattr(self, "raw_recorder", None) is not None and
+                    self.raw_recorder.error is not None):
+                raise CalibrationError(f"Raw motor recording failed: {self.raw_recorder.error}")
             if self.run_open and not self.stopping and self.drag_recorder is not None and self.drag_recorder.error is not None:
                 raise CalibrationError(f"Manual drag recording failed: {self.drag_recorder.error}")
             if self.stopping:
@@ -1407,6 +1639,9 @@ class CalibrationNode(Node):
                 if capabilities is None or not capabilities.success or not capabilities.ready:
                     raise CalibrationError("Motor rejected the read-only capability handshake")
                 self.driver_configuration = capabilities.configuration
+                if self.experiment == "calibrate" and self.recorded_capability_request != self.pending_since:
+                    atomic_json(self.output / "driver_configuration.json", flatten_message(capabilities.configuration))
+                    self.recorded_capability_request = self.pending_since
                 if self.precision_recorder is not None and self.recorded_capability_request != self.pending_since:
                     self.precision_recorder.capability(capabilities.configuration)
                     self.recorded_capability_request = self.pending_since
@@ -1449,7 +1684,9 @@ class CalibrationNode(Node):
                         return
                 if self.validity > capabilities.configuration.command_timeout:
                     raise CalibrationError("Target validity exceeds the motor command timeout")
-                self.origin = self.precision_engine.origin if self.experiment in ("precision", "fourier") and self.precision_engine else state.position
+                self.origin = (self.precision_engine.origin if self.experiment in ("precision", "fourier") and self.precision_engine
+                               else self.low_speed_engine.origin if self.experiment == "low_speed" and self.low_speed_engine
+                               else state.position)
                 self.rejections = state.rejected_commands
                 self.motion_requested = True
                 self.stop_confirmed = False
@@ -1472,6 +1709,10 @@ class CalibrationNode(Node):
                 state = self.fresh_state()
                 if state.phase == MotorState.ENABLED and state.status == 1 and state.feedback_receive_time > self.pending_since:
                     self.started = self.leg_started = self.last_tick = time.monotonic()
+                    if self.experiment == "low_speed" and self.low_speed_engine is not None:
+                        self.low_speed_engine.start(self.started)
+                    if self.quick_adaptation is not None:
+                        self.quick_observe(state, receive_time=state.feedback_receive_time)
                     if self.experiment in ("precision", "fourier") and self.precision_engine is not None:
                         if self.precision_engine.phase in ("await_enable", "await_warmup_enable"):
                             self.precision_engine.begin_motion(self.started)
@@ -1506,16 +1747,27 @@ class CalibrationNode(Node):
         guard(state.position - self.origin, state.velocity, state.torque,
               max(state.rotor_temperature, state.mos_temperature), self.motion_limits(),
               check_motion_bounds=self.experiment != "compensate")
+        if self.experiment == "low_speed":
+            self.low_speed_control(now, state)
+            return
         if self.experiment in ("precision", "fourier"):
             self.precision_control(now, state, interval=dt)
             return
+        if self.quick_adaptation is not None and self.quick_advance(now, state):
+            return
         elapsed = now - self.leg_started
-        q, v = (reference(elapsed, self.settings, validation=self.experiment == "validate")
-                if self.experiment in ("calibrate", "validate") else (0.0, 0.0))
+        probing = self.quick_stage in ("pilot", "pilot_return")
+        leg_settings = (quick_calibration_settings(self.settings, self.leg)
+                        if self.experiment == "calibrate" else self.settings)
+        q, v = (reference(elapsed, self.settings) if probing else
+                quick_calibration_reference(elapsed, self.settings, self.leg)
+                if self.experiment == "calibrate" else
+                reference(elapsed, self.settings, validation=True)
+                if self.experiment == "validate" else (0.0, 0.0))
         feedforward = 0.0
         support = 0.0
         trial = -1
-        leg = self.leg
+        leg = PILOT_LEG if self.quick_stage == "pilot" else self.leg
         if self.experiment == "breakaway":
             if now - self.started > self.settings.duration:
                 raise CalibrationError("Breakaway experiment exceeded its total time budget")
@@ -1546,11 +1798,23 @@ class CalibrationNode(Node):
                         self.leg_started = now + self.breakaway_settle_time
                         self.settled_since = 0.0
                         self.support = self.support_torque(state.position)
+                        self.breakaway_neutral = NeutralDwell(
+                            started=now, dwell=self.breakaway_settle_time, origin=self.origin,
+                            position_resolution=2 * self.identity["pmax"] / 65535,
+                            return_tolerance=self.breakaway_return_tolerance,
+                            feedback_timeout=self.motion_limits().feedback_timeout,
+                            initial_count=self.last_feedback_count)
             if self.ramping:
                 support = self.support
                 ramp_time = now - self.leg_started
-                if -0.1 <= ramp_time < 0 and abs(state.velocity) >= self.breakaway_speed:
-                    raise CalibrationError("Known support torque did not hold the shaft stationary before the ramp")
+                if ramp_time >= 0 and self.breakaway_neutral is not None:
+                    evidence = {"trial": self.trial, "support_torque": support,
+                                **self.breakaway_neutral.summary(now)}
+                    self.breakaway_preparation.append(evidence)
+                    self.record_event({"kind": "breakaway_neutral_review", "time": now, **evidence})
+                    self.breakaway_neutral = None
+                    if not evidence["ready"]:
+                        raise CalibrationError("Breakaway neutral dwell did not establish stationarity: " + evidence["reason"])
                 trial = self.trial if ramp_time >= 0 else -1
                 requested = support + (1 if self.trial % 2 == 0 else -1) * self.ramp_rate * max(0.0, ramp_time)
                 if abs(requested) >= self.settings.max_torque:
@@ -1561,16 +1825,17 @@ class CalibrationNode(Node):
         elif self.phase == "returning":
             q, v, leg = 0.0, 0.0, -1
             requested = self.return_torque(state)
-            self.settle(state, now)
-            if self.settled_since and now - self.settled_since >= 0.3:
+            if self.quick_stage != "pilot_return":
+                self.settle(state, now)
+            if self.quick_stage != "pilot_return" and self.settled_since and now - self.settled_since >= 0.3:
                 self.leg = 1
                 self.leg_started = now
                 self.phase = "running"
                 self.settled_since = 0.0
                 if self.compensator is not None:
                     self.compensator.reset()
-        elif self.drag_settings is None and elapsed >= self.settings.duration:
-            if self.experiment == "validate" and self.leg == 0:
+        elif self.drag_settings is None and elapsed >= leg_settings.duration:
+            if self.experiment in ("calibrate", "validate") and self.leg == 0:
                 self.phase = "returning"
                 self.return_since = now
                 self.settled_since = 0.0
@@ -1601,7 +1866,7 @@ class CalibrationNode(Node):
         native = None
         if native_pd:
             kp, kd, native_torque = self.settings.kp, self.settings.kd, feedforward
-            if leg < 0:
+            if leg == -1:
                 kp, kd = min(max(4.0, kp), state.kp_limit), min(max(0.5, kd), state.kd_limit)
                 native_torque = self.support_torque(state.position)
                 if self.experiment == "breakaway":
@@ -1624,9 +1889,191 @@ class CalibrationNode(Node):
             "mit_kp": native.decoded_kp if native is not None else 0.0,
             "mit_kd": native.decoded_kd if native is not None else 0.0,
             "mit_torque": native.decoded_torque if native is not None else command}
+        if self.experiment == "breakaway":
+            self.commands[self.sequence].update(
+                breakaway_command_time=now,
+                breakaway_command_valid_for=message.valid_for,
+                breakaway_neutral_epoch=(self.breakaway_neutral.started
+                                         if self.breakaway_neutral is not None else 0.0))
+            self.commands[self.sequence].update({"breakaway_target_" + name: getattr(message.target, name)
+                for name in ("mode", "position", "velocity", "kp", "kd", "torque", "velocity_limit", "current_ratio")})
+        if self.quick_adaptation is not None:
+            self.commands[self.sequence].update(
+                quick_formal=float(self.quick_stage == "formal"),
+                quick_candidate=float(self.quick_candidate.id[1:]) if probing else 0.0,
+                command_time=now - self.started)
         if len(self.commands) > 2048:
             self.commands.popitem(last=False)
         self.targets.publish(message)
+
+        self.record_message("commands.csv", message, issued_time=now, phase=self.phase,
+                            trial=trial, leg=leg, origin=self.origin, support_torque=support)
+
+    def low_speed_control(self, now: float, state: MotorState) -> None:
+        engine = self.low_speed_engine
+        if engine is None:
+            raise CalibrationError("Low-speed acquisition engine is unavailable")
+        drive = engine.control(now)
+        if engine.done:
+            self.finish_pending = True
+            self.begin_stop()
+            return
+        if not drive.enable:
+            return  # Waiting for the first fresh raw observation after enable.
+        if drive.kp > state.kp_limit or drive.kd > state.kd_limit:
+            raise CalibrationError("Low-speed native gains exceed current motor capability")
+        latest = engine.latest
+        position, velocity = (latest.position, latest.velocity) if (
+            latest is not None and latest.time >= state.feedback_receive_time) else (state.position, state.velocity)
+        native = bounded_mit_pd(
+            position, velocity, drive.position, drive.velocity, drive.kp, drive.kd,
+            drive.torque, self.settings.max_torque,
+            pmax=state.pmax, vmax=state.vmax, tmax=state.tmax,
+            direction=state.direction, offset=state.software_offset,
+            damping_priority=drive.damping_priority)
+        # A projected reference consumed the requested trajectory even when the
+        # resulting MIT command fits without any further native gain scaling.
+        # Keep that event visible to the unchanged acquisition quality gates.
+        engine.last_saturated = engine.reference_limited or native.gain_scale < 1 - 1e-9
+        self.sequence += 1
+        message = MotorSetpoint(client_id=self.topics.client_id, sequence=self.sequence, valid_for=self.validity)
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.target = MotorTarget(mode=MotorTarget.MIT, position=drive.position, velocity=drive.velocity,
+                                     kp=native.kp, kd=native.kd, torque=drive.torque)
+        tags = {**engine.tags(), "low_speed_command_time": now, "low_speed_valid_until": now + self.validity}
+        self.commands[self.sequence] = {
+            "target_position": drive.position, "target_velocity": drive.velocity,
+            "elapsed": now - self.started, "leg": 0.0, "trial": float(tags.get("low_speed_cell", -1)),
+            "feedback_effort": native.feedback(position, velocity), "feedforward": drive.torque,
+            "saturated": float(engine.last_saturated), "support_torque": 0.0,
+            "mit_pd": float(drive.kp + drive.kd > 0), "mit_position": native.decoded_position,
+            "mit_velocity": native.decoded_velocity, "mit_kp": native.decoded_kp,
+            "mit_kd": native.decoded_kd, "mit_torque": native.decoded_torque, **tags}
+        if len(self.commands) > 2048:
+            self.commands.popitem(last=False)
+        self.targets.publish(message)
+        self.record_message("commands.csv", message, issued_time=now, phase=engine.phase,
+                            origin=self.origin, **tags)
+
+    def quick_snapshot(self) -> dict | None:
+        if self.quick_adaptation is None:
+            return None
+        snapshot = self.quick_adaptation.snapshot()
+        snapshot["collector"] = {
+            "stage": self.quick_stage, "selection_elapsed": self.quick_selection_time,
+            "pre_command_observations_excluded": self.quick_role_exclusions,
+            "role_source": "applied_target_sequence is software dispatch attribution, not device acknowledgement; pre-command observations excluded",
+            "sample_partition": "samples.csv contains only quick_formal=1; all_samples.csv and pilot_samples.csv preserve preparation",
+        }
+        return snapshot
+
+    def quick_observe(self, message, *, receive_time: float | None = None) -> None:
+        """Guard all fresh pilot observations before target/timestamp fit exclusions."""
+        if self.quick_adaptation is None:
+            return
+        command = self.commands.get(getattr(message, "applied_target_sequence", None))
+        pilot_tail = (self.quick_stage == "pilot_return" and
+                      (self.quick_return_latest is None or
+                       (command is not None and not command.get("quick_formal", 1) and
+                        command["leg"] == PILOT_LEG and
+                        command["quick_candidate"] == int(self.quick_candidate.id[1:]))))
+        if self.quick_stage != "pilot" and not pilot_tail:
+            return
+        timestamp = message.receive_time if receive_time is None else receive_time
+        # State and raw feedback arrive on different topics. A raw frame older
+        # than the initial State baseline, or a coalesced timestamp, is not a
+        # second clock advance. Its values still satisfy the live margin here;
+        # on_feedback separately rejects genuinely reordered raw frames.
+        if (abs(message.position - self.origin) >= .85 * self.settings.max_travel or
+                abs(message.velocity) >= .85 * self.settings.max_speed):
+            reason = "Live pilot reached the 85 percent travel/speed guard margin"
+            self.quick_adaptation.abort(reason)
+            raise CalibrationError(reason)
+        previous = getattr(self, "quick_observation_time", None)
+        if previous is not None and timestamp <= previous:
+            return
+        observation = {"time": timestamp, "position": message.position - self.origin,
+                       "velocity": message.velocity, "torque": message.torque,
+                       "temperature": max(message.rotor_temperature, message.mos_temperature),
+                       "leg": PILOT_LEG, "feedback_age": time.monotonic() - timestamp}
+        if not self.quick_adaptation.observe_pilot(self.quick_candidate.id, observation, role="pilot"):
+            raise CalibrationError("; ".join(self.quick_adaptation.snapshot()["abort_reasons"]) or
+                                   "Automatic quick pilot observation rejected")
+        self.quick_observation_time = timestamp
+
+    def quick_append(self, row: dict) -> None:
+        """Only new, attributed return samples can advance the measured dwell."""
+        if (self.quick_stage != "pilot_return" or row["quick_formal"] or
+                row["quick_candidate"] != int(self.quick_candidate.id[1:]) or row["leg"] != -1):
+            return
+        timestamp = row["time"]
+        previous = self.quick_return_latest
+        if previous is not None and (timestamp <= previous or timestamp - previous > self.settings.feedback_timeout):
+            raise CalibrationError("Automatic quick return feedback clock/gap failed")
+        self.quick_return_latest = timestamp
+        if abs(row["position"] - self.origin) < .08 and abs(row["velocity"]) < .04:
+            if self.quick_return_stable_since is None:
+                self.quick_return_stable_since = timestamp
+        else:
+            self.quick_return_stable_since = None
+
+    def quick_score_trace(self, leg: int) -> Trace:
+        rows = [dict(row) for row in self.rows if not row["quick_formal"] and
+                row["quick_candidate"] == int(self.quick_candidate.id[1:]) and row["leg"] == leg]
+        for row in rows:
+            row["position"] -= self.origin
+            row["target_position"] -= self.origin
+            # The live observer uses the same absolute acquisition clock.
+            row["time"] += self.started
+        return Trace.from_rows(rows)
+
+    def quick_advance(self, now: float, state: MotorState) -> bool:
+        """Transition without fitting, validation-based tuning or automatic restart."""
+        if self.quick_stage == "formal":
+            return False
+        if self.quick_stage == "pilot":
+            if now - self.leg_started < self.settings.duration:
+                return False
+            self.quick_stage, self.phase = "pilot_return", "returning"
+            self.return_since = now
+            self.quick_return_stable_since = self.quick_return_latest = None
+            return False
+        if self.quick_stage != "pilot_return":
+            raise CalibrationError("Automatic quick acquisition has no active stage")
+        if now - self.return_since > 8:
+            raise CalibrationError("Automatic quick pilot return exceeded eight seconds")
+        if (self.quick_return_stable_since is None or self.quick_return_latest is None or
+                self.quick_return_latest - self.quick_return_stable_since < .3):
+            return False
+        if self.quick_review_future is None:
+            self.quick_review_future = self.observation_executor.submit(
+                review_quick_pilot, deepcopy(self.quick_adaptation), tuple(self.rows), self.origin,
+                self.started, self.quick_candidate.id, self.output)
+            return False
+        if not self.quick_review_future.done():
+            return False
+        self.quick_adaptation = self.quick_review_future.result()
+        self.quick_review_future = None
+        decision = self.quick_adaptation.snapshot()
+        if decision["status"] == "selected":
+            self.quick_candidate = self.quick_adaptation.selected_candidate
+            self.settings = self.quick_candidate.formal_settings
+            self.quick_stage = "formal"
+            self.quick_selection_time = now - self.started
+            self.run_configuration.update(asdict(self.settings))
+        elif decision["status"] == "probe_ready":
+            self.quick_candidate = self.quick_adaptation.next_candidate
+            self.settings = self.quick_candidate.probe_settings
+            self.quick_stage = "pilot"
+            self.quick_observation_time = None
+            if self.feedback is None:
+                raise CalibrationError("Fresh raw feedback is required before the next automatic pilot")
+            self.quick_observe(self.feedback)
+        else:
+            raise CalibrationError("Automatic quick excitation rejected: " + "; ".join(decision["abort_reasons"]))
+        self.phase, self.leg, self.leg_started = "running", 0, now
+        self.settled_since = 0.0
+        return True
 
     def support_torque(self, position: float) -> float:
         if self.result is None:
@@ -1723,8 +2170,10 @@ class CalibrationNode(Node):
             self.error = (self.error + "; " if self.error else "") + "Stop is not confirmed; physical intervention may be required"
             self.phase = "failed"
             self.get_logger().error(self.error)
-            self.finish()
             self.finish_pending = True
+            self.record_event({"scope": "controller", "kind": "stop_unconfirmed", "time": now,
+                               "error": self.error})
+            self.publish_status()
 
     def finish_rate_restoration(self) -> None:
         now = time.monotonic()
@@ -1761,6 +2210,11 @@ class CalibrationNode(Node):
         if not self.run_open:
             self.finish_pending = False
             return
+        if self.stopping and not self.stop_confirmed:
+            # Keep the executor free to send DISABLE and receive confirmation.
+            # File flushes, recorder joins and fitting wait for actual disable.
+            self.finish_pending = True
+            return
         if self.experiment == "fourier" and self.fourier_rate_changed and self.stop_confirmed:
             if not self.fourier_restoring_rate:
                 if self.fourier_original_rate is None:
@@ -1790,38 +2244,139 @@ class CalibrationNode(Node):
                                          if self.stop_confirmed and self.state is not None else None),
                   "coalesced_timestamp_samples": self.timestamp_duplicates,
                   "configuration": self.run_configuration, "trajectory_control": self.active_trajectory_control}
+        if self.feedback_guard_violation is not None:
+            report["feedback_guard_violation"] = self.feedback_guard_violation
+        if self.experiment == "calibrate":
+            report.update(qualified=False, acquisition_complete=False)
+            if self.quick_adaptation is None or self.quick_stage == "formal":
+                report["quick_plan"] = quick_calibration_plan(self.settings)
+        if self.experiment == "low_speed":
+            report.update(qualified=False, shared_parameters_published=False,
+                          prestart_feedback_excluded=self.low_speed_prestart_samples,
+                          acquisition_complete=bool(self.low_speed_engine and self.low_speed_engine.done and
+                                                    not self.error and self.stop_confirmed))
         if self.result is not None:
             report["source_fit"] = asdict(self.result)
+        if self.experiment == "breakaway":
+            preparation = list(self.breakaway_preparation)
+            if self.breakaway_neutral is not None:
+                preparation.append({"trial": self.trial, "support_torque": self.support,
+                                    "interrupted": True, **self.breakaway_neutral.summary(time.monotonic())})
+            report["breakaway_preparation"] = preparation
         if self.drag_settings is not None:
             report["tested_calibration"] = self.tested_calibration
         saved_result: Path | None = None
         try:
+            recording_error = ""
+            if self.raw_recorder is not None:
+                recorder, self.raw_recorder = self.raw_recorder, None
+                try:
+                    report["raw_recording"] = recorder.finalize(
+                        stop_confirmed=self.stop_confirmed, acquisition_error=self.error)
+                except (CalibrationError, ValueError, OSError, RuntimeError) as error:
+                    recording_error = str(error)
+                    report.update(raw_recording=recorder.metadata, recording_error=recording_error,
+                                  acquisition_error=self.error)
             if self.drag_settings is not None:
                 if self.drag_recorder is None:
                     raise CalibrationError("Manual drag recorder is unavailable")
                 recorder, self.drag_recorder = self.drag_recorder, None
                 if recorder.close() != self.drag_samples:
                     raise CalibrationError("Manual drag sample count does not match the recorder")
-            trace = Trace.from_rows(self.rows) if len(self.rows) >= 3 else None
-            if trace is not None:
+            formal_rows = self.rows
+            if self.quick_adaptation is not None:
+                if self.error:
+                    self.quick_adaptation.abort(self.error)
+                formal_rows = [row for row in self.rows if row["quick_formal"]]
+                pilots = [row for row in self.rows if not row["quick_formal"]]
+                report.update(samples=len(formal_rows), recorded_samples=len(self.rows), pilot_samples=len(pilots),
+                              requested_configuration=self.quick_requested_configuration,
+                              quick_adaptation=self.quick_snapshot(), sample_files={})
+                # Preserve even a one-frame failed acquisition; Trace requires
+                # three samples for analysis but is not our recording contract.
+                fields = list(self.rows[0]) if self.rows else ["time", "position", "velocity", "torque", "leg",
+                                                             "quick_formal", "quick_candidate", "command_time"]
+                for name, rows in (("all_samples.csv", self.rows), ("pilot_samples.csv", pilots),
+                                   ("samples.csv", formal_rows)):
+                    path = self.output / name
+                    with path.open("w", newline="") as stream:
+                        writer = csv.DictWriter(stream, fieldnames=fields)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    report["sample_files"][name] = {"sha256": file_sha256(path), "bytes": path.stat().st_size}
+                atomic_json(self.output / "quick_adaptation.json", report["quick_adaptation"])
+                if self.quick_stage == "formal":
+                    atomic_json(self.output / "quick_plan.json", quick_calibration_plan(self.settings))
+            trace = Trace.from_rows(formal_rows) if len(formal_rows) >= 3 else None
+            if trace is not None and self.quick_adaptation is None:
                 trace.csv(self.output / "samples.csv")
+            elif self.quick_adaptation is None and self.drag_settings is None:
+                # Failed preparation and one/two-frame acquisitions are still
+                # complete experiments to inspect; never discard their samples.
+                fields = list(formal_rows[0]) if formal_rows else [
+                    "time", "position", "velocity", "torque", "leg", "trial"]
+                with (self.output / "samples.csv").open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(formal_rows)
             atomic_json(self.output / "display.json", {"fields": DISPLAY_FIELDS, "trace": self.display_rows,
                                                       "truncated": self.display_epoch > 0})
+            if self.experiment == "low_speed" and self.low_speed_engine is not None:
+                from .low_speed_analysis import analyze_low_speed
+                engine = self.low_speed_engine
+                report["acquisition_complete"] = report["acquisition_complete"] and not recording_error
+                rows = engine.records
+                with (self.output / "low_speed_samples.csv").open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=list(rows[0]) if rows else [
+                        "time", "receive_time", "position", "velocity", "torque", "temperature",
+                        "analysis_cell", "analysis_role", "analysis_valid"])
+                    writer.writeheader()
+                    writer.writerows(rows)
+                report["sample_files"] = {name: {"sha256": file_sha256(self.output / name),
+                    "bytes": (self.output / name).stat().st_size}
+                    for name in ("samples.csv", "low_speed_samples.csv")}
+                report["low_speed_progress"] = engine.status()
+                try:
+                    analysis = analyze_low_speed(
+                        rows, engine.cells, asdict(self.low_speed_settings), origin=engine.origin,
+                        position_resolution=2 * self.identity["pmax"] / 65535,
+                        torque_resolution=2 * self.identity["tmax"] / 4095,
+                        acquisition_complete=report["acquisition_complete"])
+                except (CalibrationError, ValueError, TypeError, KeyError, RuntimeError) as error:
+                    report["low_speed_analysis_error"] = str(error)
+                    raise CalibrationError((self.error + "; " if self.error else "") +
+                                           "Low-speed analysis failed: " + str(error)) from error
+                atomic_json(self.output / "low_speed.json", analysis)
+                report.update(low_speed=analysis, low_speed_progress=engine.status(),
+                              quality_issues=analysis.get("quality_issues", []))
+            if recording_error:
+                raise CalibrationError((self.error + "; " if self.error else "") + recording_error)
             if not self.error:
                 if trace is None and self.drag_settings is None:
                     raise CalibrationError("No usable acquisition samples")
                 if not self.stop_confirmed:
                     raise CalibrationError("Cannot qualify a calibration before confirmed disable")
                 if self.experiment == "calibrate":
-                    if np.mean(trace.columns["saturated"]) > 0.05:
-                        raise CalibrationError("More than 5% of calibration commands saturated")
-                    result = fit_mechanical(trace, self.options)
+                    if self.quick_adaptation is not None and self.quick_adaptation.selected_candidate is None:
+                        raise CalibrationError("Automatic quick selection did not complete before formal identification")
+                    measurement = MeasurementAssumptions(
+                        source="Initial MotorState protocol ranges and production compact feedback codec (position16/velocity12/torque12); report dynamics unknown",
+                        position_lsb_rad=2 * self.identity["pmax"] / 65535,
+                        velocity_lsb_rad_s=2 * self.identity["vmax"] / 4095,
+                        torque_lsb_nm=2 * self.identity["tmax"] / 4095,
+                        quantization="lower_edge")
+                    result, analysis = analyze_quick_calibration(
+                        trace, self.options, protocol=QUICK_CALIBRATION_PROTOCOL,
+                        measurement_assumptions=measurement)
                     self.result = result
-                    result.save(self.output / "calibration.json", self.identity)
-                    saved_result = self.output / "calibration.json"
-                    report["model"] = self.result.model
-                    report["calibration"] = str(self.output / "calibration.json")
-                    report["fit"] = asdict(self.result)
+                    report.update(quick=analysis, qualified=result is not None, acquisition_complete=True,
+                                  quality_issues=analysis["quality_issues"],
+                                  quick_plan=quick_calibration_plan(self.settings))
+                    atomic_json(self.output / "quick.json", analysis)
+                    if result is not None:
+                        result.save(self.output / "calibration.json", self.identity)
+                        saved_result = self.output / "calibration.json"
+                        report.update(model=result.model, calibration=str(saved_result), fit=asdict(result))
                 elif self.experiment == "breakaway":
                     fit = fit_breakaway(trace, speed_threshold=self.breakaway_speed,
                                         position_threshold=self.breakaway_position,
@@ -1841,7 +2396,8 @@ class CalibrationNode(Node):
                     if (comparison["velocity_rmse_reduction"] < self.minimum_improvement or
                             comparison["feedback_effort_rms_reduction"] < self.minimum_improvement):
                         raise CalibrationError("A/B compensation did not meet the configured improvement threshold")
-                self.phase = "completed"
+                self.phase = ("completed_unqualified" if self.experiment == "low_speed" or
+                              (self.experiment == "calibrate" and self.result is None) else "completed")
         except (CalibrationError, ValueError, OSError, RuntimeError) as error:
             self.failure_stage = self.failure_stage or "fitting"
             self.error = str(error)
@@ -1853,6 +2409,8 @@ class CalibrationNode(Node):
         display_state = self.status_message()
         report["dashboard_state"] = {key: display_state[key] for key in (
             "elapsed", "progress", "stage", "precision", "precision_settings", "fourier_settings")}
+        if self.experiment == "low_speed":
+            report["dashboard_state"].update({key: display_state[key] for key in ("low_speed", "low_speed_settings")})
         report["events"] = list(self.stage_events)
         try:
             atomic_json(self.output / "report.json", report)
@@ -1880,6 +2438,12 @@ class CalibrationNode(Node):
         motor_ready = bool(
             state is not None and state.ready and state.feedback_fresh and state.absolute_position_valid
             and 0 <= now - state.feedback_receive_time < self.motion_limits().feedback_timeout)
+        profile_busy = bool(self.phase in ACTIVE_PHASES or self.stopping or self.motion_requested or
+                            (state is not None and (state.target_active or abs(state.velocity) > 0.05 or
+                             state.phase in (MotorState.ENABLING, MotorState.ENABLED, MotorState.STOPPING))))
+        self.quick_profile = self.quick_profile_cache.update(
+            motor_identity(state, self.motor_namespace) if motor_ready else None,
+            self.configuration(calibration=True), now=now, active=profile_busy)
         # Display freshness must not erase the historical stop evidence used by saved reports.
         live_stop_confirmed = bool(
             self.stop_confirmed and state is not None and disabled_feedback(state)
@@ -1888,6 +2452,16 @@ class CalibrationNode(Node):
         elapsed = max(0.0, (self.finished or now) - self.started) if self.started else 0.0
         leg_elapsed = max(0.0, (self.finished or now) - self.leg_started) if self.started else 0.0
         fraction = min(1.0, leg_elapsed / self.settings.duration) if self.started else 0.0
+        if self.experiment == "calibrate" and self.started:
+            plan = quick_calibration_plan(self.settings)
+            leg_duration = quick_calibration_settings(self.settings, self.leg).duration
+            measured_duration = min(leg_elapsed, leg_duration)
+            if self.leg == 1:
+                measured_duration += self.settings.duration
+            fraction = min(1.0, measured_duration / plan["planned_excitation_duration"])
+            if self.quick_stage in ("pilot", "pilot_return"):
+                # Preparation has an observed duration, not a fixed-time promise.
+                fraction = None
         if self.drag_settings is not None:
             fraction = None
         if self.stopping:
@@ -1895,16 +2469,26 @@ class CalibrationNode(Node):
         elif self.phase == "fitting" and self.error:
             stage = "saving_failure"
         elif self.phase == "running":
-            stage = {"calibrate": "acquisition", "compensate": "assistance", "precision": "precision_running",
-                     "fourier": "fourier_running",
+            stage = {"calibrate": "quick_training" if self.leg == 0 else "quick_validation",
+                     "compensate": "assistance", "precision": "precision_running",
+                     "fourier": "fourier_running", "low_speed": "low_speed_running",
                      "validate": "baseline" if self.leg == 0 else "compensated",
                      "breakaway": f"ramp_{self.trial + 1}" if self.ramping and now >= self.leg_started else "settling"}[self.experiment]
+            if self.quick_stage == "pilot":
+                stage = "quick_pilot"
             if self.experiment == "breakaway":
                 if not self.ramping and self.breakaway_homing == "approach":
                     stage = "conditioning"
                 elif self.ramping and now < self.leg_started:
                     stage = "neutral_dwell"
                 fraction = max(0, self.trial + int(not self.ramping)) / 4
+        elif self.phase == "returning" and self.quick_stage == "pilot_return":
+            stage = "quick_pilot_return"
+        if self.experiment == "low_speed" and self.low_speed_engine is not None:
+            low_status = self.low_speed_engine.status()
+            if self.phase == "running":
+                stage = "low_speed_" + self.low_speed_engine.phase
+            fraction = low_status["completed_cells"] / max(1, low_status["required_cells"])
         if self.experiment in ("precision", "fourier") and self.precision_engine is not None:
             engine = self.precision_engine
             if self.phase in ("running", "checking", "arming"):
@@ -1930,6 +2514,8 @@ class CalibrationNode(Node):
             self.check_resume_checkpoint(current)
             if self.experiment in ("precision", "fourier"):
                 self.precision_preflight(current)
+            elif self.experiment == "low_speed":
+                self.check_trajectory_control(current)
         except CalibrationError as error:
             blocked = str(error)
         self.observation_id += 1
@@ -1960,6 +2546,7 @@ class CalibrationNode(Node):
                    "model": self.result.model if self.result else None,
                    "trajectory_control": self.active_trajectory_control,
                    "controller_id": self.controller_id, "generation": self.generation,
+                   "controller_source": self.topics.client_id,
                    "observation_id": self.observation_id,
                    "run_id": self.output.name if self.output else "", "stage": stage, "elapsed": elapsed,
                    "failure_stage": self.failure_stage,
@@ -1981,6 +2568,12 @@ class CalibrationNode(Node):
                    "driver_constraint_observation": self.driver_constraint_observation(),
                    "constraint_bounds": self.constraint_bounds(),
                    "stage_defaults": self.full_stage_defaults,
+                   "quick_profile": self.quick_profile,
+                   "quick_adaptation": self.quick_snapshot(),
+                   "requested_configuration": self.quick_requested_configuration or None,
+                   "quick_calibration_plan": (None if self.experiment != "calibrate" or
+                                              (self.quick_adaptation is not None and self.quick_stage != "formal")
+                                              else quick_calibration_plan(self.settings)),
                    "active_limits": limits,
                    "can_start": not blocked, "blocked_reason": blocked,
                    "fit": asdict(self.result) if self.result is not None else None,
@@ -1994,6 +2587,8 @@ class CalibrationNode(Node):
                    "precision": self.precision_engine.status() if self.precision_engine is not None else None,
                    "precision_settings": asdict(self.precision_settings),
                    "fourier_settings": asdict(self.fourier_settings),
+                   "low_speed": self.low_speed_engine.status() if self.low_speed_engine is not None else None,
+                   "low_speed_settings": asdict(self.low_speed_settings),
                    "precision_minimum_duration": self.precision_settings.minimum_duration,
                    "precision_required_travel": self.precision_settings.required_travel,
                    "motor": None if state is None else {
@@ -2005,6 +2600,11 @@ class CalibrationNode(Node):
         return message
 
     def live_report(self) -> dict | None:
+        if self.last_report is not None and isinstance(self.last_report.get("quick"), dict):
+            analysis = self.last_report["quick"]
+            # Full window/source indices remain in quick.json and the saved report.
+            compact = {key: value for key, value in analysis.items() if key != "data_selection"}
+            return {**self.last_report, "quick": compact}
         if self.last_report is None or self.last_report.get("experiment") != "fourier":
             return self.last_report
         result = self.last_report.get("fourier")

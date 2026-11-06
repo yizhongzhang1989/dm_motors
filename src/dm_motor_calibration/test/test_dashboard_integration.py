@@ -14,6 +14,7 @@ from rclpy.parameter import Parameter
 from rclpy.task import Future
 
 from dm_motor_calibration import ros_node
+from dm_motor_calibration.experiment import ExperimentSettings
 from dm_motor_calibration.precision import PrecisionExperiment
 from dm_motor_interfaces.msg import MotorConfiguration, MotorFeedback, MotorRequest, MotorState
 from dm_motor_interfaces.srv import CalibrationControl
@@ -96,7 +97,9 @@ def test_dashboard_complete_calibration_and_ab_workflow(scene):
     assert snapshot["state"]["phase"] == "running"
     generation = snapshot["state"]["generation"]
     assert generation == web.current["state"]["generation"]
-    web.wait(lambda data: data["state"]["phase"] in ("completed", "failed"), timeout=30)
+    # The independent protocol runs 22 s of training plus 16 s of validation,
+    # with a measured return between them and report finalization after STOP.
+    web.wait(lambda data: data["state"]["phase"] in ("completed", "completed_unqualified", "failed"), timeout=60)
     assert web.current["state"]["phase"] == "completed", web.current
     assert web.current["state"]["stop_confirmed"]
     run = web.current["state"]["run_id"]
@@ -106,9 +109,16 @@ def test_dashboard_complete_calibration_and_ab_workflow(scene):
     assert saved_state["elapsed"] > 0 and saved_state["stage"] == "completed"
     assert "can_start" not in saved_state and "motor" not in saved_state
     assert details["plot"]["kind"] == "corrected_windows"
-    assert details["plot"]["residual_rmse"] == pytest.approx(details["fit"]["diagnostics"]["rmse"], abs=1e-10)
+    # Quick plots use the independently collected validation leg, while rmse
+    # describes the training fit. Require the displayed validation result.
+    assert details["plot"]["residual_rmse"] == pytest.approx(
+        details["fit"]["diagnostics"]["validation_rmse"], abs=1e-10)
+    assert details["plot"]["window_count"] == details["report"]["quick"]["external_validation"]["windows"]
     assert details["fit"]["parameters"]["inertia"] == pytest.approx(0.018, rel=0.2)
-    assert {"checking", "arming", "acquisition", "stopping", "fitting", "completed"} <= {
+    assert details["report"]["quick"]["qualified"] is True
+    assert details["fit"]["diagnostics"]["independent_validation"] == 1
+    assert {"checking", "arming", "quick_training", "returning", "quick_validation",
+            "stopping", "fitting", "completed"} <= {
         event["stage"] for event in details["report"]["events"]}
     assert details["raw_samples"] > len(details["trace"]) * 5
     code, history = web.request("/api/runs")
@@ -308,11 +318,11 @@ def test_failure_manifest_commits_before_terminal_status(scene, monkeypatch):
 def test_coalesced_feedback_time_is_counted_once_but_reversed_time_still_fails():
     now = time.monotonic()
     logger = Mock()
+    limits = ExperimentSettings(feedback_timeout=0.1)
     controller = SimpleNamespace(
         last_feedback_count=10, last_feedback_time=now, duplicates=0, timestamp_duplicates=0,
         motion_requested=True, phase="running", experiment="calibrate", precision_engine=None,
-        settings=SimpleNamespace(feedback_timeout=0.1),
-        motion_limits=lambda: SimpleNamespace(feedback_timeout=0.1),
+        origin=0.0, settings=limits, motion_limits=lambda: limits,
         get_logger=lambda: logger, fail=Mock(), record_message=Mock())
     ros_node.CalibrationNode.on_feedback(controller, MotorFeedback(
         feedback_count=11, receive_time=now, absolute_position_valid=True))
@@ -376,6 +386,9 @@ def test_checking_waits_for_post_review_feedback_before_enable(scene, monkeypatc
         namespace=scene.prefix + "/fresh_review",
         parameter_overrides=[Parameter("config_file", value=str(scene.config_path))])
     try:
+        controller.output = scene.directory / "fresh_review"
+        controller.output.mkdir()
+        controller.run_open = True
         controller.state = deepcopy(scene.state)
         controller.state.phase, controller.state.status = MotorState.DISABLED, 0
         controller.state.feedback_fresh = True

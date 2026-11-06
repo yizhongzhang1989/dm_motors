@@ -22,7 +22,7 @@ class BrokerFixture(unittest.TestCase):
     backend = "sim"
 
     def setUp(self):
-        os.environ["ROS_DOMAIN_ID"] = str(30 + os.getpid() % 40)
+        os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(30 + os.getpid() % 40))
         rclpy.init()
         self.namespace = f"/can_latency_{os.getpid()}_{time.monotonic_ns()}"
         self.node = Node("latency_probe", namespace=self.namespace)
@@ -187,6 +187,35 @@ class BrokerObservation(BrokerFixture):
 class VirtualBrokerFixture(BrokerFixture):
     backend = "virtual"
 
+    def test_virtual_tx_shares_dispatch_timestamp_with_observation(self):
+        wire, observed = {}, {}
+
+        def capture(target, message):
+            if message.can_id == 0x321:
+                target[bytes(message.data)] = (message, time.monotonic_ns())
+
+        subscriptions = [
+            self.node.create_subscription(Frame, "wire_tx", lambda m: capture(wire, m), 64),
+            self.node.create_subscription(Frame, "tx_observed", lambda m: capture(observed, m), 64),
+        ]
+        for subscription in subscriptions:
+            self.addCleanup(self.node.destroy_subscription, subscription)
+        self.register_probe()
+        self.wait(lambda: all(self.node.count_publishers(s.topic_name) > 0 for s in subscriptions))
+        before = self.state.tx_count
+        sent = self.send()
+        key = sent.to_bytes(8, "little")
+        self.wait(lambda: key in wire and key in observed and self.state.tx_count > before)
+        frame, received = wire[key]
+        witness, _ = observed[key]
+        self.assertGreater(frame.received_steady, 0)
+        self.assertLessEqual(sent, frame.received_steady)
+        self.assertLessEqual(frame.received_steady, received)
+        self.assertEqual(frame.received_steady, witness.received_steady)
+        self.assertEqual(frame.header.stamp, witness.header.stamp)
+        self.assertEqual(frame, witness)
+        self.assertEqual(self.state.tx_count, before + 1)
+
     def test_virtual_rx_preserves_device_acquisition_timestamp(self):
         frames = []
         subscription = self.node.create_subscription(Frame, "rx", frames.append, 64)
@@ -200,6 +229,47 @@ class VirtualBrokerFixture(BrokerFixture):
         self.assertEqual(self.state.port, "")
         self.node.destroy_subscription(subscription)
 
+
+
+class BrokerOptionalRemoval(BrokerFixture):
+    def test_exact_queued_read_removal_is_not_a_wire_transaction(self):
+        from can_bus.msg import OptionalReadRemoved
+        removed, wire = [], []
+        self.node.create_subscription(OptionalReadRemoved, 'optional_read_removed', removed.append, 64)
+        self.node.create_subscription(Frame, 'wire_tx', wire.append, 64)
+        request = RegisterClient.Request(
+            client_name='removal_probe', filters_tx=[FrameFilter(can_id=0x321, mask=0x7ff),
+                FrameFilter(can_id=0x7ff, mask=0x7ff, prefix=[1, 0], prefix_mask=[255, 255])],
+            stop_frames=[Frame(can_id=0x321, length=8, data=[255] * 7 + [253])],
+            lease_duration=Duration(nanosec=500000000), max_tx_hz=1.0)
+        future = self.registration.call_async(request); self.wait(future.done)
+        self.assertTrue(future.result().success, future.result().message)
+        self.token, self.epoch = future.result().token, future.result().epoch
+        self.wait(lambda: self.tx.get_subscription_count() > 0 and
+                  self.node.count_publishers('optional_read_removed') > 0)
+        first = self.send(); self.wait(lambda: first in self.samples)
+        # One-second client rate interval deterministically holds the optional
+        # read. STOP bypasses this interval; no timing race or production knob.
+        read = TxFrame(token=self.token, epoch=self.epoch, sequence=2,
+                       priority=3, sent_steady=time.monotonic_ns(),
+                       valid_for=Duration(nanosec=20000000),
+                       frame=Frame(can_id=0x7ff, length=8, data=[1, 0, 0x33, 80, 0, 0, 0, 0]))
+        read.frame.header.stamp = self.node.get_clock().now().to_msg()
+        stop = TxFrame(token=self.token, epoch=self.epoch, sequence=3, priority=1,
+                       sent_steady=time.monotonic_ns(), valid_for=Duration(nanosec=100000000),
+                       frame=request.stop_frames[0])
+        stop.frame.header.stamp = self.node.get_clock().now().to_msg()
+        self.tx.publish(read); self.tx.publish(stop)
+        self.wait(lambda: len(removed) == 1 and any(f.can_id == 0x321 and f.data[-1] == 253 for f in wire))
+        event = removed[0]
+        self.assertEqual((event.token, event.epoch, event.sequence, event.stop_sequence),
+                         (read.token, read.epoch, 2, 3))
+        self.assertEqual(event.sent_steady, read.sent_steady)
+        self.assertGreaterEqual(event.removed_steady, read.sent_steady)
+        self.assertLess(event.removed_steady - read.sent_steady, 20_000_000)
+        self.assertEqual(list(event.frame.data), list(read.frame.data))
+        self.assertFalse(any(f.can_id == 0x7ff for f in wire))
+        print('Actual broker removal identity:', event)
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,7 @@ class RosIntegration(unittest.TestCase):
     def setUpClass(cls):
         cls.namespace = f"/dm_integration_{os.getpid()}"
         # Isolate DDS traffic from any real motor nodes already running on this machine.
-        os.environ["ROS_DOMAIN_ID"] = str(80 + os.getpid() % 100)
+        os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(80 + os.getpid() % 100))
         rclpy.init(args=["--ros-args", "-r", f"__ns:={cls.namespace}", "-p", "motor_id:=7"])
         cls.node = Node("integration_probe")
         cls.state = None

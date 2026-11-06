@@ -38,10 +38,12 @@ packages:
         require_virtual_bus: false
         can_fd: false
         control_rate: 200.0
+        event_driven_feedback: false
         state_rate: 0.0
         max_task_duration: 60.0
         mode: 1
         configure_mode_on_startup: false
+        startup_velocity_bandwidth: 0.0
         profile: j4310_v12
         legacy_control: false
         direction: 1.0
@@ -54,8 +56,8 @@ packages:
         torque_limit: 0.0
         kp_limit: 500.0
         kd_limit: 1.0
-        position_min: -1.7976931348623157e308
-        position_max: 1.7976931348623157e308
+        position_min: -1.7976931348623157e+308
+        position_max: 1.7976931348623157e+308
         host_protection_enabled: false
         measured_velocity_limit: 0.0
         measured_torque_limit: 0.0
@@ -99,7 +101,16 @@ packages:
         load_torque: 0.0
         max_torque: 10.0
         no_load_speed: 50.0
+        constant_torque_speed: 0.0
         torque_time_constant: 0.002
+        # Optional velocity-estimator lag for robustness tests, not identified hardware data.
+        velocity_time_constant: 0.0
+        # Reporting channels are separate from physical torque and the internal velocity estimate.
+        feedback_velocity_source: internal
+        feedback_velocity_time_constant: 0.0
+        feedback_velocity_delay: 0.0
+        feedback_torque_time_constant: 0.0
+        feedback_torque_delay: 0.0
         lower_limit: -1000000.0
         upper_limit: 1000000.0
         contact_stiffness: 200.0
@@ -164,12 +175,14 @@ packages:
           motor_dashboard_ports:
             motor_1: 8081
             motor_2: 8082
+            motor_3: 8088
         system:
           bus_names:
           - main
           motor_names:
           - motor_1
           - motor_2
+          - motor_3
           buses:
             main:
               backend: serial
@@ -183,6 +196,32 @@ packages:
               bus: main
               motor_id: 2
               configure_mode_on_startup: true
+            motor_3:
+              bus: main
+              motor_id: 3
+              master_id: 0
+              profile: j4310_v12
+              mode: 1
+              direction: 1.0
+              software_offset: 0.0
+              configure_mode_on_startup: true
+              startup_velocity_bandwidth: 0.0
+              control_rate: 500.0
+              state_rate: 500.0
+              command_timeout: 0.12
+              watchdog_timeout: 0.1
+              feedback_timeout: 0.08
+              host_protection_enabled: true
+              position_min: -350.0
+              position_max: 350.0
+              velocity_limit: 1.0
+              measured_velocity_limit: 1.0
+              torque_limit: 0.8
+              estimated_torque_limit: 0.8
+              measured_torque_limit: 0.8
+              mos_temperature_stop: 48.0
+              rotor_temperature_stop: 48.0
+              protection_samples: 1
         variants:
           simulation:
             system:
@@ -372,6 +411,7 @@ packages:
         nodes:
           dm_motor_control:
             motor_node:
+              startup_velocity_bandwidth: 100.0
               host_protection_enabled: true
               measured_torque_limit: 0.0
               estimated_torque_limit: 0.0
@@ -399,21 +439,27 @@ packages:
                   rotor_temperature_stop: 0.0
               dm_motor_bilateral_control:
                 bilateral_control_node:
-                  max_torque: 8.0
+                  max_torque: 0.0
                   motion_limits_enabled: false
+                  friction_compensation_enabled: false
   dm_motor_bilateral_control:
     nodes:
       bilateral_control_node:
         motor_a: motor_1
         motor_b: motor_2
-        rate: 200.0
+        control_mode: shared_reference
+        required_velocity_bandwidth: 100.0
+        rate: 500.0
         target_validity: 0.05
         operator_timeout: 1.0
         direction: 1
-        stiffness: 16.0
-        coupling_damping: 0.35
-        local_damping: 0.35
-        max_torque: 0.5
+        stiffness: 50.0
+        coupling_damping: 0.4975
+        local_damping: 0.005
+        max_torque: 0.0
+        friction_compensation_enabled: true
+        friction_compensation_fraction: 0.6
+        friction_torque_limit: 0.2
         motion_limits_enabled: false
         max_feedback_torque: 1.0
         max_travel: 0.3
@@ -439,6 +485,19 @@ packages:
           dashboard_host: 0.0.0.0
           dashboard_port: 8084
   dm_motor_calibration:
+    # Explicit recipes for these physical axes on this host. Other hosts or
+    # changed identities fall back to their startup candidate; no guard is copied.
+    quick_profiles:
+      /motor_1:
+        schema: 1
+        source_report: /home/robot/.ros/dm_motor_calibration/20261104T110906-47e266d2/report.json
+        source_sha256: 0566bd1211a418f2e5c6e085132c9e11cd42ca0f933866e6aee6227f434a877c
+        machine_id_sha256: 2ea9513725fadbdd2572be6037558d6e8a4e4491f4d5854fbad3efe168721964
+      /motor_2:
+        schema: 1
+        source_report: /home/robot/.ros/dm_motor_calibration/20261104T111154-993036e8/report.json
+        source_sha256: 4cd94a9097674cf5bdc1193a76d51f3552652e260081dc156a2642ef3ced11a5
+        machine_id_sha256: 2ea9513725fadbdd2572be6037558d6e8a4e4491f4d5854fbad3efe168721964
     nodes:
       calibration_node:
         motor_namespace: /motor_1
@@ -583,6 +642,10 @@ packages:
           namespace: calibration
           dashboard_host: 0.0.0.0
           dashboard_port: 8085
+        nodes:
+          dm_motor_calibration:
+            calibration_node:
+              quick_excitation: auto
       dashboard.launch.py:
         parameters:
           namespace: ''

@@ -12,7 +12,7 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
-os.environ["ROS_DOMAIN_ID"] = str(100 + os.getpid() % 100)
+os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(100 + os.getpid() % 100))
 from ament_index_python.packages import get_package_prefix
 import rclpy
 from rclpy.executors import SingleThreadedExecutor

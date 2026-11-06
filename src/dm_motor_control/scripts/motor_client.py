@@ -67,21 +67,88 @@ class MotorClient(Node):
         return response
 
     def capabilities(self):
-        attempts = 0
-        while True:
-            try:
-                response = self.call("get_capabilities", GetCapabilities.Request())
-            except TimeoutError:
-                attempts += 1
-                if attempts >= 3:
-                    raise
-                self.get_logger().warning(
-                    f"Read-only capability handshake timed out; retrying discovery ({attempts + 1}/3). "
-                    "No enable or write operation has been issued.")
-                continue
-            if not response.ready:
-                raise RuntimeError(f"Driver not ready: {response.message}")
-            return response
+        # Topic graph discovery does not prove that the return path has matched.
+        # Warm up only this read-only query; all mutating calls retain one send,
+        # the transport's 0.5 s validity and its 0.75 s response deadline.
+        started = time.monotonic()
+        deadline, next_probe = started + 5.0, started
+        endpoint = self.command_clients["get_capabilities"]
+        kind = GetCapabilities.Request.CAPABILITIES
+        owned, active = {}, {}
+        timeouts, stale_rejections = 0, 0
+        stale_counts = {"freshness": 0, "sequence": 0}
+        stale_messages = {
+            "control requires client ID, sequence and fresh timestamp/validity",
+            "stale control request sequence",
+        }
+
+        def summary():
+            return (f"elapsed={time.monotonic() - started:.3f}s probes={len(owned)} "
+                    f"timeouts={timeouts} stale_rejections={stale_rejections} "
+                    f"freshness_rejections={stale_counts['freshness']} "
+                    f"sequence_rejections={stale_counts['sequence']} "
+                    f"last_request_id={next(reversed(owned), None)}")
+
+        try:
+            while rclpy.ok():
+                now = time.monotonic()
+                if now >= deadline:
+                    raise TimeoutError(
+                        "Read-only capability handshake timed out; no enable or write operation "
+                        f"has been issued ({summary()}).")
+                for request_id, future in list(active.items()):
+                    if not future.done():
+                        continue
+                    del active[request_id]
+                    try:
+                        response = future.result()
+                    except TimeoutError:
+                        timeouts += 1
+                        self.get_logger().debug(
+                            f"Capability probe timed out: request_id={request_id}, {summary()}")
+                        continue
+                    if not response.success:
+                        # A fresh later probe can overtake an earlier query during
+                        # discovery. Only these two read-only rejections are retried.
+                        if response.message in stale_messages:
+                            stale_rejections += 1
+                            category = "sequence" if response.message == "stale control request sequence" else "freshness"
+                            stale_counts[category] += 1
+                            self.get_logger().debug(
+                                f"Capability probe rejected as stale: request_id={request_id}, "
+                                f"reason={response.message}, {summary()}")
+                            continue
+                        raise RuntimeError(f"{response.message} (request_id={request_id}, {summary()})")
+                    if not response.ready:
+                        raise RuntimeError(
+                            f"Driver not ready: {response.message} (request_id={request_id}, {summary()})")
+                    detail = f"Read-only capability handshake confirmed: request_id={request_id}, {summary()}"
+                    if timeouts or stale_rejections:
+                        self.get_logger().warning(detail)
+                    else:
+                        self.get_logger().debug(detail)
+                    return response
+                if now >= next_probe and len(owned) < 25 and endpoint.is_ready():
+                    request_id, future = self.topics.send(kind, GetCapabilities.Request())
+                    owned[request_id] = active[request_id] = future
+                    next_probe = now + 0.2
+                    self.get_logger().debug(
+                        f"Read-only capability probe sent: request_id={request_id}, {summary()}")
+                rclpy.spin_once(self, timeout_sec=max(0.0, min(0.01, deadline - time.monotonic())))
+            raise RuntimeError("ROS shut down before the read-only capability handshake completed")
+        finally:
+            # Humble Future.cancel() is not done(); remove only this handshake's
+            # exact entries so the normal transport expiry cannot resurrect them.
+            with self.topics.lock:
+                for request_id, future in owned.items():
+                    pending = self.topics.pending.get(request_id)
+                    if pending and pending[0] is future and pending[2] == kind:
+                        self.topics.pending.pop(request_id)
+            for future in owned.values():
+                if future.done():
+                    future.exception()  # Mark any simultaneous expired probe as retrieved.
+                else:
+                    future.cancel()
 
     def acquire(self):
         self.token = self.call("control_lease", ControlLease.Request(

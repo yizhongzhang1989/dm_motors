@@ -12,7 +12,7 @@ from .dashboard_data import DISPLAY_FIELDS, display_record
 from .experiment import MitPdPlan, bounded_mit_pd, decoded_mit_value
 from .precision import Drive, PrecisionExperiment, PrecisionSettings, Sample
 from .recording import PrecisionRecording, sample_membership
-from .simulation import SimulatedMotor
+from .simulation import SimulatedMotor, measurement_configuration
 from .stage_parameters import TEST_PROFILE_NOTE
 
 
@@ -48,7 +48,10 @@ def collect_prepared(parameters: Mapping[str, float | str], *, settings: Precisi
             if "fourier_settings" in engine.recording_metadata():
                 configuration.update({"fourier_" + key: value for key, value in engine.recording_metadata()["fourier_settings"].items()})
             configuration.update(physics_truth=dict(parameters), noise=noise, quantized=quantized, seed=seed,
-                                 protocol_mode=protocol_mode)
+                                 protocol_mode=protocol_mode,
+                                 measurement_chain=measurement_configuration(parameters),
+                                 feedback_period=feedback_period, control_period=control_period,
+                                 feedback_after_preparation=feedback_after_preparation)
             if output is not None:
                 recorder = PrecisionRecording(output, engine, identity, configuration, source="simulation",
                                                initial_state=motor.state.copy())

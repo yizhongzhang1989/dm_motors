@@ -169,6 +169,14 @@ footer { padding: 4px 0; }
 .progress-heading { margin-top: 20px; margin-bottom: 9px; }
 .progress-heading h3 { margin: 0; }
 #experiment-mode { margin-bottom: 16px; }
+.draft-summary { border: 1px solid #3b666c; border-radius: 8px; background: #102c37; padding: 14px; margin-bottom: 14px; }
+.draft-summary .heading { margin-bottom: 8px; gap: 6px; }
+.draft-summary strong { font-size: 15px; color: #b6edf0; }
+.draft-summary p + p { margin-top: 6px; }
+.current-step { margin: 10px 0 6px; font-size: 12px; line-height: 1.7; color: #bdd9e7; }
+#experiment-tools { border-top: 1px solid #2a425d; padding-top: 5px; }
+#experiment-tools > summary { font-size: 12px; }
+#experiment-tools[open] > summary { margin-bottom: 4px; }
 #calibration-summary { margin-bottom: 12px; }
 #experiment-configuration { max-height: 320px; overflow-y: auto; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); }
 #experiment-configuration dt { overflow-wrap: anywhere; }

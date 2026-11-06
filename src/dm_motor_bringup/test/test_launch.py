@@ -134,6 +134,7 @@ def test_simulation_discards_only_inherited_topology_limits(tmp_path, profile, e
 @pytest.mark.parametrize("dashboard_host", ["0.0.0.0", "127.0.0.1", "127.0.0.2"])
 def test_included_launch_builds_exact_device_and_dashboard_graph(
         monkeypatch, filename, node_count, backend, dashboard_host):
+    monkeypatch.setattr("common.dashboard.check_endpoints", lambda host, ports: None)
     config = str(Path(get_package_share_directory("dm_motor_control")) / "test/config" / filename)
     _, include, forwarded = configured_launch(
         config=config, namespace="bench", dashboard_host=dashboard_host,
@@ -192,6 +193,7 @@ def test_occupied_dashboard_port_aborts_before_starting_any_nodes():
 
 
 def test_hardware_entry_selects_serial_and_never_adds_simulator(monkeypatch):
+    monkeypatch.setattr("common.dashboard.check_endpoints", lambda host, ports: None)
     context, inner, forwarded = configured_launch(namespace="hardware_test")
     expected = ""
     assert forwarded["config"] == expected
@@ -235,6 +237,7 @@ def test_included_port_collision_guard_is_preserved(monkeypatch):
 ])
 def test_lead_follow_composes_existing_system_and_namespaced_controller(
         monkeypatch, override, config_name, backend, simulation, dashboard_port):
+    monkeypatch.setattr("common.dashboard.check_endpoints", lambda host, ports: None)
     path = Path(__file__).resolve().parents[1] / "launch/lead_follow.launch.py"
     follow_spec = importlib.util.spec_from_file_location("lead_follow_bringup", path)
     module = importlib.util.module_from_spec(follow_spec)
@@ -351,7 +354,7 @@ def test_bilateral_profile_has_separate_port_and_safe_environment_selection():
                                       variant="simulation")["motion_limits_enabled"]
 
 
-def test_bilateral_hardware_uses_common_pd_budget_without_fixed_driver_torque_trips():
+def test_bilateral_hardware_defaults_to_no_added_torque_budget_or_fixed_driver_torque_trips():
     config = ConfigManager()
     profile = ("dm_motor_bringup", "bilateral_control.launch.py")
     motor = config.node_parameters("dm_motor_control", "motor_node", profile)
@@ -361,7 +364,7 @@ def test_bilateral_hardware_uses_common_pd_budget_without_fixed_driver_torque_tr
     assert motor["host_protection_enabled"] is True
     assert motor["mos_temperature_stop"] == 55
     assert motor["rotor_temperature_stop"] == 55
-    assert controller["max_torque"] == 0.5
+    assert controller["max_torque"] == 0.0
     assert controller["motion_limits_enabled"] is False
 
 
@@ -491,6 +494,11 @@ def test_every_launch_reads_selected_config_without_port_arguments(
         if node["executable"] in fields:
             owner, field, _ = fields[node["executable"]]
             expected = config.node_parameters(owner, node["executable"], (package, filename))[field]
+            if node["executable"] == "motor_node":
+                # Per-motor topology overrides take precedence over shared defaults.
+                name = node["parameters"][0].get("motor_name")
+                motor = profile.get("system", {}).get("motors", {}).get(name, {})
+                expected = motor.get(field, expected)
             assert node["parameters"][0][field] == expected
     dashboards = [node["parameters"][0] for node in nodes if node["executable"] == "dashboard.py"]
     ports = [parameters["dashboard_port"]] if parameters.get("dashboard_port") else []

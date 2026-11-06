@@ -11,6 +11,12 @@ import yaml
 from common import ConfigManager
 
 
+@pytest.fixture(autouse=True)
+def offline_port_checks(monkeypatch):
+    # Validate graph/port rules without depending on running dashboard listeners.
+    monkeypatch.setattr("common.dashboard.socket.socket.bind", lambda self, address: None)
+
+
 def load(filename, **overrides):
     path = Path(__file__).resolve().parents[1] / "launch" / filename
     spec = importlib.util.spec_from_file_location("simulation_launch_test", path)
@@ -37,6 +43,8 @@ def test_single_motor_has_production_driver_and_optional_dashboard(monkeypatch, 
     assert nodes[1]["package"] == "dm_motor_control"
     assert nodes[1]["executable"] == "motor_node"
     assert nodes[1]["parameters"][0]["require_virtual_bus"] is True
+    assert nodes[1]["parameters"][0]["event_driven_feedback"] is False
+    assert nodes[1]["parameters"][0]["native_position_observation_rate"] == 0.0
     assert nodes[2]["executable"] == "sim_motor_node"
     assert nodes[2]["namespace"] == "bench/axis"
     if port != "":
@@ -110,6 +118,90 @@ def test_single_motor_rate_and_fd_overrides_reach_driver_and_bus(monkeypatch):
     assert nodes[1]["parameters"][0]["control_rate"] == 400.0
 
 
+@pytest.mark.parametrize("configured,override,expected", [
+    (None, None, 0.0), (125.0, None, 125.0),
+    (125.0, "0", 0.0), (None, "125", 125.0),
+])
+def test_native_position_observation_config_and_explicit_override(
+        tmp_path, monkeypatch, configured, override, expected):
+    data = yaml.safe_load(ConfigManager().path.read_text())
+    defaults = data["packages"]["dm_motor_control"]["nodes"]["motor_node"]
+    if configured is None:
+        defaults.pop("native_position_observation_rate", None)
+    else:
+        defaults["native_position_observation_rate"] = configured
+    path = tmp_path / "position-observation.yaml"
+    path.write_text(yaml.safe_dump(data))
+    overrides = {} if override is None else {"native_position_observation_rate": override}
+    module, context = load("motor.launch.py", config_file=str(path), simulation="true", **overrides)
+    monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
+    driver = next(node for node in module.launch_motor(context) if node["executable"] == "motor_node")
+    assert driver["parameters"][0]["native_position_observation_rate"] == expected
+
+
+@pytest.mark.parametrize("configured,override,expected", [
+    (None, None, False), (None, "true", True),
+    (False, "true", True), (True, None, True), (True, "false", False),
+])
+def test_event_feedback_uses_config_and_explicit_override_with_legacy_fallback(
+        tmp_path, monkeypatch, configured, override, expected):
+    data = yaml.safe_load(ConfigManager().path.read_text())
+    defaults = data["packages"]["dm_motor_control"]["nodes"]["motor_node"]
+    if configured is None:
+        defaults.pop("event_driven_feedback", None)
+    else:
+        defaults["event_driven_feedback"] = configured
+    path = tmp_path / "event-feedback.yaml"
+    path.write_text(yaml.safe_dump(data))
+    overrides = {} if override is None else {"event_driven_feedback": override}
+    module, context = load("motor.launch.py", config_file=str(path), simulation="true", **overrides)
+    monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
+    driver = next(node for node in module.launch_motor(context) if node["executable"] == "motor_node")
+    assert driver["parameters"][0]["event_driven_feedback"] is expected
+
+
+@pytest.mark.parametrize("location", ["nodes", "parameters", "variant"])
+def test_event_feedback_honors_selected_profile_and_simulation_variant(tmp_path, monkeypatch, location):
+    data = yaml.safe_load(ConfigManager().path.read_text())
+    data["packages"]["dm_motor_control"]["nodes"]["motor_node"].pop("event_driven_feedback", None)
+    profile = data["packages"]["dm_motor_control"]["launches"]["motor.launch.py"]
+    if location == "parameters":
+        profile.setdefault("parameters", {})["event_driven_feedback"] = True
+    else:
+        target = profile["variants"]["simulation"] if location == "variant" else profile
+        target.setdefault("nodes", {}).setdefault("dm_motor_control", {}).setdefault(
+            "motor_node", {})["event_driven_feedback"] = True
+    path = tmp_path / "event-feedback-profile.yaml"
+    path.write_text(yaml.safe_dump(data))
+    module, context = load("motor.launch.py", config_file=str(path), simulation="true")
+    monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
+    driver = next(node for node in module.launch_motor(context) if node["executable"] == "motor_node")
+    assert driver["parameters"][0]["event_driven_feedback"] is True
+
+
+@pytest.mark.parametrize("invalid", ["", "yes", "1"])
+def test_event_feedback_rejects_non_boolean_launch_override(monkeypatch, invalid):
+    module, context = load("motor.launch.py", simulation="true", event_driven_feedback=invalid)
+    monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
+    with pytest.raises(ValueError, match="event_driven_feedback must be true or false"):
+        module.launch_motor(context)
+
+
+def test_bus_event_feedback_preserves_shared_and_per_motor_yaml_values(tmp_path, monkeypatch):
+    data = yaml.safe_load(ConfigManager().path.read_text())
+    data["packages"]["dm_motor_control"]["nodes"]["motor_node"]["event_driven_feedback"] = True
+    profile = data["packages"]["dm_motor_control"]["launches"]["bus.launch.py"]
+    profile["system"]["motors"]["motor_2"]["event_driven_feedback"] = False
+    path = tmp_path / "event-feedback-bus.yaml"
+    path.write_text(yaml.safe_dump(data))
+    module, context = load("bus.launch.py", config_file=str(path), simulation="true")
+    monkeypatch.setattr(module, "Node", lambda **kwargs: kwargs)
+    drivers = {node["parameters"][0]["motor_name"]: node["parameters"][0]
+               for node in module.compose(context) if node["executable"] == "motor_node"}
+    assert drivers["motor_1"]["event_driven_feedback"] is True
+    assert drivers["motor_2"]["event_driven_feedback"] is False
+
+
 @pytest.mark.parametrize("backend,port", [("serial", "/dev/ttyACM0"), ("socketcan", "can0"), ("virtual", "/dev/ttyACM0")])
 def test_simulation_scene_rejects_every_physical_transport(tmp_path, backend, port):
     data = yaml.safe_load(ConfigManager().path.read_text())
@@ -127,9 +219,9 @@ def test_system_ports_use_config_allow_headless_and_reject_conflicts(monkeypatch
     monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
     nodes = composition.compose(context)
     devices = [node for node in nodes if node["executable"] == "sim_motor_node"]
-    assert len(devices) == 2
+    assert len(devices) == 3
     assert [node["parameters"][0]["port"] for node in nodes
-            if node["executable"] == "dashboard.py"] == [8080, 8081, 8082]
+            if node["executable"] == "dashboard.py"] == [8080, 8081, 8082, 8088]
     composition, context = load("bus.launch.py", simulation="true",
                                 can_dashboard_ports="", motor_dashboard_ports="")
     monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)

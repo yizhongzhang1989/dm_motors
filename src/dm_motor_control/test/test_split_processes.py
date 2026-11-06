@@ -24,7 +24,7 @@ from can_bus.srv import RegisterClient
 
 class SplitProcesses(unittest.TestCase):
     def setUp(self):
-        os.environ["ROS_DOMAIN_ID"] = str(175 + os.getpid() % 25)
+        os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(175 + os.getpid() % 25))
         rclpy.init()
         self.namespace = f"/split_test_{os.getpid()}_{time.monotonic_ns()}"
         self.bus_namespace = self.namespace + "/can"

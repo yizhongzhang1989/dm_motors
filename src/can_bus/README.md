@@ -25,6 +25,11 @@ interfaces are unchanged. Device emulators subscribe to `wire_tx` and publish
 Virtual RX preserves nonzero monotonic acquisition timestamps, so topic queue
 delay is not hidden from motor feedback age. `sim` remains a legacy test alias
 with its existing timestamp behavior.
+For `virtual`, `wire_tx` and `tx_observed` share one timestamp taken immediately
+before publishing the wire frame: a simulated device can respond before that
+publish returns. The successful observation is queued only after publish returns.
+Physical transports and legacy `sim` retain their send-return TX timestamps;
+neither timestamp is a device execution acknowledgement.
 
 ```bash
 ros2 launch can_bus can_bus.launch.py namespace:=can/main backend:=virtual
@@ -120,13 +125,52 @@ Explicit `FASTRTPS_DEFAULT_PROFILES_FILE` / `FASTDDS_DEFAULT_PROFILES_FILE` valu
 and other `RMW_IMPLEMENTATION` choices are preserved. All participating processes
 must load the workspace environment; already running processes do not inherit a new profile.
 
+Humble `rmw_fastrtps` 6.2.10 adds its own loopback UDP and SHM transports after
+loading XML when `ROS_LOCALHOST_ONLY=1`. Shared-memory mappings in that mode do
+not mean this hook failed. The DDS regression checks the XML policy and actual
+message delivery, expecting RMW-added SHM in localhost mode and no SHM in ordinary
+profile mode. An isolated localhost-only run verifies only the former runtime branch.
+
+For an explicitly local, UDP-only deployment, select the separate
+[loopback UDP profile](config/fastdds_loopback_udp.xml) and set `ROS_LOCALHOST_ONLY=0`.
+The XML permits only `127.0.0.1` and disables built-in transports; the zero value
+prevents Humble from adding SHM after loading it. Apply this environment to every
+new participating process, using the installation built from this source:
+
+```bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ROS_LOCALHOST_ONLY=0
+unset FASTDDS_DEFAULT_PROFILES_FILE
+export FASTRTPS_DEFAULT_PROFILES_FILE="$(ros2 pkg prefix can_bus)/share/can_bus/config/fastdds_loopback_udp.xml"
+ros2 launch dm_motor_bringup bilateral_control.launch.py config_file:=/absolute/path/to/site.yaml
+```
+
+This is an explicit deployment choice: the environment hook and launch defaults
+do not select it or replace a user's custom profile. It disables inter-machine
+DDS communication. It does not change reliability, history depth, publication
+mode, command TTL, physical CAN settings or motor protections. Existing processes
+keep their original environment until deliberately restarted. Do not combine it
+with `ROS_LOCALHOST_ONLY=1` and assume SHM remains disabled.
+
+`test_dds_loopback` checks the XML and exchanges a unique payload between two
+independent processes in a private nonzero ROS domain, checking both processes
+for absence of Fast DDS SHM mappings in both SYNCHRONOUS and ASYNCHRONOUS
+publication modes. It accesses no CAN device. This verifies
+transport selection and communication, not a bound on every publication latency.
+
+The [2026-11-06 publication-stall investigation](../../docs/2026-11-06-dds-publication-stall.md)
+separates the measured 204 ms publication/lock wait, Humble's added SHM, the
+possible port-health mechanism, and the six-round production UDP-only comparison
+using default SYNCHRONOUS publication. It preserves failed attempts and does not
+claim a uniquely proven SHM cause or completed unilateral/bilateral comparison.
+
 With Humble / Fast DDS 2.6.12, repeated abrupt motor-process exits exposed intermittent
 peer communication timeouts under default SHM; the unchanged failure-isolation test
 passed 20 consecutive runs with UDPv4. The
 [Fast DDS SHM documentation](https://fast-rtps.docs.eprosima.com/en/2.6.x/fastdds/transport/shared_memory/shared_memory.html)
 describes crashed-port recovery with a default 1000 ms health-check timeout.
-This deployment default avoids that recovery path instead of relaxing application
-watchdogs or deleting shared-memory objects belonging to other processes.
+The explicit loopback UDP option excludes that recovery path without relaxing
+application watchdogs or deleting shared-memory objects belonging to other processes.
 Custom middleware profiles need their own process-failure and latency qualification.
 
 ## Interface

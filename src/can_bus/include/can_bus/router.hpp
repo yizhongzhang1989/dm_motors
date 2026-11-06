@@ -26,8 +26,20 @@ struct Client
   bool activity_requires_stop{false};
   bool receive_ready{true};
   bool quiet{true}, revoked{false}, fault{false};
-  struct Pending {Frame frame; double expires; uint8_t priority; bool active;};
+  // 0 ordinary, 1 exact registered STOP, 2 maintenance, 3 optional read-only position80.
+  // Optional entries never coalesce; at most one per exact owned motor read route.
+  struct Pending
+  {
+    Frame frame; double expires; uint8_t priority; bool active;
+    uint64_t sequence{0}, sent_steady{0};
+  };
   std::deque<Pending> pending;
+};
+struct OptionalReadRemoved
+{
+  std::string token;
+  uint64_t epoch{0}, sequence{0}, stop_sequence{0}, sent_steady{0}, removed_steady{0};
+  Frame frame;
 };
 class Router
 {
@@ -35,7 +47,9 @@ public:
   explicit Router(uint64_t epoch, bool fd = false) : epoch(epoch), allow_fd(fd) {}
   std::string add(Client client, double now);
   void heartbeat(const std::string &, uint64_t, uint64_t, bool, bool, double, uint64_t sent_steady = 0);
-  void enqueue(const std::string &, uint64_t, uint64_t, double, uint8_t,
+  // At most the existing 32 queued entries; only a committed STOP erase returns
+  // evidence. The caller must dispatch STOP before asynchronously publishing it.
+  std::vector<OptionalReadRemoved> enqueue(const std::string &, uint64_t, uint64_t, double, uint8_t,
     const Frame &, double, bool active = false, uint64_t sent_steady = 0);
   bool maintenance(const std::string &, uint64_t, bool, double, double);
   std::vector<Frame> drain(double now, bool transmit_ready = true);

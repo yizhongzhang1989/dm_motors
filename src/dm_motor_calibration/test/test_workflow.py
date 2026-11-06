@@ -186,6 +186,127 @@ def test_simulator_rejects_invalid_plant_and_does_not_leak_a_process(simulator):
     assert process.poll() == 0
 
 
+def ideal_plant(**changes):
+    return {"inertia": 1.0, "coulomb_friction": 0.0, "static_friction": 0.0,
+            "viscous_friction": 0.0, "torque_time_constant": 0.0,
+            "constant_torque_speed": 100.0, "no_load_speed": 1000.0,
+            "integration_step": 0.001, **changes}
+
+
+def test_isolated_simulator_override_matches_explicit_executable(simulator, monkeypatch):
+    if simulator is None:
+        pytest.skip("Independent executable not configured for this test run")
+    monkeypatch.setenv("DM_CALIBRATION_SIMULATOR", str(simulator))
+    with SimulatedMotor({}) as selected, SimulatedMotor({}, simulator) as explicit:
+        assert selected.step(0.1) == explicit.step(0.1)
+
+
+def test_default_measurements_preserve_truth_and_disabled_history(simulator):
+    with SimulatedMotor(ideal_plant(initial_velocity=0.2), simulator) as motor:
+        assert motor.state["velocity"] == motor.state["physical_velocity"] == 0.2
+        assert motor.state["torque"] == motor.state["physical_torque"] == 0.0
+        for enabled in (True, False, True):
+            state = motor.step_mit(0, 0.1, 0, 0.5, 0.4, dt=0.003, enabled=enabled)
+            assert state["velocity"] == state["physical_velocity"] == state["internal_velocity"]
+            assert state["torque"] == state["physical_torque"] == state["reference_torque"]
+        assert motor.state["time"] == pytest.approx(0.009)
+
+
+def test_report_torque_filter_and_fractional_delay_are_independent_of_actuation(simulator):
+    parameters = ideal_plant(feedback_torque_time_constant=0.012, feedback_torque_delay=0.0015)
+    with SimulatedMotor(parameters, simulator) as motor:
+        # Equal external torque holds physical speed at zero: the report has a known unit-step input.
+        state = motor.step(1, dt=0.01, external=-1)
+        expected = 0.5 * ((1 - math.exp(-0.008 / 0.012)) + (1 - math.exp(-0.009 / 0.012)))
+        assert state["physical_torque"] == state["reference_torque"] == 1.0
+        assert state["torque"] == pytest.approx(expected, abs=1e-14)
+        assert state["time"] == 0.01  # Signal delay is not a backdated acquisition timestamp.
+        state = motor.step(0, dt=0.001, enabled=False)
+        assert state["physical_torque"] == 0
+        assert state["torque"] > expected  # STOP does not erase the existing report history.
+
+
+def test_physical_report_velocity_bypasses_internal_estimator_and_preserves_initial_value(simulator):
+    parameters = ideal_plant(initial_velocity=0.2, velocity_time_constant=0.02,
+                            feedback_velocity_source="physical", feedback_velocity_time_constant=0.0045,
+                            feedback_velocity_delay=0.0015)
+    internal, reported = 0.2, [0.2]
+    for step in range(1, 11):
+        physical = 0.2 + step * 0.001
+        internal += -math.expm1(-0.001 / 0.02) * (physical - internal)
+        reported.append(reported[-1] + -math.expm1(-0.001 / 0.0045) * (physical - reported[-1]))
+    with SimulatedMotor(parameters, simulator) as motor:
+        assert motor.state["velocity"] == motor.state["internal_velocity"] == 0.2
+        state = motor.step(0, dt=0.01, external=1, enabled=False)
+        assert state["physical_velocity"] == pytest.approx(0.21, abs=1e-14)
+        assert state["internal_velocity"] == pytest.approx(internal, abs=1e-14)
+        assert state["velocity"] == pytest.approx(0.5 * (reported[8] + reported[9]), abs=1e-14)
+        assert state["velocity"] > state["internal_velocity"]
+
+
+def test_reporting_chain_does_not_change_native_damping_or_plant(simulator):
+    base = ideal_plant(velocity_time_constant=0.008)
+    reports = {"feedback_velocity_source": "physical", "feedback_velocity_time_constant": 0.0045,
+               "feedback_velocity_delay": 0.0015, "feedback_torque_time_constant": 0.012,
+               "feedback_torque_delay": 0.002}
+    with SimulatedMotor(base, simulator) as original, SimulatedMotor({**base, **reports}, simulator) as filtered:
+        for enabled in (True, True, False, True):
+            a = original.step_mit(0.01, 0.2, 1, 1, 0.1, dt=0.01, enabled=enabled)
+            b = filtered.step_mit(0.01, 0.2, 1, 1, 0.1, dt=0.01, enabled=enabled)
+            for key in ("position", "physical_velocity", "physical_torque", "internal_velocity", "command_torque"):
+                assert a[key] == b[key]
+        assert a["velocity"] != b["velocity"]
+        assert a["torque"] != b["torque"]
+
+
+def test_constant_torque_knee_and_saturation_observer_use_same_envelope(simulator):
+    common = ideal_plant(inertia=1000, initial_velocity=5, max_torque=7.87, no_load_speed=50)
+    with SimulatedMotor({**common, "constant_torque_speed": 8}, simulator) as flat:
+        state = flat.step(7.5, dt=0.001)
+        assert state["physical_torque"] == 7.5
+        assert state["saturated"] == 0
+    with SimulatedMotor({**common, "constant_torque_speed": 0}, simulator) as legacy:
+        state = legacy.step(7.5, dt=0.001)
+        assert state["physical_torque"] == pytest.approx(7.87 * 0.9)
+        assert state["saturated"] == 1
+
+
+@pytest.mark.parametrize("parameter,value", [
+    ("integration_step", 0), ("integration_step", 0.002),
+    ("feedback_velocity_source", "unknown"), ("velocity_time_constant", -0.1),
+    ("feedback_velocity_time_constant", math.nan), ("feedback_velocity_delay", 0.101),
+    ("feedback_torque_time_constant", -0.001), ("feedback_torque_delay", math.inf),
+    ("constant_torque_speed", 50),
+])
+def test_simulator_rejects_invalid_measurement_and_envelope_parameters(simulator, parameter, value):
+    with pytest.raises(CalibrationError):
+        SimulatedMotor({parameter: value}, simulator)
+
+
+def test_precision_controller_consumes_reports_without_truth_or_timestamp_substitution(simulator):
+    from dm_motor_calibration.precision import Drive, PrecisionExperiment, PrecisionSettings
+    from dm_motor_calibration.precision_simulation import collect_prepared
+    captured = []
+
+    class Capture(PrecisionExperiment):
+        def control(self, now):
+            return Drive(enable=True, torque=0.1)
+
+        def ingest(self, sample, tag):
+            captured.append(sample)
+            raise CalibrationError("captured observation")
+
+    parameters = ideal_plant(feedback_torque_delay=0.01, feedback_velocity_delay=0.01)
+    with pytest.raises(CalibrationError, match="captured observation"):
+        collect_prepared(parameters, settings=PrecisionSettings(warmup_repetitions=0), noise=0,
+                         quantized=False, executable=simulator, engine_factory=Capture)
+    assert len(captured) == 1
+    sample = captured[0]
+    assert sample.time == 0.005
+    assert sample.velocity == sample.torque == 0.0
+    assert sample.position > 0.0  # Physical state moved; the delayed reports are still their initial values.
+
+
 def test_cli_import_preserves_samples_provenance_and_never_overwrites(tmp_path, capsys):
     t = np.arange(0, 12, 0.005)
     position = 0.5 * np.sin(t) + 0.2 * np.sin(2.3 * t)

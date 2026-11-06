@@ -1,0 +1,154 @@
+# Explicit hardware-only A/B/C bilateral test rig; no automatic enable.
+# A/id1 and C/id3 are coaxially coupled with opposite encoder directions.
+# B/id2 is mechanically free and follows A through differential bilateral control.
+# 2026-11-05 selected B100: short sweeps, release and V16 continuous 301.24 s passed.
+# Historical evidence: ../docs/experiment-history.md; current checks: ../docs/cleanup-validation.md.
+# Use the existing dm_motor_bringup/bilateral_control.launch.py with config_file.
+# See bilateral_physical_rig.md for limits, lifecycle, attach command and checks.
+# No simulation variant: simulation:=true is rejected before creating devices.
+version: 2
+system_parameters_file: system_parameters.yaml
+packages:
+  can_bus:
+    nodes:
+      can_bus_node:
+        backend: serial
+        can_bitrate: 1000000
+        can_fd: false
+        client_timeout: 0.5
+        io_rate: 1000.0
+        port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+      dashboard:
+        bus_namespace: /can/main
+        host: 0.0.0.0
+        port: 8080
+  dm_motor_control:
+    nodes:
+      motor_node:
+        motor_name: motor_1
+        motor_id: 1
+        master_id: 0
+        can_bus_namespace: /can/main
+        require_virtual_bus: false
+        can_fd: false
+        control_rate: 500.0
+        event_driven_feedback: false
+        state_rate: 500.0
+        max_task_duration: 60.0
+        mode: 1
+        configure_mode_on_startup: true
+        startup_velocity_bandwidth: 100.0
+        profile: j4310_v12
+        legacy_control: false
+        direction: 1.0
+        software_offset: 0.0
+        watchdog_timeout: 0.2
+        command_timeout: 0.25
+        feedback_timeout: 0.1
+        position_limit: 0.0
+        velocity_limit: 26.0
+        torque_limit: 0.0
+        kp_limit: 500.0
+        kd_limit: 1.0
+        position_min: -350.0
+        position_max: 350.0
+        host_protection_enabled: true
+        measured_velocity_limit: 26.0
+        measured_torque_limit: 0.0
+        estimated_torque_limit: 0.0
+        mos_temperature_stop: 50.0
+        rotor_temperature_stop: 50.0
+        protection_samples: 1
+        fault_group: ''
+      dashboard:
+        motor_id: 1
+        host: 0.0.0.0
+        port: 8081
+        client_timeout: 0.75
+        command_timeout: 0.25
+        simulation: false
+        shaft_stiffness: 1.0
+        shaft_damping: 0.05
+  dm_motor_bilateral_control:
+    nodes:
+      bilateral_control_node:
+        control_mode: differential_torque
+        coupling_damping: 0.4975
+        direction: 1
+        feedback_age: 0.02
+        feedback_stop: 0.08
+        friction_compensation_enabled: true
+        friction_compensation_fraction: 0.6
+        friction_torque_limit: 0.4
+        # Explicit additional controller gains; not qualified calibration terms.
+        # B uses its identified viscosity; A defaults to 0 (latest tested A candidate is documented separately).
+        extra_viscous_a: 0.0
+        extra_viscous_b: 0.02584737521699079
+        extra_viscous_velocity_limit: 13.2
+        local_damping: 0.005
+        max_feedback_torque: 1.0
+        max_temperature: 55.0
+        max_torque: 0.0
+        max_travel: 0.3
+        motion_limits_enabled: false
+        motor_a: motor_1
+        motor_b: motor_2
+        operator_timeout: 1.0
+        pair_skew: 0.005
+        rate: 500.0
+        recovery_time: 0.1
+        required_velocity_bandwidth: 100.0
+        stiffness: 50.0
+        target_validity: 0.05
+        warning_temperature: 45.0
+        allow_differential_hardware: true
+      dashboard:
+        controller_namespace: bilateral_control
+        host: 0.0.0.0
+        port: 8084
+  dm_motor_bringup:
+    launches:
+      bilateral_control.launch.py:
+        parameters:
+          namespace: ''
+          control_rate: '500'
+          dashboard_host: 0.0.0.0
+          can_dashboard_ports:
+            main: 8080
+          motor_dashboard_ports:
+            motor_1: 8081
+            motor_2: 8082
+            motor_3: 8088
+          dashboard_port: 8084
+        system:
+          bus_names:
+          - main
+          motor_names:
+          - motor_1
+          - motor_2
+          - motor_3
+          buses:
+            main:
+              backend: serial
+              port: /dev/serial/by-id/usb-HDSC_CDC_Device_00000000050C-if00
+          motors:
+            motor_1:
+              bus: main
+              motor_id: 1
+            motor_2:
+              bus: main
+              motor_id: 2
+            motor_3:
+              bus: main
+              motor_id: 3
+              command_timeout: 0.12
+              estimated_torque_limit: 4.0
+              feedback_timeout: 0.08
+              measured_torque_limit: 4.0
+              measured_velocity_limit: 16.0
+              mos_temperature_stop: 48.0
+              rotor_temperature_stop: 48.0
+              torque_limit: 4.0
+              velocity_limit: 16.0
+              watchdog_timeout: 0.1
+              startup_velocity_bandwidth: 40.0

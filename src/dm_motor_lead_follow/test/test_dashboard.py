@@ -130,7 +130,7 @@ class Harness:
 
 @pytest.fixture
 def harness():
-    os.environ["ROS_DOMAIN_ID"] = str(125 + os.getpid() % 20)
+    os.environ["ROS_DOMAIN_ID"] = os.environ.get("DM_MOTOR_TEST_DOMAIN", str(125 + os.getpid() % 20))
     rclpy.init()
     namespace = f"/follow_web_{os.getpid()}_{time.monotonic_ns()}"
     controller = Controller(namespace)

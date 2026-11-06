@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import math
+import os
 from pathlib import Path
 import select
 import subprocess
@@ -17,11 +18,36 @@ from .experiment import ExperimentSettings, feedback_torque, guard, reference
 
 
 SIM_COLUMNS = ("time", "position", "velocity", "torque", "command_torque", "external_torque",
-               "temperature", "current", "ambient_temperature", "heating_power", "reference_torque", "saturated")
+               "temperature", "current", "ambient_temperature", "heating_power", "reference_torque", "saturated",
+               "physical_velocity", "physical_torque", "internal_velocity")
+
+# These mirror the C++ calibration entry point; all report dynamics are opt-in.
+MEASUREMENT_DEFAULTS = {
+    "velocity_time_constant": 0.0, "feedback_velocity_source": "internal",
+    "feedback_velocity_time_constant": 0.0, "feedback_velocity_delay": 0.0,
+    "feedback_torque_time_constant": 0.0, "feedback_torque_delay": 0.0,
+}
+
+
+def measurement_configuration(parameters: Mapping[str, float | str]) -> dict:
+    return {"implementation": "dm_motor_control::simulation::FeedbackDynamics",
+            "parameters": {key: parameters.get(key, value) for key, value in MEASUREMENT_DEFAULTS.items()},
+            "integration_step": parameters.get("integration_step", 0.00025),
+            "timestamp": "acquisition_time; signal delay does not backdate the timestamp",
+            "observation_fields": ["position", "velocity", "torque", "temperature"],
+            "truth_fields": ["physical_velocity", "physical_torque", "internal_velocity",
+                             "reference_torque", "current", "heating_power"]}
 
 
 class SimulatedMotor:
+    """Physical plant plus device measurement dynamics, without CAN or transport.
+
+    ``velocity``/``torque`` are reports (before optional Python noise/quantization).
+    Explicit physical/internal columns are diagnostics, never controller feedback.
+    """
     def __init__(self, parameters: Mapping[str, float | str], executable: Path | None = None):
+        if executable is None and os.environ.get("DM_CALIBRATION_SIMULATOR"):
+            executable = Path(os.environ["DM_CALIBRATION_SIMULATOR"])
         if executable is None:
             from ament_index_python.packages import get_package_prefix
             executable = Path(get_package_prefix("dm_motor_calibration")) / "lib/dm_motor_calibration/calibration_simulator"

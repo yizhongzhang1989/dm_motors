@@ -197,6 +197,25 @@ def test_compact_migration_preserves_physical_values_and_runtime_semantics(tmp_p
         load_calibration(store, {**motor_identity(), "software_offset": 1.0})
 
 
+def test_published_quick_predictor_keeps_physical_parameter_qualification_separate(tmp_path):
+    path = tmp_path / "system.yaml"
+    path.write_text("version: 1\nmotors: {}\n")
+    fit = qualified_result()
+    semantics = {"independent_validation": 1.0, "quick_protocol_version": 1.0,
+                 "physical_parameters_independently_validated": 0.0}
+    fit = replace(fit, diagnostics={**fit.diagnostics, **semantics})
+    artifact = tmp_path / "calibration.json"
+    fit.save(artifact, motor_identity())
+    store = SystemParameters(path)
+    publish_calibration(store, artifact)
+    saved = store.calibration("/motor_1", False, "mechanical")
+    assert saved["qualified"] is True
+    assert saved["fit"]["diagnostics"] == semantics
+    assert load_calibration(store, motor_identity()).diagnostics == semantics
+    store.compact()
+    assert store.calibration("/motor_1", False, "mechanical")["fit"]["diagnostics"] == semantics
+
+
 @pytest.mark.parametrize("mutation", ["unqualified", "bad_fit", "no_identity"])
 def test_invalid_result_preserves_last_good_calibration(tmp_path, mutation):
     path = tmp_path / "system.yaml"
@@ -305,7 +324,11 @@ def test_precision_finish_never_publishes_even_qualified_result(tmp_path, qualif
         node.stop_confirmed = True
         node.identity = motor_identity()
         node.publish_status = Mock()
-        node.status_message = Mock()
+        node.status_message = Mock(return_value={
+            "elapsed": 1.0, "progress": 100.0,
+            "stage": "completed" if qualified else "completed_unqualified",
+            "precision": {}, "precision_settings": {}, "fourier_settings": {},
+        })
         node.precision_engine = Mock()
         node.precision_engine.analysis.return_value = (
             qualified_result() if qualified else None, {"quality_issues": [] if qualified else ["test limit"]})

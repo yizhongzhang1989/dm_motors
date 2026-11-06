@@ -13,11 +13,12 @@ from .data import CalibrationError, FitResult, ModelResult, read_json
 from .data_usage import AcquisitionUsage
 from .dashboard_data import DISPLAY_FIELDS, DisplayBuffer, decode_object
 from .reidentify import file_sha256, load_recording
+from .speed_sweep_report import speed_sweep_analysis, verify_speed_sweep_inputs
 
 
 TERMINAL_STATES = frozenset({"completed", "completed_unqualified", "qualified", "failed", "incomplete", "recorded"})
 TRACE_FIELDS = ("time", "position", "velocity", "torque", "target_position", "target_velocity",
-                "command_torque", "temperature", "current", "voltage", "external_torque")
+                "command_torque", "temperature", "current", "voltage", "external_torque", "trial_index")
 MAX_TRACE_ROWS = 3000
 
 
@@ -124,7 +125,8 @@ def _event_records(data: ReportData) -> list[tuple[float, float]]:
 
 
 def _read_samples(data: ReportData) -> None:
-    path = input_path(data.root, "samples.csv")
+    filename = "all_samples.csv" if data.report.get("quick_adaptation") and input_path(data.root, "all_samples.csv").is_file() else "samples.csv"
+    path = input_path(data.root, filename)
     if not path.exists():
         data.notices.append("本目录没有已提交的 samples.csv；不猜测缺失的原始轨迹。")
         display = optional_json(data.root, "display.json")
@@ -143,6 +145,8 @@ def _read_samples(data: ReportData) -> None:
     intervals = array("d")
     usage = AcquisitionUsage(data.metadata or {})
     previous = None
+    previous_trial = None
+    trial_boundaries = 0
     count = invalid = nonmonotonic = omitted = 0
     for row in csv_rows(path):
         count += 1
@@ -154,6 +158,11 @@ def _read_samples(data: ReportData) -> None:
         if "analysis_valid" in row:
             invalid += float(row["analysis_valid"]) != 1
         timestamp = float(row.get("receive_time", row["time"]))
+        trial = row.get("trial_index") if data.report.get("experiment") == "speed_sweep" else None
+        if previous is not None and trial is not None and trial != previous_trial:
+            trial_boundaries += 1
+            previous = None
+        previous_trial = trial
         if math.isfinite(timestamp):
             if previous is not None:
                 if timestamp > previous:
@@ -176,13 +185,20 @@ def _read_samples(data: ReportData) -> None:
     data.trace = reduce_trace(data.trace)
     data.diagnostics.update(sample_rows=count, invalid_analysis_rows=invalid,
                             nonincreasing_sample_times=nonmonotonic, plot_nonfinite_rows=omitted,
-                            sample_interval_ms=statistics(intervals), displayed_rows=len(data.trace))
+                            sample_interval_ms=statistics(intervals), displayed_rows=len(data.trace), motion_source=filename)
+    if data.report.get("experiment") == "speed_sweep":
+        data.diagnostics["excluded_independent_trial_boundaries"] = trial_boundaries
+    if filename == "all_samples.csv":
+        expected = data.report.get("recorded_samples")
+        if expected is not None and (type(expected) is not int or expected != count):
+            raise CalibrationError("All-sample count differs from recorded_samples in report.json")
+        data.notices.append("全过程来自 all_samples.csv，含预探测与回位；正式拟合和独立验证仅使用 samples.csv。")
     data.diagnostics["data_usage"] = usage.summary()
     if omitted:
         data.notices.append(f"{omitted} 条含非有限数值的记录未绘制，但原始数据未修改。")
     if invalid or nonmonotonic:
         data.notices.append(f"检测到 {invalid} 条被标记无效的分析样本和 {nonmonotonic} 处非递增采集时间；不能把它们当成有效连续测量。")
-    _check_count(data, "samples.csv", count)
+    _check_count(data, filename, count)
 
 
 def _check_count(data: ReportData, name: str, count: int) -> None:
@@ -279,6 +295,21 @@ def load_report_data(directory: Path) -> ReportData:
         raise CalibrationError("Report motor identity must be an object")
     precision = report.get("precision")
     fourier = report.get("fourier")
+    quick = report.get("quick")
+    for field in ("quick_adaptation", "requested_configuration"):
+        value = report.get(field)
+        saved = optional_json(root, field + ".json")
+        if value is not None and (not isinstance(value, dict) or saved is not None and value != saved):
+            raise CalibrationError(f"Saved {field} disagrees with the committed report")
+    saved_quick = optional_json(root, "quick.json")
+    if quick is not None and (not isinstance(quick, dict) or
+                              (saved_quick is not None and quick != saved_quick)):
+        raise CalibrationError("Saved quick validation results disagree with the committed report")
+    low_speed = report.get("low_speed")
+    saved_low_speed = optional_json(root, "low_speed.json")
+    if low_speed is not None and (not isinstance(low_speed, dict) or
+                                 saved_low_speed is not None and low_speed != saved_low_speed):
+        raise CalibrationError("Saved low-speed results disagree with the committed report")
     saved_fourier = optional_json(root, "fourier.json")
     if fourier is not None and (not isinstance(fourier, dict) or (saved_fourier is not None and fourier != saved_fourier)):
         raise CalibrationError("Saved Fourier results disagree with the committed report")
@@ -325,6 +356,33 @@ def load_report_data(directory: Path) -> ReportData:
     elif isinstance(report.get("source_fit"), dict):
         fit = ModelResult.from_mapping(report["source_fit"])
     data = ReportData(root, report, metadata, identity, precision, static, fit)
+    if speed_sweep_analysis(report) is not None:
+        verify_speed_sweep_inputs(root, report)
+        data.verified_inputs = True
+        data.notices.append("独立高速实验已核对分析、样本和源记录哈希；滑动预测通过不代表惯量、静摩擦或绝对力矩标尺已标定，未发布生产参数。")
+    if report.get("experiment") == "low_speed":
+        raw = optional_json(root, "raw_recording.json")
+        if raw is not None and report.get("raw_recording") != raw:
+            raise CalibrationError("Raw low-speed manifest disagrees with the committed report")
+        if raw is not None and raw.get("recording_complete") is True:
+            if raw.get("kind") != "motor_message_journals" or raw.get("schema") != 1 or raw.get("identity") != identity:
+                raise CalibrationError("Unsupported or mismatched low-speed raw recording")
+            files = raw.get("files", {})
+            required = {"feedback.csv", "state.csv", "commands.csv", "events.csv"}
+            if not required <= set(files) <= required | {"position_observation.csv"}:
+                raise CalibrationError("Low-speed raw recording is missing a message stream")
+            for name, spec in {**files, **report.get("sample_files", {})}.items():
+                path = input_path(root, name)
+                if (not path.is_file() or file_sha256(path) != spec.get("sha256") or
+                        path.stat().st_size != spec.get("bytes")):
+                    raise CalibrationError(f"Low-speed recorded input changed: {name}")
+                if name in files and sum(1 for _ in csv_rows(path)) != spec.get("rows"):
+                    raise CalibrationError(f"Low-speed raw row count changed: {name}")
+            for source in raw.get("sources", []):
+                if file_sha256(input_path(root, source["path"])) != source.get("sha256"):
+                    raise CalibrationError("Low-speed acquisition source snapshot changed")
+            data.verified_inputs = True
+            data.notices.append("已核对低速实验保存的消息日志、分析CSV与源码哈希；这证明归档字节一致，不证明物理总线或DDS零丢帧。")
     data.fourier = fourier
     data.warmup = optional_json(root, "warmup.json") or report.get("warmup") or (precision or fourier or {}).get("warmup")
     if data.warmup is not None:
@@ -353,7 +411,7 @@ def load_report_data(directory: Path) -> ReportData:
             prior = load_report_data(parent)
             data.parents = [*prior.parents, prior]
             data.notices.append("本次包含断点续采：辨识结果包含父段，下面各段轨迹与控制时序分别展示，不把暂停连接成连续运动。")
-    else:
+    elif not data.verified_inputs:
         data.notices.append("本目录没有完整原始记录清单，不能宣称已核验全部原始字节；仅分析现有保存结果。")
     pauses = _event_records(data)
     _read_samples(data)

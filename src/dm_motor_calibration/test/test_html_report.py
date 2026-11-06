@@ -99,6 +99,76 @@ def test_signed_friction_curve_is_the_first_visible_report_section(exported):
     assert "零速未测区间" in content
 
 
+@pytest.mark.parametrize("has_ranges", [True, False], ids=["signed_shared_bands", "legacy_missing_directions"])
+def test_quick_html_shared_bands_leave_low_speed_gap_and_preserve_inputs(tmp_path, monkeypatch, has_ranges):
+    from dm_motor_calibration import html_report
+
+    # Saved A-axis v3 shared-window ranges; no motor runtime or acquisition is needed.
+    directions = {
+        "negative": {"velocity_min": -0.5124790615967407, "velocity_max": -0.2866758763820284,
+                     "windows": {"training": 25, "external_validation": 23}},
+        "positive": {"velocity_min": 0.27129437621903174, "velocity_max": 0.5241661252967286,
+                     "windows": {"training": 30, "external_validation": 22}},
+    }
+    quick = {
+        "protocol": "quick_independent_v1", "qualified": True,
+        "candidate_model": {
+            "model": "coulomb_viscous",
+            "parameters": {"inertia": 0.00187, "bias": -0.00194, "coulomb": 0.1554, "viscous": 0.0},
+            "units": {"inertia": "kg*m^2", "bias": "Nm", "coulomb": "Nm", "viscous": "Nm/(rad/s)"},
+            "diagnostics": {}, "warnings": [],
+            "domain": {"velocity_min": -0.5420018012344405, "velocity_max": 0.5244350041312194},
+        },
+        "training": {"windows": 58, "velocity_min": -0.5420018012344405, "velocity_max": 0.5244350041312194},
+        "external_validation": {"windows": 46, "velocity_min": -0.5124790615967407,
+                                "velocity_max": 0.5241661252967286},
+        "coverage": {"validated_velocity_min": -0.5124790615967407,
+                     "validated_velocity_max": 0.5241661252967286},
+    }
+    if has_ranges:
+        quick["coverage"]["directions"] = directions
+    report = {"status": "completed", "experiment": "calibrate", "qualified": True,
+              "stop_confirmed": True, "quick": quick}
+    source = tmp_path / "source"
+    source.mkdir()
+    atomic_json(source / "report.json", report)
+    atomic_json(source / "quick.json", quick)
+    before = {path.name: path.read_bytes() for path in source.iterdir()}
+    curves = []
+    original_chart = html_report.chart
+
+    def capture_chart(*args, **kwargs):
+        if args[0] == "快速机械标定的摩擦模型":
+            curves.extend(args[3])
+        return original_chart(*args, **kwargs)
+
+    monkeypatch.setattr(html_report, "chart", capture_chart)
+    result = generate_html_report(source, tmp_path / "report.html")
+    content = Path(result["output"]).read_text()
+    primary = content.split('<section id="friction-curve"', 1)[1].split("</section>", 1)[0]
+    assert "共有滑动窗口均速范围 / rad/s" in primary
+    assert "训练窗口（共有范围内）" in primary and "独立验证窗口（共有范围内）" in primary
+    assert "未覆盖段留空" in primary and "不表示区间内每个速度已获验证" in primary
+    assert "窗口均速整体包络 / rad/s" in content and "跨零包络不表示低速空洞已被覆盖" in content
+    if has_ranges:
+        assert len(curves) == 2
+        for series, direction in zip(curves, ("negative", "positive")):
+            shared = directions[direction]
+            lower, upper = shared["velocity_min"], shared["velocity_max"]
+            assert series.points
+            assert all(lower <= x <= upper for x, _ in series.points)
+            assert min(x for x, _ in series.points) == pytest.approx(lower)
+            assert max(x for x, _ in series.points) == pytest.approx(upper)
+            assert json.dumps([lower, upper]) in primary
+            counts = shared["windows"]
+            assert f'<td>{counts["training"]}</td><td>{counts["external_validation"]}</td>' in primary
+    else:
+        assert curves == [] and "<svg" not in primary
+        assert "未记录 / 未测得" in primary and "不从整体速度包络推断" in primary
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == before
+    assert read_json(source / "report.json")["quick"]["qualified"] is True
+
+
 def test_report_cli_does_not_import_ros_or_construct_a_motor(exported, tmp_path):
     source, _, _, _ = exported
     code = """
@@ -354,3 +424,54 @@ def test_dashboard_auto_schedules_only_committed_terminal_runs():
     Dashboard.tick(node)
     Dashboard.tick(node)
     node.request_html_report.assert_called_once_with("run")
+
+
+def test_adaptive_failure_without_formal_plan_keeps_pilot_and_unselected_meaning(tmp_path):
+    from dm_motor_calibration.report_data import load_report_data
+    root = tmp_path / "adaptive"
+    root.mkdir()
+    adaptation = {"status": "aborted", "selected_candidate": None, "attempts": [],
+                  "candidates": {}, "abort_reasons": ["Observed travel guard"]}
+    report = {"status": "failed", "experiment": "calibrate", "samples": 0, "recorded_samples": 3,
+              "qualified": False, "stop_confirmed": True, "error": "Observed travel guard",
+              "quick_adaptation": adaptation, "requested_configuration": {"quick_excitation": "auto", "kp": .3},
+              "configuration": {"quick_excitation": "auto", "kp": .3}}
+    atomic_json(root / "report.json", report)
+    atomic_json(root / "quick_adaptation.json", adaptation)
+    atomic_json(root / "requested_configuration.json", report["requested_configuration"])
+    (root / "all_samples.csv").write_text("time,position,velocity,torque,leg\n0,0,0,0,-2\n1,.1,.1,.1,-2\n2,.2,.1,.1,-2\n")
+    data = load_report_data(root)
+    assert data.diagnostics["motion_source"] == "all_samples.csv"
+    assert data.diagnostics["sample_rows"] == 3 and data.report["samples"] == 0
+    result = generate_html_report(root)
+    text = Path(result["output"]).read_text()
+    assert "自动选择激励" in text and "未选定" in text and "Observed travel guard" in text
+    assert "正式样本" in text and "全部记录样本" in text
+    assert "all_samples.csv" in text and "选中激励不代表标定合格" in text
+    assert not (root / "quick_plan.json").exists() and not (root / "calibration.json").exists()
+    atomic_json(root / "quick_adaptation.json", {**adaptation, "selected_candidate": "C1"})
+    with pytest.raises(CalibrationError, match="quick_adaptation"):
+        load_report_data(root)
+    atomic_json(root / "quick_adaptation.json", adaptation)
+    atomic_json(root / "report.json", {**report, "recorded_samples": 4})
+    with pytest.raises(CalibrationError, match="recorded_samples"):
+        load_report_data(root)
+
+
+def test_adaptive_html_summarizes_selected_recipe_without_promoting_quality(tmp_path):
+    root = small_report(tmp_path / "selected")
+    report = read_json(root / "report.json")
+    report.update(experiment="calibrate", qualified=False, samples=0, recorded_samples=0,
+                  requested_configuration={"kp": .3, "quick_excitation": "auto"},
+                  configuration={"kp": 4, "quick_excitation": "auto"},
+                  quick_adaptation={"status": "selected", "selected_candidate": "C1",
+                                    "attempts": [{"candidate_id": "C1"}], "candidates": {
+                                        "C1": {"formal_settings": {"amplitude": .45, "frequency": .11, "kp": 4, "kd": .5}}}})
+    atomic_json(root / "report.json", report)
+    result = generate_html_report(root)
+    text = Path(result["output"]).read_text()
+    assert "C1" in text and "[4, 0.5]" in text and "0.45" in text
+    assert "自动激励前的请求配置" in text and "0.3" in text
+    assert "选中激励不代表标定合格" in text
+    assert read_json(root / "report.json") == report
+    assert not (root / "calibration.json").exists()

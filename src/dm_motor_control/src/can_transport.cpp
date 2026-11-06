@@ -4,6 +4,7 @@
 #include "can_bus/msg/tx_frame.hpp"
 #include "can_bus/msg/heartbeat.hpp"
 #include "can_bus/msg/status.hpp"
+#include "can_bus/msg/optional_read_removed.hpp"
 #include "can_bus/srv/register_client.hpp"
 #include "can_bus/srv/maintenance.hpp"
 #include <algorithm>
@@ -20,6 +21,7 @@ namespace
 using Register = can_bus::srv::RegisterClient;
 using Maintenance = can_bus::srv::Maintenance;
 using Wire = can_bus::msg::Frame;
+using Removed = can_bus::msg::OptionalReadRemoved;
 bool parameter(const Frame & f)
 {
   return f.id == 0x7ff && f.length >= 3 &&
@@ -81,14 +83,18 @@ struct CanTransport::Impl
   rclcpp::Publisher<can_bus::msg::Heartbeat>::SharedPtr heartbeat;
   rclcpp::Subscription<can_bus::msg::Status>::SharedPtr status_sub;
   rclcpp::Subscription<Wire>::SharedPtr rx_sub;
+  rclcpp::Subscription<Wire>::SharedPtr position_tx_sub;
+  rclcpp::Subscription<Removed>::SharedPtr position_removed_sub;
   rclcpp::Client<Register>::SharedPtr registration;
   rclcpp::Client<Maintenance>::SharedPtr maintenance;
   rclcpp::TimerBase::SharedPtr timer;
   Register::Request request;
   std::deque<std::pair<Frame, double>> outgoing;
   std::deque<Frame> incoming;
+  std::function<void()> receive_notification;
   std::string token, group, failure, physical_backend, owner;
   uint64_t epoch{0}, seen_epoch{0}, sequence{0}, heartbeat_sequence{0};
+  uint64_t last_stop_sequence{0};
   uint64_t quiet_sequence{0};
   uint8_t id;
   uint16_t master;
@@ -100,6 +106,18 @@ struct CanTransport::Impl
   bool heartbeat_confirmed{false};
   bool receive_verified{false};
   bool require_virtual{false};
+  bool allow_native_observation{false};
+  struct PositionRead
+  {
+    Frame frame;
+    uint64_t id, published_steady, expires_steady, observed_steady{0};
+    bool ambiguous{false};
+    std::string token{};
+    uint64_t epoch{0}, sequence{0}, removed_steady{0}, removal_stop_sequence{0};
+  };
+  std::optional<PositionRead> position_read;
+  std::vector<PositionReadDispatch> position_dispatches;
+  std::vector<PositionReadRemoval> position_removals;
   double last_probe{0};
   bool activity_requires_stop{false}, stop_published{false};
   bool maintenance_pending{false}, maintenance_owned{false}, service_pending{false};
@@ -112,7 +130,10 @@ struct CanTransport::Impl
   double next_maintenance_attempt{0};
   void fail(const std::string & reason)
   {
-    if (failure.empty()) {failure = reason; outgoing.clear();}
+    if (failure.empty()) {
+      failure = reason; outgoing.clear();
+      position_read.reset(); position_dispatches.clear(); position_removals.clear();
+    }
   }
   bool channels_ready() const
   {
@@ -129,9 +150,11 @@ struct CanTransport::Impl
   }
   Impl(rclcpp::Node & parent, const std::string & bus_namespace,
     const std::string & client_name, uint8_t motor, uint16_t master_id,
-    bool fd, double rate, double receive_timeout, const std::string & fault_group, bool virtual_only)
+    bool fd, double rate, double receive_timeout, const std::string & fault_group, bool virtual_only,
+    bool native_observation)
   : executor(executor_options(parent)),
-    group(fault_group), id(motor), master(master_id), require_virtual(virtual_only), timeout(receive_timeout),
+    group(fault_group), id(motor), master(master_id), require_virtual(virtual_only),
+    allow_native_observation(native_observation), timeout(receive_timeout),
     started(can_bus::steady_seconds())
   {
     if (bus_namespace.empty() || bus_namespace.front() != '/' || motor == 0 || motor > 15 ||
@@ -219,6 +242,14 @@ struct CanTransport::Impl
           }
         }
       });
+    // Default-off clients incur no full-bus TX subscription or callback work.
+    // Opt-in constructs the reader before native observations can be scheduled.
+    if (allow_native_observation) {
+      position_tx_sub = node->create_subscription<Wire>(bus + "/tx_observed",
+        rclcpp::QoS(1024).reliable(), [this](Wire::ConstSharedPtr w) {position_tx_callback(*w);});
+      position_removed_sub = node->create_subscription<Removed>(bus + "/optional_read_removed",
+        rclcpp::QoS(64).reliable(), [this](Removed::ConstSharedPtr m) {position_removed_callback(*m);});
+    }
     timer = node->create_wall_timer(std::chrono::milliseconds(5), [this] {tick();});
     executor.add_node(node);
     thread = std::thread([this] {
@@ -358,14 +389,14 @@ struct CanTransport::Impl
     m.priority = stop(f) ? 1 : maintenance_frame(f) ? 2 : 0;
     m.active = active(f); m.sent_steady = static_cast<uint64_t>(pending.second * 1e9);
     m.frame = encode(f); m.frame.header.stamp = node->now(); tx->publish(m);
-    if (stop(f)) {stop_published = true;}
+    if (stop(f)) {stop_published = true; last_stop_sequence = m.sequence;}
     if (maintenance_frame(f)) {last_parameter = now;}
     outgoing.pop_front();
   }
   void receive_callback(const Wire & w)
   {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!failure.empty() || w.can_id != master || w.data.size() != 8 ||
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!failure.empty() || w.can_id != master || w.length != 8 || w.data.size() != 8 ||
       w.channel || w.extended || w.rtr || w.error) {return;}
     const double now = can_bus::steady_seconds();
     if (!w.received_steady || now - w.received_steady * 1e-9 > timeout ||
@@ -377,11 +408,71 @@ struct CanTransport::Impl
       w.received_steady * 1e-9 >= last_probe)
     {receive_verified = true;}
     if (parameter_reply && (quiet || !owner.empty() || maintenance_owned) && w.data[0] != id) {return;}
-    if (parameter_reply && w.data[0] == id) {last_parameter = now;}
+    const bool sampled_reply = position_read && w.data[0] == id && w.data[2] == 0x33 &&
+      w.data[3] == position_read->frame.data[3] &&
+      w.received_steady >= position_read->published_steady &&
+      w.received_steady <= position_read->expires_steady;
+    if (parameter_reply && w.data[0] == id && !sampled_reply) {last_parameter = now;}
     if (incoming.size() >= 64) {fail("remote CAN receive queue overflow"); return;}
-    Frame f; f.id = w.can_id; f.fd = w.fd; f.brs = w.brs;
+    Frame f; f.id = w.can_id; f.length = w.length; f.fd = w.fd; f.brs = w.brs;
     f.received_steady = w.received_steady;
     std::copy(w.data.begin(), w.data.end(), f.data.begin()); incoming.push_back(f);
+    const auto notification = receive_notification;
+    lock.unlock();
+    if (notification) {notification();}
+  }
+  void position_tx_callback(const Wire & w)
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!position_read || !failure.empty() || shutting_down) {return;}
+    auto & read = *position_read;
+    const auto & frame = read.frame;
+    if (w.can_id != frame.id || w.channel != frame.channel || w.extended || w.rtr || w.error ||
+      w.fd != frame.fd || w.brs != frame.brs || w.length != 8 || w.data.size() != 8 ||
+      !std::equal(w.data.begin(), w.data.end(), frame.data.begin()) ||
+      w.received_steady < read.published_steady || !w.received_steady)
+    {return;}
+    // This is broker TX acquisition evidence, not publication-return or a
+    // device ACK. An identical later wire transaction is ambiguous: CAN has
+    // no per-read nonce. At most one initial and one ambiguous event are kept.
+    if (read.ambiguous || (read.observed_steady && read.observed_steady == w.received_steady)) {return;}
+    const auto now_ns = static_cast<uint64_t>(can_bus::steady_seconds() * 1e9);
+    read.ambiguous = read.observed_steady != 0 || read.removed_steady != 0 || w.received_steady > read.expires_steady ||
+      w.received_steady > now_ns;
+    read.observed_steady = w.received_steady;
+    position_dispatches.push_back({read.id, w.received_steady, read.ambiguous});
+    const auto notification = receive_notification;
+    lock.unlock();
+    if (notification) {notification();}
+  }
+  void position_removed_callback(const Removed & m)
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!position_read || !failure.empty() || shutting_down) {return;}
+    auto & read = *position_read;
+    // An old token/epoch/sequence can never cancel the current single flight.
+    if (m.token != read.token || m.epoch != read.epoch || m.sequence != read.sequence ||
+      token != read.token || epoch != read.epoch) {return;}
+    if (read.ambiguous) {return;}
+    const auto & w = m.frame;
+    const auto & f = read.frame;
+    const auto now_ns = static_cast<uint64_t>(can_bus::steady_seconds() * 1e9);
+    const bool bad = m.sent_steady != read.published_steady || !m.removed_steady ||
+      m.removed_steady < read.published_steady || m.removed_steady >= read.expires_steady ||
+      m.removed_steady > now_ns || now_ns >= read.expires_steady ||
+      m.stop_sequence <= read.sequence || m.stop_sequence > last_stop_sequence ||
+      w.can_id != f.id || w.channel != f.channel || w.extended || w.rtr || w.error ||
+      w.fd != f.fd || w.brs != f.brs || w.length != 8 || w.data.size() != 8 ||
+      !std::equal(w.data.begin(), w.data.end(), f.data.begin()) || read.observed_steady ||
+      (read.removed_steady && (read.removed_steady != m.removed_steady ||
+      read.removal_stop_sequence != m.stop_sequence));
+    if (!bad && read.removed_steady) {return;}  // Identical witness is idempotent.
+    read.ambiguous = bad; read.removed_steady = m.removed_steady;
+    read.removal_stop_sequence = m.stop_sequence;
+    position_removals.push_back({read.id, m.removed_steady, bad});
+    const auto notification = receive_notification;
+    lock.unlock();
+    if (notification) {notification();}
   }
   ~Impl()
   {
@@ -405,9 +496,10 @@ struct CanTransport::Impl
 };
 CanTransport::CanTransport(rclcpp::Node & node, const std::string & bus_namespace,
   const std::string & client_name, uint8_t motor_id, uint16_t master_id, bool fd,
-  double rate, double timeout, const std::string & fault_group, bool require_virtual)
+  double rate, double timeout, const std::string & fault_group, bool require_virtual,
+  bool allow_native_position_observation)
 : impl_(std::make_unique<Impl>(node, bus_namespace, client_name, motor_id, master_id,
-    fd, rate, timeout, fault_group, require_virtual)) {}
+    fd, rate, timeout, fault_group, require_virtual, allow_native_position_observation)) {}
 CanTransport::~CanTransport() = default;
 void CanTransport::send(const Frame & f)
 {
@@ -436,6 +528,10 @@ void CanTransport::send(const Frame & f)
     impl_->quiet = false; impl_->activity_requires_stop = true; impl_->stop_published = false;
   }
   if (stop(f)) {
+    // STOP priority/queue retirement is independent of diagnostic association.
+    // Runtime hard cancellation clears it explicitly; a normal native80 retire
+    // still needs a possibly delayed TX witness. Keep only that association:
+    // never delay STOP, retransmit a read, or retract a broker-published request.
     auto & queue = impl_->outgoing;
     queue.erase(std::remove_if(queue.begin(), queue.end(), [&](const auto & p) {
       return !stop(p.first) || p.first.id == f.id;
@@ -469,6 +565,11 @@ std::vector<Frame> CanTransport::receive()
   }
   return result;
 }
+void CanTransport::set_receive_notification(std::function<void()> notification)
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->receive_notification = std::move(notification);
+}
 bool CanTransport::ready() const
 {std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->ready_locked();}
 std::string CanTransport::error() const
@@ -498,6 +599,77 @@ bool CanTransport::activity_available() const
     !impl_->maintenance_pending && !impl_->maintenance_owned &&
     !impl_->releasing && !impl_->service_pending && !impl_->fault &&
     !impl_->fault_clear_pending;
+}
+bool CanTransport::native_position_observation_supported() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->allow_native_observation && impl_->position_tx_sub &&
+    !impl_->request.stop_frames.front().fd &&
+    impl_->position_tx_sub->get_publisher_count() > 0;
+}
+uint64_t CanTransport::bus_epoch() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->registered ? impl_->epoch : 0;
+}
+bool CanTransport::try_send_native_position_read(const Frame & f, uint64_t read_id, uint64_t expires_steady)
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->allow_native_observation || !impl_->position_tx_sub ||
+    impl_->request.stop_frames.front().fd ||
+    impl_->position_tx_sub->get_publisher_count() == 0) {return false;}
+  const bool fd = impl_->request.stop_frames.front().fd;
+  if (!read_id || f.id != 0x7ff || f.length != 8 || f.channel || f.brs || f.fd ||
+    f.data[0] != impl_->id || f.data[1] != 0 || f.data[2] != 0x33 ||
+    f.data[3] != 80 ||
+    !std::all_of(f.data.begin() + 4, f.data.end(), [](uint8_t b) {return b == 0;}))
+  {throw std::invalid_argument("position observation permits only own read-only p_m80 frames");}
+  const auto now_ns = static_cast<uint64_t>(can_bus::steady_seconds() * 1e9);
+  if (expires_steady <= now_ns || expires_steady - now_ns > 20000000) {return false;}
+  if (!impl_->ready_locked() || impl_->shutting_down || impl_->position_read ||
+    !impl_->outgoing.empty() || !impl_->owner.empty() || impl_->maintenance_pending ||
+    impl_->maintenance_owned || impl_->releasing || impl_->service_pending ||
+    impl_->fault || impl_->fault_clear_pending) {return false;}
+  Frame wire = f; wire.fd = fd;
+  can_bus::msg::TxFrame message;
+  message.token = impl_->token; message.epoch = impl_->epoch; message.sequence = ++impl_->sequence;
+  impl_->position_read = Impl::PositionRead{wire, read_id, now_ns, expires_steady};
+  impl_->position_read->token = message.token; impl_->position_read->epoch = message.epoch;
+  impl_->position_read->sequence = message.sequence;
+  message.sent_steady = now_ns;
+  message.valid_for.nanosec = static_cast<uint32_t>(expires_steady - now_ns);
+  message.priority = 3; message.active = false;
+  message.frame = encode(wire); message.frame.header.stamp = impl_->node->now();
+  try {impl_->tx->publish(message);}
+  catch (...) {impl_->position_read.reset(); throw;}
+  // Publication only. Runtime must await the separate broker TX observation.
+  // Never enqueue this read in the maintenance or ordinary target queue.
+  return true;
+}
+std::vector<PositionReadDispatch> CanTransport::take_position_read_dispatches()
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::vector<PositionReadDispatch> result;
+  result.swap(impl_->position_dispatches);
+  return result;
+}
+std::vector<PositionReadRemoval> CanTransport::take_position_read_removals()
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::vector<PositionReadRemoval> result;
+  result.swap(impl_->position_removals);
+  return result;
+}
+void CanTransport::cancel_position_read(uint64_t read_id)
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->position_read && impl_->position_read->id == read_id) {impl_->position_read.reset();}
+  auto & events = impl_->position_dispatches;
+  events.erase(std::remove_if(events.begin(), events.end(),
+    [read_id](const auto & event) {return event.read_id == read_id;}), events.end());
+  auto & removals = impl_->position_removals;
+  removals.erase(std::remove_if(removals.begin(), removals.end(),
+    [read_id](const auto & event) {return event.read_id == read_id;}), removals.end());
 }
 bool CanTransport::prepare_maintenance()
 {

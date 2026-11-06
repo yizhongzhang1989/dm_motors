@@ -8,6 +8,161 @@
 本包标定主机侧控制模型，不替代厂商内部电流环/编码器出厂标定。
 默认拒绝真机运动，只有显式调用 `start` 才运行有限时长的实验。
 
+## 快速入口与独立验证
+
+Dashboard 的“新实验”默认创建**快速机械标定**草稿，不发运动请求，也不继承历史拖动任务。
+旧节点未提供 `quick_independent_v1` 能力时，页面不会将旧单段流程显示为新快速流程。
+方法选择、阶段设置和模型细节保留在高级设置中；打开或刷新页面始终恢复最近一次实验。
+
+新版 ROS `experiment=calibrate` 默认执行40秒训练、实测回位与静置、20秒独立验证。
+`duration` 表示训练段时长，验证段为 `max(16, min(24, duration/2))` 秒；回位和停止确认另计。
+两条参考轨迹不同：仅训练段用于拟合、模型选择和自适应积分窗；验证段使用冻结结果验收。
+每方向的窗口数、速度带覆盖和预测误差均须通过，不能用整体平均掩盖单方向失配。
+
+正式采样 `samples.csv` 中 `leg=0` 为训练，`leg=-1` 为回位，`leg=1` 为最终验证。
+实验保存 `quick_plan.json`、`quick.json`、代码/环境快照、实际驱动配置、原始采样和完整报告。
+
+快速标定、补偿对照、起动阈值及拖动实验还保存完整收到的反馈、状态、指令与事件日志，
+以 `raw_recording.json` 核对行数和哈希；`samples.csv` 保持独立的分析分区。
+准备阶段失败也保留原始记录和空样本表头。起动阈值的中性静置使用带采集时间的位置与速度证据，
+不会因单个报告速度码跳动就视为持续运动；原有运动保护不变。
+实现、短时真机结果及物理含义见[起动阈值标定与完整记录](../../docs/experiment-history.md#calibration-breakaway-2026-11-05)。
+中性观察还按采集时间核对实际指令和有效期，仅允许同一阶段、连续且完全相同的P0/D0目标作等价归属；
+原始反馈序号不改写，不把软件派发归属当设备应答。修复验证及新的低速/惯量离线方法见
+[低速摩擦与惯量辨识进展](../../docs/experiment-history.md#calibration-low-speed-and-inertia-2026-11-05)。
+结果不合格时为 `completed_unqualified`，保留候选、原因及全部数据，不产生合格 `calibration.json`。
+`fit_mechanical()` 与旧单段CSV仍保留原来的训练/选模留出语义，不会因新代码而获得独立验证标签。
+
+快速结果只支持本次实际覆盖范围内的滑动摩擦及动力学预测。低速、小惯量条件下，
+速度/力矩量化可能使惯量估计存在明显偏差，即使预测残差很小也不能证明每个参数都准确。
+静摩擦、全速度、热参数以及绝对力矩标尺需要各自的激励和测量证据；快速入口不能替代这些验收。
+
+### 短行程低速摩擦采集
+
+同一 Dashboard 的“高级设置 → 实验方法”可选择 `low_speed`（短行程低速摩擦），不需要旧标定文件。
+它单独补充低速连续滑动数据，不修改原来的全圈精密流程，也不把快速轨迹中的停走平均速度当成恒速。
+使用原有逐帧保护、MIT编码预算、完整收到的消息记录与新鲜失能确认；启动页面仍不运动。
+
+默认训练速度为正反 `0.05 / 0.1 / 0.2 rad/s`，每方向3次独立行程；
+另保留正反 `0.075 / 0.15 rad/s` 各一次独立速度采集。每段先实测定位，再以P0/D0.8和位置OLS速度PI
+进入预定区间；积分器逐段清空，不使用旧摩擦系数播种。正反同速使用同一空间区间，
+按实测位置跨越边界取得数据，之后减速、进入下一段，最终返回起点并停止。
+
+训练重复数、速度档及总预算使用只读启动参数 `low_speed_repetitions`、`low_speed_speeds`、
+`low_speed_validation_speeds`、`low_speed_time_budget`；将它们写到所选完整配置的
+`packages.dm_motor_calibration.nodes.calibration_node` 下并重启节点生效。默认总预算240秒，
+仍受通用 `max_torque/max_speed/max_travel/max_temperature/feedback_timeout` 约束；
+预定区间及定位行程无法放入保护范围时拒绝开始，不自动提高边界。单重复仅用于采集链路诊断。
+
+低速控制另提供只读 `low_speed_position_kp`（0～100，默认0）。设为正值时必须同时将
+`low_speed_velocity_ki`设为0，改用连续位置参考和原生D；这是可选采集控制，不是摩擦模型前馈。
+位置参考按新鲜反馈的采集时间差推进；重复控制拍不再对旧位置继续累加参考，实际源时间差
+保存在`low_speed_reference_sample_time/dt`。速度渐变与截止仍按控制时钟执行，不预测未来位置。
+回位仍使用P100/D1，交接记录上一请求估算力矩及变化；它不等于实测电磁力矩连续性证明。
+参考追赶超过原PD预算或行程时会投影并回写参考，投影也记录为饱和，即使最终编码增益未缩小，
+原稳态质量门仍会拒绝该段。通用配置默认保留原PI，候选结果和验证进度见
+[低速采集记录](../../docs/experiment-history.md#calibration-low-speed-and-inertia-2026-11-05)。
+
+实验保留 `low_speed_plan.json`、全部引擎观测 `low_speed_samples.csv`、`low_speed.json`、
+通用轨迹、原始消息和独立报告。分析使用同位置区间的角度加权报告力矩半差，检查稳速、反向位置报告、
+数据空档、重复性及共同核心区间的一致性；未通过和未完成的段仍在报告中。
+半差是局部报告量，不能直接当作精确物理摩擦，也不能独立区分方向不对称摩擦；
+真实停滑、位置误差、力矩报告动态及位置负载均可能造成偏差。
+
+同一固定窗口还保存源时间梯形平均`time_mean_reported_torque`及角度减时间均值差，
+配对保存`time_odd_reported_torque`与`angle_minus_time_odd_reported_torque`；
+它们只作诊断，不改变原角均值、训练、独立验证或资格判定。Dashboard和HTML在折叠详情中
+显示对照，旧报告缺少字段时不补造数值。报告另保存`maximum_directed_drawdown`，表示
+`direction × 报告位置`相对此前最高值的最大回退，与累计`reverse_distance`区分；
+二者都不能独立证明真实轴反转。不能把时间均值或二者差值直接作为摩擦修正。
+当前阶段输出局部采集诊断，始终保留 `qualified=false`，不产生或发布 `calibration.json`。
+这条采集入口是后续低速模型与双边应用验证的数据基础，不代表已完成全域物理参数标定。
+
+反馈中的`applied_target_sequence`是驱动处理该帧时的软件目标，可能晚于帧的采集时间。
+低速入口只允许沿连续已知指令回查同一恒速单元、同一训练/验证角色及同一目标速度的
+有效期内指令，单独记录原派发序号、归属序号和重归属标志。回位、加减速、跨单元、缺号或过期
+不能用此方法补归属；有歧义的指令链中任何饱和均保留。该判断仅确定实验分段，不宣称哪条
+位置/力矩目标已被电机执行，原始反馈序号和时间不改写。
+
+`quick.parameter_identifiability` 单独保存训练段的参数相关性、码宽影响尺度、
+固定的前/后半段及半/双积分窗敏感性重拟合。子试验失败也保留，不使用最终验证段选参，
+这些范围不是统计置信区间。未知的速度/力矩报告滤波、延迟和绝对力矩比例不会默认为零。
+新候选和合格预测模型均注明 `physical_parameters_independently_validated=0`；
+共享参数压缩仍保留此语义，不会把“预测合格”变成“惯量、Fc、b各自准确”。
+
+可以离线重算完整快速实验，保持原实验不变：
+
+```bash
+ros2 run dm_motor_calibration calibrate.py quick-reidentify /path/to/experiment \
+  --output /path/to/new-analysis
+```
+
+新目录保存原始输入副本、输入哈希、辨识源码和独立验证结果。已有输出目录不可覆盖；
+失败采集不能因为离线拟合较好而升级。没有采集时哈希的旧实验只标记
+`current_input_snapshot_only`，不宣称原始采集完整性已验证。`--model`、`--known-bias`
+允许明确的重分析，但旧验证轨迹的再次评分不是一份新的独立实验。
+
+本机可在 `packages.dm_motor_calibration.quick_profiles` 中按完整motor namespace
+显式登记合格实验引用，与 `nodes` 并列。引用由纯函数
+`quick_profile.make_profile_reference(report_path)` 生成，绑定报告SHA256与本机身份；
+节点还核对电机坐标/量程、当前协议及分析上下文。只恢复激励与分析选项，
+不恢复运动预算、硬件许可或驱动保护。文件缺失、身份或上下文变化时清楚显示回退原因；
+不会从实验历史里自动寻找一个看似可用的参数组。换了实体电机但沿用同一ID/坐标时，
+现有接口没有物理序号可识别这一变化，必须删除或重新审查引用。
+
+本机A/B已验证参考为 `.45 rad / .11 Hz / P4 / D0.5`、不拟合重力、40+20秒。
+这些值通过显式本机引用提供，不作为所有电机的全局默认；新一轮仍须独立通过质量验证。
+实测通过和失败、补偿对照及双边应用结果见[2026-11-04快速标定验证](../../docs/experiment-history.md#calibration-quick-validation-2026-11-04)。
+
+### 自动选择激励
+
+标准命令 `ros2 launch dm_motor_calibration calibration.launch.py` 使用统一配置中的
+`calibration.launch.py` profile，初始默认 `quick_excitation=auto`（“自动选择”）。
+该默认仅作用于此 launch profile；直接启动节点且配置未提供该字段时仍回退到 `fixed`，
+离线 CLI `quick-simulate` 省略 `--excitation` 时也为 `fixed`。
+`precision.launch.py` 与 `fourier_20rad_test` 专属 profile 的默认不变。
+
+Dashboard 保留用户选择的 `auto` 或 `fixed`；切换到非 `calibrate` 任务时不使用该字段，
+也不覆盖这项选择，切回快速机械标定时继续保留。旧节点未提供该字段时按 `fixed` 兼容，
+页面不开放自动入口。打开或刷新页面、新建或修改草稿均不请求运动，仍需明确“开始标定”。
+
+当前自动入口使用 `tracking_first_adaptive_window`（算法v3），
+最多两段各10秒预探测，按有限C1→C2候选和实测反馈判断；每段后必须在8秒内实测回位并静置0.3秒。
+选中后冻结正式参数，执行40秒训练、实测回位、20秒独立验证，启动和停止确认另计。
+自动选择不会提高力矩、速度、行程、温度或反馈时限；保护触发立即停止，不自动重启。
+
+预探测仅选激励，按0.12/0.08/0.04秒选择最长合格覆盖窗，并保留每方向累计至少0.48秒等门。
+它不进入正式拟合，也不指定正式分析窗；模型和分析窗仍由正式训练冻结，最终验证不反馈调参。
+自动实验保存 `all_samples.csv`（全部）、`pilot_samples.csv`（预探测及正式开始前回位）和
+`samples.csv`（正式训练/回位/验证）。`quick_reidentify_v3` 核对选择快照、采样哈希与分区逐值重建，
+不重新选择激励，不把失败采集升级为合格。
+
+选中激励不代表模型合格。算法v2两轴真机因预探测覆盖不足拒绝，失败保留；这些数据用于v3开发诊断。
+随后冻结的v3在两轴新实验中均选中C1并完成40+20秒，独立验证RMS为0.005511/0.004128 Nm，
+确认STOP并保存合格预测模型。该结果仅支持本次覆盖范围，不证明J、分离Fc/b独立准确或所有电机通用。
+算法代际、后台评审、CSV合同及保留的成功/失败证据见
+[2026-11-04自动激励记录](../../docs/experiment-history.md#calibration-automatic-excitation-2026-11-04)。
+
+## 与真机快速流程一致的物理仿真
+
+```bash
+ros2 run dm_motor_calibration calibrate.py quick-simulate --output /tmp/calibration-quick-example
+```
+
+显式离线自动入口加 `--excitation auto`；省略时为 `fixed`。自动模式在上述正式流程前增加有界预探测和实测回位。
+
+这个入口使用生产C++物理模型、原生MIT控制和实际协议量化，按40秒训练、实测回位、20秒另一条轨迹验证、停止、独立评分的顺序执行。回位必须连续0.3秒满足位置误差小于0.08 rad且速度小于0.04 rad/s，8秒未达到则失败。控制器只使用报告观测；物理真值不进入控制、保护或拟合。报告链滤波/延迟可通过物理配置指定。当前离线采集是同步观测，不包含CAN排队或ROS调度，不能替代完整ROS及真机验收。
+
+可选参数为`--physics physics.yaml`、`--experiment-settings experiment.json`、`--analysis-settings analysis.json`、`--observer-settings observer.json`、`--rate`、`--jitter`和`--seed`。JSON分别使用`ExperimentSettings`、`MechanicalOptions`、`QuickObserverSettings`的字段；省略字段采用该次入口的默认值，实际完整设置均保存。默认观测范围为位置±12.5 rad、速度±50 rad/s、力矩±10 Nm，分别16/12/12 bit、下沿解码；换协议需显式提供对应范围。
+
+输出目录必须是新目录，保存`report.json`、`samples.csv`、`quick_plan.json`、`quick.json`（分析成功时）、`acquisition.json`、观测链与源码快照、物理配置、文件哈希及`analysis.html`（有可绘制采样时）。该结果可用上文`quick-reidentify`重新分析；不自动写共享参数。模拟STOP只证明同步模拟器处理了失能步进，不冒充真机驱动的状态确认。
+
+退出码：0为独立预测合格，2为采集完成但不合格，1为执行失败。中断和超限保留已采样内容及停止证据；停止应答失败不进入辨识。运行期间二进制或Python源码改变会拒绝最终资格并撤销合格模型文件。二进制记录绝对路径与SHA256，未打包所有动态库，重现需对应构建或相同哈希的程序。
+
+不使用ROS安装入口时，可设置`DM_CALIBRATION_SIMULATOR`为已构建的独立仿真程序，并从Python包执行`python3 -m dm_motor_calibration.cli quick-simulate ...`；自定义物理YAML的加载也不依赖ROS的`common`包。
+
+`quick_adaptation.py`提供最多两段短探测的候选选择状态机，已接入ROS与离线的`auto`入口。预探测通过只允许冻结后续激励，最终40+20秒及原独立资格门仍必须执行，不能根据验证结果自动反复试到通过。
+
 ## 全项目共享参数
 
 运行配置顶层 `system_parameters_file` 指向
@@ -32,7 +187,8 @@ Dashboard 的“应用模型”折叠面板位于“拖动测试”下方；按�
 `ModelResult` 只检查结构和数值有效性，`FitResult` 仍严格表示自动合格，不改变原辨识算法的结论。
 共享条目采用 `schema: 3`，兼容旧 `schema: 2`；运行加载返回不携带实验诊断的 `ModelResult`，
 不虚构样本数或质量统计。保留全部独立物理参数及单位、适用域；删除警告、拟合设置、重复身份/种类、
-空表格及可由重力正余弦系数推导的幅值/相位。影响偏置解释的 `bias_is_sensor_offset` 仍保留。
+空表格及可由重力正余弦系数推导的幅值/相位。影响偏置解释的 `bias_is_sensor_offset`、
+独立预测验证协议标志及 `physical_parameters_independently_validated` 仍保留。
 不完整/无模型、非有限值、负摩擦系数、身份错配和失能未确认等不能通过人工认可绕过。
 拖动测试仅供人工判断体验，不替代独立精度检验。保存失败通过 HTTP/ROS 和面板明确报告，
 不改变已完成实验的结果，也不伪装成成功。只有保存成功才替换对应电机
@@ -64,7 +220,7 @@ ROS 的验证/补偿实验可读取共享机械模型；显式指定的文件仍
 
 ### 标定前的三档旋转与扫频正弦预运行
 
-新实验默认采用 `precision_warmup_profile=rotation_sine`、`precision_warmup_repetitions=1`：
+精密/傅里叶流程的预运行默认采用 `precision_warmup_profile=rotation_sine`、`precision_warmup_repetitions=1`；快速机械流程不执行这段预运行：
 
 1. 安全定位到 `precision_zero_position`（默认控制坐标 **0 rad**）。
 2. 按 **3 秒/圈、2 秒/圈、1 秒/圈** 三档从慢到快旋转，即
@@ -199,6 +355,47 @@ ros2 launch dm_motor_calibration precision.launch.py \
   motor_namespace:=/precision_sim/motor_1 namespace:=precision_sim/calibration \
   dashboard_port:=8185
 ```
+
+时间加速入口的 `--physics FILE.yaml` 接受扁平参数表；它与 ROS 系统配置文件的嵌套结构不同。
+除 `JointPhysics` 参数外，现在支持设备内部速度估计 `velocity_time_constant`，以及以下独立报告链。
+实现与生产 `VirtualMotor` 共用 `FeedbackDynamics`，无需启动 ROS 或 CAN。
+
+```yaml
+# 测量链示例：2026-11-04 候选的速度/力矩报告条件。
+integration_step: 0.00003125
+velocity_time_constant: 0.0
+feedback_velocity_source: physical
+feedback_velocity_time_constant: 0.0045
+feedback_velocity_delay: 0.0015
+feedback_torque_time_constant: 0.012
+feedback_torque_delay: 0.002
+torque_time_constant: 0.002
+constant_torque_speed: 8.0
+no_load_speed: 50.0
+# 另填目标轴的 inertia、friction_model、coulomb_friction、static_friction、
+# viscous_friction、max_torque 等；不能把本例的未指定默认值当成已辨识结果。
+```
+
+复制 `config/bilateral_identification_20261104.yaml` 的条件时，先合并
+`packages.dm_motor_control.nodes.sim_motor_node` 与目标设备的 `simulation` 覆盖，
+再仅取物理/测量参数写入扁平文件；CAN、命名空间、发布频率和 mapping 等不是这个纯数值入口的参数。
+`constant_torque_speed` 是恒力矩区的可选拐点，默认 0 保持旧包络；LuGre 模型已有的
+`friction_displacement_scale`、`initial_bristle_displacement` 也可传入，不会自动选择或拟合模型。
+
+所有内部/报告时间常数与延迟默认 0，报告速度默认取内部速度，保留原零滤波行为。
+内部速度只决定设备 MIT 的 D 反馈；报告滤波不会反过来改变物理响应。每个物理子步之后更新一次滤波，
+分数子步延迟按历史样本线性插值。初始速度使用 `initial_velocity`、初始力矩为 0；失能不清空历史。
+`integration_step` 允许 10 µs–1 ms，标定入口默认仍是 0.25 ms；它按每次输入间隔均分子步，
+与墙钟 `VirtualMotor` 的最后短子步分割可能有微小数值差异。
+
+返回/记录的 `velocity`、`torque` 是延迟后的报告值，随后才加采集噪声与可选量化；
+精密控制器和辨识器仅消费这些观测。`physical_velocity`、`physical_torque`、`internal_velocity`
+以及 `reference_torque`、电流/发热列是仿真诊断真值，不能当作额外真机传感器。
+`recording.json` 的配置记录测量链及控制/采样间隔。时间戳仍是采集时刻，不因信号延迟而倒填。
+这个入口没有串口、CAN 排队、设备反馈丢包或 ROS 调度，也不完整模拟固件；通过纯数值试验不等于实机验收。
+更新后须一起重建 C++ 标定可执行文件与 Python 包，因为内部管道增加了显式真值列。
+离线测试可显式传 `executable=Path(...)`，或设置 `DM_CALIBRATION_SIMULATOR` 指向独立构建的
+标定可执行文件；两者都未指定时仍使用 ament 安装目录。
 
 ## 傅里叶级数运动辨识任务
 
@@ -781,7 +978,8 @@ ros2 service call /calibration/stop std_srvs/srv/Trigger '{}'
 重要参数：`duration/amplitude/frequency` 控制激励；
 `trajectory_control` 选择轨迹反馈实现：
 
-- `auto`（默认）：真机使用 `mit_pd`，ROS 仿真保留 `host_torque`；报告记录实际选择。
+- `auto`（默认）：真机使用 `mit_pd`，固定激励的 ROS 仿真使用 `host_torque`；
+  `experiment=calibrate` 且 `quick_excitation=auto` 时，ROS 仿真也使用 `mit_pd`。报告记录实际选择。
 - `mit_pd`：将轨迹 PD 交给电机内部快速闭环，适合低惯量、高静摩擦真机。
   先按与生产双边控制一致的保守绝对项预算限制增益，再检查原协议编码后的合成力矩估计，
   同时保留驱动和独立的实测速度/力矩/行程/温度保护；不写增益寄存器或 Flash。
@@ -1050,6 +1248,7 @@ ros2 service call /calibration/start std_srvs/srv/Trigger '{}'
 | `feedback.csv` | 本进程收到的完整原始反馈消息，在重复时间、无效位置等分析过滤之前记录 |
 | `state.csv` | 本进程收到的完整状态、温度、保护、故障与目标快照 |
 | `commands.csv` | 实际发布的主机目标；保留时钟、序列号、MIT 参数、有效期与实验标注 |
+| `position_observation.csv` | 可选的原生细位置观察；完整保留消息、终态、事务时钟、来源与计数，另记主机回调时刻 |
 | `events.csv` | 不截断的精密控制器阶段转换、控制阶段、START/STOP、使能/失能请求与错误事件 |
 | `recording.json` | 已解析配置、电机身份、传感器量化范围、原始时钟起点、采集计划/故障标注、消息字段定义、环境版本，以及各 CSV 的行数、列名、字节数和 SHA-256 |
 | `code/dm_motor_calibration/` | 辨识 Python 源码快照及其哈希；ROS 标定器在进程启动时冻结该快照 |
@@ -1066,6 +1265,20 @@ ros2 service call /calibration/start std_srvs/srv/Trigger '{}'
 写入期间文件名为 `*.pending.csv`，只有所有数据流与事件流成功关闭后，才将
 `recording_complete` 标为 `true`，最后提交报告。异常退出留下的 pending 文件用于审计，
 不能冒充已完整保存的实验；`recording_complete=true` 本身也不表示采集计划或质量检查通过。
+
+ROS标定节点默认启用只读启动参数`record_position_observation=true`，以BEST_EFFORT订阅本轴
+`position_observation`。此开关只录制已经发布的消息，不启动寄存器轮询；驱动需另行配置
+`native_position_observation_rate=125`并满足原生MIT有效输出条件，才会产生观察。
+没有消息时仍保存零行可选文件，并标记`not_received`；禁用时不创建该文件。
+快速、低速、精密及Fourier的对应记录路径都保留这条可选流，历史没有该流的报告仍可加载。
+需要使用已构建`MotorPositionObservation`的同版本消息包；旧install只替换Python源码不足以启动新节点。
+
+观察中的COMPLETE、TIMEOUT、CANCELLED、AMBIGUOUS、重复及无效值均原样留存，不能把收到的回调数
+当成有效样本数或无丢包证明。四个纳秒时钟描述主机请求、发送、接收与完成，设备实际采样时间仍未知。
+正常观察回调不进入速度估计、摩擦拟合或资格判定；但这条流发生队列溢出或写入失败时，仍按既有
+录制失败路径停止实验。离线加载会核验其哈希、大小、列定义和实际CSV逻辑行数。
+状态JSON还发布`controller_source`，用于在START前核对本进程实际目标来源；它与`controller_id`
+用途不同，也不是排他控制锁或设备执行应答。
 
 历史整圈预运行使用 `membership_csv_v2`，包含 `analysis_warmup` 与 `analysis_warmup_cell`；
 新的三档旋转/正弦记录使用 `membership_csv_v3`，另有 `analysis_warmup_sine`。

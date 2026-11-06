@@ -25,8 +25,11 @@
 #include <dm_motor_interfaces/msg/motor_command.hpp>
 #include <dm_motor_interfaces/msg/motor_setpoint.hpp>
 #include <dm_motor_interfaces/msg/motor_feedback.hpp>
+#include <dm_motor_interfaces/msg/motor_position_observation.hpp>
+#include "dm_motor_control/position_observation_schedule.hpp"
 #include <condition_variable>
 #include <deque>
+#include <optional>
 #include <dm_motor_interfaces/msg/motor_state.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -78,7 +81,10 @@ using FeedbackPublication = std::pair<rclcpp::Publisher<api::msg::MotorFeedback>
 using TaskPublication = std::pair<rclcpp::Publisher<api::msg::MotorTaskEvent>::SharedPtr,
   api::msg::MotorTaskEvent>;
 using ReplyPublication = std::pair<rclcpp::Publisher<Reply>::SharedPtr, Reply>;
-using TelemetryPublication = std::variant<FeedbackPublication, TaskPublication, ReplyPublication>;
+using ObservationPublication = std::pair<rclcpp::Publisher<api::msg::MotorPositionObservation>::SharedPtr,
+  api::msg::MotorPositionObservation>;
+using TelemetryPublication = std::variant<FeedbackPublication, TaskPublication, ReplyPublication,
+  ObservationPublication>;
 struct CachedControl
 {
   Request request;
@@ -88,6 +94,23 @@ struct InputTarget
 {
   api::msg::MotorSetpoint::ConstSharedPtr message;
   std::string source;
+};
+// Transport notifications must not capture MotorNode: a notification copied by
+// the CAN thread can outlive stop() detaching it. The shared wake state has no
+// access to a motor, target or transport and only wakes the existing I/O owner.
+struct FeedbackWake
+{
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool pending{false};
+  void notify()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      pending = true;
+    }
+    condition.notify_one();
+  }
 };
 struct SourceOrder
 {
@@ -201,6 +224,8 @@ struct Axis
   rclcpp::Subscription<Request>::SharedPtr control_subscription;
   rclcpp::Publisher<Reply>::SharedPtr reply_publisher;
   rclcpp::Publisher<api::msg::MotorTaskEvent>::SharedPtr task_publisher;
+  rclcpp::Publisher<api::msg::MotorPositionObservation>::SharedPtr position_observation_publisher;
+  PositionObservationSchedule observation_schedule;
   std::map<uint8_t, std::function<void(Request::SharedPtr, Reply::SharedPtr)>> handlers;
   std::map<std::string, CachedControl> command_history;
 };
@@ -212,6 +237,16 @@ public:
   MotorNode() : Node("motor_controller", rclcpp::NodeOptions().start_parameter_services(false)),
     config_(declare_parameter<std::string>("config_file", common::default_config_path()))
   {
+    const std::string feedback_path = "packages.dm_motor_control.nodes.motor_node.event_driven_feedback";
+    rcl_interfaces::msg::ParameterDescriptor startup_only;
+    startup_only.read_only = true;
+    event_driven_feedback_ = declare_parameter<bool>("event_driven_feedback",
+      config_.has(feedback_path) ? config_.get<bool>(feedback_path) : false, startup_only);
+    native_position_observation_rate_ = declare_parameter<double>("native_position_observation_rate",
+      0.0, startup_only);
+    if (native_position_observation_rate_ != 0 && native_position_observation_rate_ != 125) {
+      throw std::invalid_argument("native_position_observation_rate must be 0 (off) or 125 Hz");
+    }
     rate_ = parameter<double>("", "control_rate");
     state_rate_limit_ = parameter<double>("", "state_rate");
     state_rate_ = state_rate_limit_;
@@ -219,6 +254,9 @@ public:
     finite(rate_, "control_rate"); finite(state_rate_, "state_rate");
     if (rate_ < 20 || rate_ > 1000 || state_rate_ < 1 || state_rate_ > rate_) {
       throw std::invalid_argument("control_rate must be 20..1000; state_rate 1..control_rate or 0");
+    }
+    if (native_position_observation_rate_ > 0 && rate_ < 250) {
+      throw std::invalid_argument("native position observation requires control_rate >=250 Hz; only 500 Hz is the initial validation cohort");
     }
     max_task_duration_ = parameter<double>("", "max_task_duration");
     positive(max_task_duration_, "max_task_duration");
@@ -229,6 +267,11 @@ public:
       throw std::invalid_argument("Each motor_node controls exactly one motor; use bus.launch.py for multiple nodes");
     }
     configure_single();
+    if (event_driven_feedback_) {
+      for (auto & axis : axes_) {
+        axis->transport->set_receive_notification([wake = feedback_wake_] {wake->notify();});
+      }
+    }
     target_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
     rclcpp::ExecutorOptions target_options;
     target_options.context = get_node_base_interface()->get_context();
@@ -249,6 +292,10 @@ public:
             parameter.as_double() < 20 || parameter.as_double() > 1000)
           {
             result.reason = "Only control_rate may change at runtime; requires a double in 20..1000 Hz.";
+            return result;
+          }
+          if (native_position_observation_rate_ > 0 && parameter.as_double() < 250) {
+            result.reason = "native position observation requires control_rate >=250 Hz";
             return result;
           }
         }
@@ -302,6 +349,7 @@ public:
       control_thread_ = std::thread([this] {control_loop();});
     } catch (...) {
       running_ = false;
+      feedback_wake_->notify();
       target_executor_->cancel();
       feedback_condition_.notify_all();
       if (target_thread_.joinable()) {target_thread_.join();}
@@ -309,7 +357,9 @@ public:
       if (control_thread_.joinable()) {control_thread_.join();}
       throw;
     }
-    RCLCPP_INFO(get_logger(), "Independent motor node, remote CAN transport, %.1f Hz; explicit enable required", rate_);
+    RCLCPP_INFO(get_logger(),
+      "Independent motor node, remote CAN transport, %.1f Hz, event feedback %s; explicit enable required",
+      rate_, event_driven_feedback_ ? "enabled" : "disabled");
   }
 
   ~MotorNode() override {stop();}
@@ -317,6 +367,8 @@ public:
   void stop()
   {
     if (!running_.exchange(false)) {return;}
+    for (auto & axis : axes_) {axis->transport->set_receive_notification({});}
+    feedback_wake_->notify();
     target_executor_->cancel();
     feedback_condition_.notify_all();
     if (target_thread_.joinable()) {target_thread_.join();}
@@ -375,6 +427,11 @@ private:
     if (desired_mode < 1 || desired_mode > 4) {throw std::invalid_argument("mode must be 1..4");}
     result.mode = mode(static_cast<uint8_t>(desired_mode));
     result.configure_mode_on_startup = parameter<bool>(prefix, "configure_mode_on_startup");
+    const std::string bandwidth_path = "packages.dm_motor_control.nodes.motor_node.startup_velocity_bandwidth";
+    rcl_interfaces::msg::ParameterDescriptor startup_only;
+    startup_only.read_only = true;
+    result.startup_velocity_bandwidth = declare_parameter<double>(prefix + "startup_velocity_bandwidth",
+      config_.has(bandwidth_path) ? config_.get<double>(bandwidth_path) : 0.0, startup_only);
     result.command_timeout = parameter<double>(prefix, "command_timeout");
     result.feedback_timeout = parameter<double>(prefix, "feedback_timeout");
     result.watchdog = parameter<double>(prefix, "watchdog_timeout");
@@ -449,18 +506,28 @@ private:
         "fresh disabled feedback and independent RAM readback required; no Flash save",
         static_cast<unsigned>(config.mode));
     }
+    if (config.startup_velocity_bandwidth > 0) {
+      RCLCPP_INFO(get_logger(), "Startup V_BW RAM configuration: %.6g Hz; fresh disabled read, "
+        "conditional write and independent readback required before ready; no Flash save or STOP restoration",
+        config.startup_velocity_bandwidth);
+    }
     auto axis = axis_config("", config, "");
     const auto bus_namespace = parameter<std::string>("", "can_bus_namespace");
     if (bus_namespace.empty() || bus_namespace.front() != '/') {
       throw std::invalid_argument("can_bus_namespace must be an absolute ROS namespace");
     }
     const bool fd = parameter<bool>("", "can_fd");
+    if (native_position_observation_rate_ > 0 && fd) {
+      throw std::invalid_argument("native position observation requires classical CAN");
+    }
     const bool require_virtual = parameter<bool>("", "require_virtual_bus");
     const auto client_name = std::string(get_fully_qualified_name());
     auto remote = std::make_unique<CanTransport>(*this, bus_namespace, client_name,
-      config.id, config.master, fd, rate_, config.feedback_timeout, axis->fault_group, require_virtual);
+      config.id, config.master, fd, rate_, config.feedback_timeout, axis->fault_group, require_virtual,
+      native_position_observation_rate_ > 0);
     axis->transport = remote.get();
-    auto bus = std::make_unique<Bus>(std::move(remote), std::vector<MotorConfig>{config}, false);
+    auto bus = std::make_unique<Bus>(std::move(remote), std::vector<MotorConfig>{config}, false,
+      native_position_observation_rate_ > 0);
     axis->bus = bus.get(); axis->backend = "can_bus";
     axes_.push_back(std::move(axis)); buses_.push_back(std::move(bus));
   }
@@ -513,6 +580,7 @@ private:
     axis.applied.mode = axis.requested.mode;
     axis.source_order.clear();
     axis.active_session.clear(); axis.active_source.clear();
+    axis.observation_schedule.clear();
     axis.manual_drag_source.clear();
   }
 
@@ -545,6 +613,43 @@ private:
     if (axis.explicit_bounds) {return {axis.lower, axis.upper};}
     const double limit = position_command_limit(state.mode, state.mapping, axis.config.limits);
     return {axis.offset - limit, axis.offset + limit};
+  }
+
+  void check_feedback_protection(
+    Axis & axis, const MotorSnapshot & state, double time, double feedback_age)
+  {
+    if (axis.host_protection && state.phase == Phase::Enabled && feedback_age >= 0 &&
+      feedback_age < axis.config.feedback_timeout &&
+      state.feedback_count != axis.protection_count)
+    {
+      axis.protection_count = state.feedback_count;
+      const double position = joint_position(axis, state);
+      const auto bounds = joint_bounds(axis, state);
+      std::string violation;
+      if (position < bounds.first || position > bounds.second) {
+        violation = "joint position " + std::to_string(position) + " rad outside [" +
+          std::to_string(bounds.first) + ", " + std::to_string(bounds.second) + "] rad";
+      } else if (axis.measured_velocity > 0 && std::abs(state.feedback.v) > axis.measured_velocity &&
+        !(axis.streamed_target && !axis.held_target && !axis.task &&
+        time <= axis.target_deadline && !axis.manual_drag_source.empty() &&
+        axis.active_source == axis.manual_drag_source)) {
+        violation = "absolute velocity " + std::to_string(std::abs(state.feedback.v)) +
+          " rad/s > " + std::to_string(axis.measured_velocity) + " rad/s";
+      } else if (axis.measured_torque > 0 && std::abs(state.feedback.t) > axis.measured_torque) {
+        violation = "absolute torque " + std::to_string(std::abs(state.feedback.t)) +
+          " Nm > " + std::to_string(axis.measured_torque) + " Nm";
+      } else if (axis.mos_stop > 0 && state.feedback.mos >= axis.mos_stop) {
+        violation = "MOS temperature " + std::to_string(state.feedback.mos) +
+          " C >= " + std::to_string(axis.mos_stop) + " C";
+      } else if (axis.rotor_stop > 0 && state.feedback.rotor >= axis.rotor_stop) {
+        violation = "rotor temperature " + std::to_string(state.feedback.rotor) +
+          " C >= " + std::to_string(axis.rotor_stop) + " C";
+      }
+      axis.violations = violation.empty() ? 0 : axis.violations + 1;
+      if (axis.violations >= axis.violation_limit) {
+        axis.bus->fail(axis.config.name, "measured feedback protection exceeded: " + violation);
+      }
+    } else if (state.phase != Phase::Enabled) {axis.violations = 0;}
   }
 
   Target native_target(const Axis & axis, Target target) const
@@ -678,6 +783,15 @@ private:
       axis.endpoint + "feedback", rclcpp::QoS(4096).reliable().durability_volatile());
     axis.bus->set_feedback_callback(
       [this, &axis](const std::string &, const MotorSnapshot & sample, double received) {
+        if (event_driven_feedback_) {
+          // Early delivery must not overwrite an unchecked limit violation
+          // before the next periodic snapshot. Both receive paths run under
+          // mutex_ on the I/O owner; the unique feedback counter prevents the
+          // periodic check from counting this sample again. Bus drains RX and
+          // sends any newly latched STOP before it can send ordinary targets.
+          const double time = steady_seconds();
+          check_feedback_protection(axis, sample, time, std::max(0.0, time - received));
+        }
         api::msg::MotorFeedback msg;
         msg.motor_id = axis.config.id; msg.feedback_count = sample.feedback_count;
         msg.receive_time = received;
@@ -694,6 +808,37 @@ private:
         msg.target_accept_latency_ms = axis.applied_target_age_ms;
         pending_feedback_.emplace_back(axis.feedback_publisher, std::move(msg));
       });
+    if (native_position_observation_rate_ > 0) {
+      axis.position_observation_publisher = create_publisher<api::msg::MotorPositionObservation>(
+        // Optional telemetry must not wait for a reliable subscriber's ACK on
+        // the shared publication worker. IDs/counters expose missing samples.
+        axis.endpoint + "position_observation", rclcpp::QoS(16).best_effort().durability_volatile());
+      axis.bus->set_position_observation_callback([this, &axis](const PositionObservation & sample) {
+          const uint64_t completed = static_cast<uint64_t>(steady_seconds() * 1e9);
+          if (sample.state == PositionObservationState::Complete && sample.point.valid) {
+            axis.observation_schedule.completed();
+          } else if (sample.state == PositionObservationState::Cancelled && !sample.session_locked) {
+            // One accepted slot yielded no usable observation. Skipped cadence
+            // slots may have no ID, so missed_slots is not equal to ID gaps.
+            axis.observation_schedule.missed();
+          }
+          api::msg::MotorPositionObservation msg;
+          msg.header.stamp = now(); msg.state = static_cast<uint8_t>(sample.state);
+          msg.valid = sample.point.valid; msg.session_locked = sample.session_locked;
+          msg.device_sample_time_known = false; msg.message = sample.message;
+          msg.source_id = sample.context.source_id; msg.motor_id = axis.config.id;
+          msg.task_id = sample.context.task_id; msg.observation_id = sample.id;
+          msg.observation_epoch = sample.context.observation_epoch; msg.bus_epoch = sample.context.bus_epoch;
+          msg.profile = axis.profile; msg.direction = axis.direction; msg.software_offset = axis.offset;
+          msg.mapping_p = sample.mapping.p; msg.mapping_v = sample.mapping.v; msg.mapping_t = sample.mapping.t;
+          msg.raw_value = sample.point.raw; msg.native_position = sample.point.radians;
+          msg.requested_steady = sample.requested_steady; msg.tx_steady = sample.point.tx_steady;
+          msg.rx_steady = sample.point.rx_steady; msg.completed_steady = completed;
+          msg.missed_slots = axis.observation_schedule.missed_slots();
+          msg.completed_count = axis.observation_schedule.completed_count();
+          queue_publication(ObservationPublication{axis.position_observation_publisher, std::move(msg)});
+        });
+    }
     const auto receive_target = [this, &axis](api::msg::MotorSetpoint::ConstSharedPtr msg,
         const rclcpp::MessageInfo & info) {
         std::shared_ptr<const InputTarget> input = std::make_shared<InputTarget>(
@@ -1289,6 +1434,93 @@ private:
     }
   }
 
+  std::optional<PositionObservationIdentity> observation_identity(const Axis & axis, double time) const
+  {
+    if (axis.active_source.empty() || !axis.transport->ready() ||
+      !axis.transport->activity_available() || !axis.bus->ready()) {return std::nullopt;}
+    const auto state = axis.bus->snapshot(axis.config.name, time);
+    if (state.phase != Phase::Enabled || state.feedback.status != 1 ||
+      !state.absolute_position_valid || state.feedback_age < 0 ||
+      state.feedback_age >= axis.config.feedback_timeout || state.mode != Mode::Mit ||
+      axis.active.mode != Mode::Mit) {return std::nullopt;}
+    if (!axis.active_session.empty() && session_deadline(axis, axis.active_session) <= time) {
+      return std::nullopt;
+    }
+    if (axis.task) {
+      if (axis.task_stopping || axis.task->is_canceling() || time < axis.task_start ||
+        time >= axis.task_start + axis.task_duration) {return std::nullopt;}
+    } else if (!axis.streamed_target ||
+      (axis.held_target ? axis.active_session.empty() : time > axis.target_deadline))
+    {return std::nullopt;}
+    return PositionObservationIdentity{axis.active_source, axis.active_session,
+      axis.task ? axis.task->task_id : 0,
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(axis.task.get())), axis.transport->bus_epoch()};
+  }
+
+  std::optional<PositionObservationIdentity> retire_changed_position_observation(Axis & axis, double time)
+  {
+    if (native_position_observation_rate_ == 0) {return std::nullopt;}
+    if (axis.bus->position_observation_locked()) {
+      axis.observation_schedule.clear();
+      return std::nullopt;  // No retry after an ambiguous submitted transaction.
+    }
+    const auto identity = observation_identity(axis, time);
+    auto & schedule = axis.observation_schedule;
+    if (!identity || !schedule.matches(*identity)) {
+      // Withdraw source eligibility immediately, but retain an already published
+      // read's unique old TX/RX association until closure or its original deadline.
+      const auto state = axis.bus->snapshot(axis.config.name, time);
+      if (state.host_fault || state.device_fault || state.phase == Phase::Fault ||
+        !state.absolute_position_valid || state.feedback_age < 0 ||
+        state.feedback_age >= axis.config.feedback_timeout)
+      {axis.bus->cancel_position_observation(axis.config.name, "native observation feedback/fault context lost");}
+      else {axis.bus->retire_position_observation(axis.config.name, "native observation source/context changed");}
+      schedule.clear();
+    }
+    return identity;
+  }
+
+  void update_position_observation(Axis & axis, double time)
+  {
+    const auto identity = retire_changed_position_observation(axis, time);
+    if (!identity || axis.bus->position_observation_locked() ||
+      axis.bus->position_observation_retiring()) {return;}
+    auto & schedule = axis.observation_schedule;
+    if (!schedule.matches(*identity)) {
+      schedule.bind(*identity, static_cast<uint64_t>(time * 1e9));
+    }
+    double valid_until = std::numeric_limits<double>::infinity();
+    if (axis.task) {valid_until = std::min(valid_until, axis.task_start + axis.task_duration);}
+    if (!axis.active_session.empty()) {
+      valid_until = std::min(valid_until, session_deadline(axis, axis.active_session));
+    }
+    if (axis.streamed_target && !axis.held_target) {
+      valid_until = std::min(valid_until, axis.target_deadline);
+    }
+    const uint64_t now_ns = static_cast<uint64_t>(time * 1e9);
+    // Observation requires a bounded live source. This does not shorten the
+    // source-valid callback or cancel a read that was already published.
+    const uint64_t valid_until_ns = std::isfinite(valid_until) && valid_until > 0 ?
+      static_cast<uint64_t>(valid_until * 1e9) : now_ns;
+    if (!schedule.take_slot(now_ns, valid_until_ns)) {return;}
+    const auto expected = *identity;
+    const uint64_t epoch = schedule.epoch();
+    const PositionObservationContext context{epoch, expected.bus_epoch, expected.task, expected.source};
+    const auto valid_source = [this, &axis, expected, epoch] {
+        const auto current = observation_identity(axis, steady_seconds());
+        return current && *current == expected && axis.observation_schedule.active() &&
+          axis.observation_schedule.epoch() == epoch;
+      };
+    // CanTransport registers this fixed motor route once and latches failures.
+    // Retirement must not depend on the old control source/schedule staying live.
+    const auto valid_lineage = [&axis, expected] {
+        return axis.transport->ready() && axis.transport->activity_available() &&
+          axis.transport->error().empty() && axis.transport->bus_epoch() == expected.bus_epoch;
+      };
+    if (!axis.bus->request_position_observation(axis.config.name, schedule.next_id(), time,
+      context, valid_source, valid_lineage)) {schedule.missed();}
+  }
+
   void control_loop()
   {
     auto next = std::chrono::steady_clock::now();
@@ -1373,37 +1605,7 @@ private:
                 axis->bus->fail(axis->config.name, "command publisher timeout: setpoint validity expired");
                 axis->streamed_target = false;
               }
-              if (axis->host_protection && state.phase == Phase::Enabled && state.feedback_age >= 0 &&
-                state.feedback_age < axis->config.feedback_timeout &&
-                state.feedback_count != axis->protection_count)
-              {
-                axis->protection_count = state.feedback_count;
-                const double position = joint_position(*axis, state);
-                std::string violation;
-                if (position < axis->lower || position > axis->upper) {
-                  violation = "joint position " + std::to_string(position) + " rad outside [" +
-                    std::to_string(axis->lower) + ", " + std::to_string(axis->upper) + "] rad";
-                } else if (axis->measured_velocity > 0 && std::abs(state.feedback.v) > axis->measured_velocity &&
-                  !(axis->streamed_target && !axis->held_target && !axis->task &&
-                  time <= axis->target_deadline && !axis->manual_drag_source.empty() &&
-                  axis->active_source == axis->manual_drag_source)) {
-                  violation = "absolute velocity " + std::to_string(std::abs(state.feedback.v)) +
-                    " rad/s > " + std::to_string(axis->measured_velocity) + " rad/s";
-                } else if (axis->measured_torque > 0 && std::abs(state.feedback.t) > axis->measured_torque) {
-                  violation = "absolute torque " + std::to_string(std::abs(state.feedback.t)) +
-                    " Nm > " + std::to_string(axis->measured_torque) + " Nm";
-                } else if (axis->mos_stop > 0 && state.feedback.mos >= axis->mos_stop) {
-                  violation = "MOS temperature " + std::to_string(state.feedback.mos) +
-                    " C >= " + std::to_string(axis->mos_stop) + " C";
-                } else if (axis->rotor_stop > 0 && state.feedback.rotor >= axis->rotor_stop) {
-                  violation = "rotor temperature " + std::to_string(state.feedback.rotor) +
-                    " C >= " + std::to_string(axis->rotor_stop) + " C";
-                }
-                axis->violations = violation.empty() ? 0 : axis->violations + 1;
-                if (axis->violations >= axis->violation_limit) {
-                  axis->bus->fail(axis->config.name, "measured feedback protection exceeded: " + violation);
-                }
-              } else if (state.phase != Phase::Enabled) {axis->violations = 0;}
+              check_feedback_protection(*axis, state, time, state.feedback_age);
               task_tick(*axis, axis->bus->snapshot(axis->config.name, time), time);
               if (axis->held_target && axis->streamed_target && !axis->task &&
                 axis->bus->snapshot(axis->config.name, time).phase == Phase::Enabled &&
@@ -1418,6 +1620,9 @@ private:
           }
         }
         for (auto & bus : buses_) {
+          for (auto & axis : axes_) {
+            if (axis->bus == bus.get()) {update_position_observation(*axis, time);}
+          }
           if (!axes_.front()->transport->ready()) {continue;}
           try {
             bus->tick(time);
@@ -1469,8 +1674,46 @@ private:
       }
       next += period;
       if (next < std::chrono::steady_clock::now()) {next = std::chrono::steady_clock::now();}
-      std::this_thread::sleep_until(next);
+      if (!event_driven_feedback_) {
+        std::this_thread::sleep_until(next);
+        continue;
+      }
+      // Only receive/publish between the original control deadlines. Do not
+      // accept targets, advance tasks, refresh leases, or send ordinary frames
+      // on these wakeups. Periodic supervision and TX keep their original rate.
+      while (running_ && std::chrono::steady_clock::now() < next) {
+        {
+          std::unique_lock<std::mutex> lock(feedback_wake_->mutex);
+          feedback_wake_->condition.wait_until(lock, next, [this] {
+            return !running_ || feedback_wake_->pending;
+          });
+          feedback_wake_->pending = false;
+        }
+        if (!running_ || std::chrono::steady_clock::now() >= next) {break;}
+        receive_feedback_early();
+      }
     }
+  }
+
+  void receive_feedback_early()
+  {
+    std::vector<FeedbackPublication> feedback;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      const double time = steady_seconds();
+      for (auto & axis : axes_) {
+        const auto error = axis->transport->error();
+        if (!error.empty()) {axis->bus->transport_failed(error);}
+        else if (axis->transport->ready()) {
+          // A source can change between control ticks. Retire before an early
+          // RX poll evaluates its old source predicate; never bind/take a slot here.
+          retire_changed_position_observation(*axis, time);
+          axis->bus->poll_feedback(time);
+        }
+      }
+      feedback.swap(pending_feedback_);
+    }
+    for (auto & sample : feedback) {queue_publication(std::move(sample));}
   }
 
   void feedback_loop()
@@ -1627,6 +1870,9 @@ private:
   std::vector<std::unique_ptr<Axis>> axes_;
   std::mutex mutex_;
   std::atomic<bool> running_{false};
+  bool event_driven_feedback_{false};
+  double native_position_observation_rate_{0};
+  std::shared_ptr<FeedbackWake> feedback_wake_{std::make_shared<FeedbackWake>()};
   std::thread control_thread_;
   double rate_{200}, state_rate_{200}, max_task_duration_{60};
   double last_tick_{0}, period_{0}, max_period_{0};

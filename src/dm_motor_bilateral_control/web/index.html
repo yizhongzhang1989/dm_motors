@@ -9,7 +9,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div><h1>标准双边力控</h1><small>相对坐标 MIT PD · 非简易位置互换</small></div>
+    <div><h1>标准双边力控</h1><small>相对坐标 MIT PD · 双轴摩擦补偿 · <span id="control-mode">等待模式</span></small></div>
     <div class="top-actions"><span id="phase" class="badge" role="status">等待连接</span>
       <span id="quality" class="badge">—</span>
       <button id="start" type="submit" form="settings" disabled>开始</button>
@@ -26,14 +26,26 @@
           <fieldset id="edit-fields" disabled>
             <label>方向<select id="direction"><option value="1">同向</option><option value="-1">反向</option></select></label>
             <div class="fields">
-              <label>耦合刚度 Kc / Nm·rad⁻¹<input id="stiffness" type="number" min="0" max="100" step="any" required></label>
-              <label>耦合阻尼 Dc<input id="coupling_damping" type="number" min="0" max="1" step="any" required></label>
+              <label>有效耦合刚度 Kc / Nm·rad⁻¹<input id="stiffness" type="number" min="0" max="500" step="any" required></label>
+              <label>有效耦合阻尼 Dc<input id="coupling_damping" type="number" min="0" max="1" step="any" required></label>
               <label>本地阻尼 B<input id="local_damping" type="number" min="0" max="1" step="any" required></label>
-              <label>共同 PD 预算 / Nm<input id="max_torque" type="number" min="0.000001" step="any" required></label>
+              <label>应用层力矩预算 / Nm<input id="max_torque" type="number" min="0" step="any" aria-describedby="budget-help" required></label>
             </div>
-            <p class="muted">两侧 Kp/Kd 相同，Kd=Dc+B≤1，前馈请求始终为0。PD预算不是驱动硬限矩。</p>
-            <p class="muted">B=0 时没有本地阻尼；高预算下，延迟和量化扰动可能引起振荡。请先使用默认带阻尼参数，不要靠增大预算代替调参。</p>
-            <details open><summary>反馈配对与恢复 / 秒</summary>
+            <p id="budget-help" class="muted">0 = 不额外限矩；正值按映射后的原生 MIT 增益约束 PD 与前馈总估算。驱动保护与协议指令范围仍生效。</p>
+            <p id="gain-help" class="muted">等待读取控制模式和两轴增益上限。</p>
+            <p id="velocity-bandwidth" class="muted">速度带宽状态未读取。</p>
+            <label class="check"><input id="friction_compensation_enabled" type="checkbox">启用双轴摩擦补偿</label>
+            <p id="compensation-summary" class="muted">等待模型状态。</p>
+            <details><summary>补偿比例与上限</summary>
+              <div class="fields">
+                <label>补偿比例 / 0–1<input id="friction_compensation_fraction" type="number" min="0" max="1" step="any" required></label>
+                <label>模型摩擦上限 / Nm<input id="friction_torque_limit" type="number" min="0.000001" max="0.5" step="any" required></label>
+              </div>
+              <p class="muted">默认补偿 60%，保留模型误差余量；补偿过量可能使松手后仍持续运动。</p>
+              <p class="muted">按各轴反馈速度计算，并限制在标定速度域内。模型摩擦受此上限约束；编码修正单独显示，总前馈仍受驱动字段上限约束。</p>
+              <p class="muted">模型配置：<span id="system-parameters-file" class="source">—</span></p>
+            </details>
+            <details><summary>反馈配对与恢复 / 秒</summary>
               <div class="fields">
                 <label>新鲜期限<input id="feedback_age" type="number" min="0.002" max="0.1" step="any" required></label>
                 <label>配对最大时差<input id="pair_skew" type="number" min="0.000001" step="any" required></label>
@@ -42,7 +54,7 @@
               </div>
             </details>
             <label class="check"><input id="motion_limits_enabled" type="checkbox">启用附加运动限制（默认关闭）</label>
-            <p class="muted">共同 PD 预算始终参与增益缩放。此开关不修改已有驱动的保护；真机双边 bringup 仍保留温度保护。</p>
+            <p class="muted">此开关不修改应用层预算或已有驱动的保护。</p>
             <fieldset id="limit-fields">
               <div class="fields">
                 <label>反馈力矩停机 / Nm<input id="max_feedback_torque" type="number" min="0.000001" step="any" required></label>
@@ -52,28 +64,85 @@
               </div>
             </fieldset>
           </fieldset>
+          <button id="apply" type="button" class="secondary" disabled>应用设置 · 保持失能</button>
         </form>
         <p id="dirty" class="muted"></p>
-        <p class="muted">开始时应用当前配置；运行中不可修改。没有两侧角差停机阈值，不自动保持共同位置。</p>
+        <p class="muted">开始也会应用当前设置；运行中不可修改。不会自动恢复运行或保持共同位置。</p>
       </section>
       <div class="observations">
+        <section class="panel coupling-panel">
+          <div class="heading"><h2>有效耦合与输出边界</h2><span id="protocol-status" class="badge">等待状态</span></div>
+          <div class="coupling-readouts">
+            <div><span>原生 MIT Kp / Kd</span><strong id="gains">—</strong><small id="requested-gains">等待配置</small></div>
+            <div><span>增益保留</span><strong id="gain-scale">—</strong><small id="gain-reason">等待状态</small></div>
+            <div><span>已应用的力矩预算</span><strong id="budget-mode">—</strong><small>0 仅关闭额外应用限矩</small></div>
+          </div>
+          <p class="muted">原生增益为预算缩放和量化后的请求值；有效耦合参数与原生 MIT 增益分别显示。力矩估算和协议量程提示不等于设备实际输出。两轴驱动保护见下方。</p>
+        </section>
         <section class="motors">
           <article class="panel"><div class="heading"><h2>电机 A</h2><span id="a-status" class="badge">—</span></div>
-            <p id="a-name" class="muted"></p><div class="position"><b id="a-position">—</b><span>rad</span></div>
+            <p id="a-name" class="muted"></p><p id="a-fault" class="fault fault-detail" hidden></p>
+            <div class="position"><b id="a-position">—</b><span>rad</span></div>
             <dl><dt>速度 / rad/s</dt><dd id="a-velocity">—</dd><dt>反馈力矩 / Nm</dt><dd id="a-torque">—</dd>
-              <dt>最近 PD 估算 / Nm</dt><dd id="a-estimate">—</dd><dt>温度</dt><dd id="a-temperature">—</dd>
-              <dt>反馈年龄 / ms</dt><dd id="a-age">—</dd><dt>反馈率 / Hz</dt><dd id="a-rate">—</dd></dl></article>
+              <dt>未缩放需求 / Nm</dt><dd id="a-demand">—</dd><dt>量化总估算 / Nm</dt><dd id="a-estimate">—</dd>
+              <dt>摩擦前馈 / Nm</dt><dd id="a-friction">—</dd>
+              <dt>温度</dt><dd id="a-temperature">—</dd><dt>反馈年龄 / ms</dt><dd id="a-age">—</dd>
+              <dt>反馈率 / Hz</dt><dd id="a-rate">—</dd></dl>
+            <p id="a-output-status" class="muted">等待输出状态。</p>
+            <details class="driver-details"><summary>驱动边界与保护 · <span id="a-driver-status">未读取</span></summary>
+              <dl><dt>协议力矩量程 / Nm</dt><dd id="a-protocol-limit">未读取</dd>
+                <dt>前馈字段上限 / Nm</dt><dd id="a-feedforward-limit">未读取</dd>
+                <dt>Kp / Kd 字段上限</dt><dd id="a-gain-limits">未读取</dd>
+                <dt>估算力矩停机 / Nm</dt><dd id="a-estimated-stop">未读取</dd>
+                <dt>实测力矩停机 / Nm</dt><dd id="a-measured-stop">未读取</dd>
+                <dt>驱动控制率 / Hz</dt><dd id="a-control-rate">未读取</dd>
+                <dt>看门狗 / ms</dt><dd id="a-watchdog">未读取</dd></dl>
+            </details>
+            <div class="compensation">
+              <div class="heading"><h3>摩擦模型</h3><span id="a-compensation-status" class="badge">—</span></div>
+              <dl><dt>模型</dt><dd id="a-model">—</dd><dt>标定速度 / rad/s</dt><dd id="a-domain">—</dd></dl>
+              <p id="a-compensation-message" class="muted"></p>
+              <details><summary>前馈分量</summary>
+                <dl><dt>编码修正 / Nm</dt><dd id="a-quantization">—</dd>
+                  <dt>总前馈请求 / Nm</dt><dd id="a-total-feedforward">—</dd></dl>
+                <p class="muted">预算为 0 时修正 MIT 位置与速度的编码残差。它独立于摩擦模型，关闭摩擦补偿后仍可有小前馈；不是惯量补偿。</p>
+              </details>
+              <details><summary>模型来源</summary><p id="a-source" class="source muted">—</p></details>
+            </div></article>
           <article class="panel"><div class="heading"><h2>电机 B</h2><span id="b-status" class="badge">—</span></div>
-            <p id="b-name" class="muted"></p><div class="position"><b id="b-position">—</b><span>rad</span></div>
+            <p id="b-name" class="muted"></p><p id="b-fault" class="fault fault-detail" hidden></p>
+            <div class="position"><b id="b-position">—</b><span>rad</span></div>
             <dl><dt>速度 / rad/s</dt><dd id="b-velocity">—</dd><dt>反馈力矩 / Nm</dt><dd id="b-torque">—</dd>
-              <dt>最近 PD 估算 / Nm</dt><dd id="b-estimate">—</dd><dt>温度</dt><dd id="b-temperature">—</dd>
-              <dt>反馈年龄 / ms</dt><dd id="b-age">—</dd><dt>反馈率 / Hz</dt><dd id="b-rate">—</dd></dl></article>
+              <dt>未缩放需求 / Nm</dt><dd id="b-demand">—</dd><dt>量化总估算 / Nm</dt><dd id="b-estimate">—</dd>
+              <dt>摩擦前馈 / Nm</dt><dd id="b-friction">—</dd>
+              <dt>温度</dt><dd id="b-temperature">—</dd><dt>反馈年龄 / ms</dt><dd id="b-age">—</dd>
+              <dt>反馈率 / Hz</dt><dd id="b-rate">—</dd></dl>
+            <p id="b-output-status" class="muted">等待输出状态。</p>
+            <details class="driver-details"><summary>驱动边界与保护 · <span id="b-driver-status">未读取</span></summary>
+              <dl><dt>协议力矩量程 / Nm</dt><dd id="b-protocol-limit">未读取</dd>
+                <dt>前馈字段上限 / Nm</dt><dd id="b-feedforward-limit">未读取</dd>
+                <dt>Kp / Kd 字段上限</dt><dd id="b-gain-limits">未读取</dd>
+                <dt>估算力矩停机 / Nm</dt><dd id="b-estimated-stop">未读取</dd>
+                <dt>实测力矩停机 / Nm</dt><dd id="b-measured-stop">未读取</dd>
+                <dt>驱动控制率 / Hz</dt><dd id="b-control-rate">未读取</dd>
+                <dt>看门狗 / ms</dt><dd id="b-watchdog">未读取</dd></dl>
+            </details>
+            <div class="compensation">
+              <div class="heading"><h3>摩擦模型</h3><span id="b-compensation-status" class="badge">—</span></div>
+              <dl><dt>模型</dt><dd id="b-model">—</dd><dt>标定速度 / rad/s</dt><dd id="b-domain">—</dd></dl>
+              <p id="b-compensation-message" class="muted"></p>
+              <details><summary>前馈分量</summary>
+                <dl><dt>编码修正 / Nm</dt><dd id="b-quantization">—</dd>
+                  <dt>总前馈请求 / Nm</dt><dd id="b-total-feedforward">—</dd></dl>
+                <p class="muted">预算为 0 时修正 MIT 位置与速度的编码残差。它独立于摩擦模型，关闭摩擦补偿后仍可有小前馈；不是惯量补偿。</p>
+              </details>
+              <details><summary>模型来源</summary><p id="b-source" class="source muted">—</p></details>
+            </div></article>
         </section>
         <section class="panel">
           <h2>耦合与通信状态</h2>
           <dl class="diagnostics"><dt>相对位置差 / rad</dt><dd id="position-error">—</dd>
             <dt>相对速度 / rad/s</dt><dd id="relative-velocity">—</dd>
-            <dt>共同增益比例</dt><dd id="gain-scale">—</dd><dt>量化 Kp / Kd</dt><dd id="gains">—</dd>
             <dt>配对年龄 / 时差 ms</dt><dd id="pair-timing">—</dd><dt>恢复 / 新鲜配对数</dt><dd id="recovery">—</dd>
             <dt>累计配对 / 降级</dt><dd id="pair-count">—</dd><dt>驱动请求组数</dt><dd id="command-count">—</dd></dl>
           <p id="controller-message" class="notice"></p>
@@ -81,8 +150,10 @@
         </section>
         <section class="panel plots">
           <h2>双向响应</h2>
-          <p class="muted">青：A · 紫：B · 黄：相对位置差。力矩图实线为反馈、虚线为PD估算；不是外力传感器读数。</p>
-          <h3>相对启动位置 / rad</h3><canvas id="position-chart" aria-label="两侧相对位置和误差曲线"></canvas>
+          <p class="muted">青：A · 紫：B · 黄：相对位置差。力矩图实线为反馈、虚线为 PD 与前馈总估算；不是外力传感器读数。</p>
+          <h3>相对启动位置 / rad</h3>
+          <p id="position-baseline" class="muted">待建立启动基准</p>
+          <canvas id="position-chart" aria-label="两侧相对位置和误差曲线"></canvas>
           <h3>力矩 / Nm</h3><canvas id="torque-chart" aria-label="两侧反馈与估算力矩曲线"></canvas>
           <small id="rate" class="muted"></small>
         </section>

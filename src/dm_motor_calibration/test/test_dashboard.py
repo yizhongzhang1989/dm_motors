@@ -16,6 +16,7 @@ from dm_motor_calibration import CalibrationError, MechanicalOptions, fit_mechan
 from dm_motor_calibration.dashboard import ApiError, Dashboard, DashboardServer
 from dm_motor_calibration.dashboard_data import (
     DISPLAY_FIELDS, MAX_SNAPSHOT_ROWS, DisplayBuffer, decode_object, friction_plot, normalize_settings,
+    model_curves, quick_shared_ranges,
 )
 from dm_motor_calibration.ros_node import CalibrationNode
 from dm_motor_interfaces.srv import CalibrationControl
@@ -27,6 +28,7 @@ from test_workflow import calibration
     {"allow_hardware": True}, {"max_torque": float("inf")}, {"rate": 1.0}, {"duration": True},
     {"kp": "2"}, {"fit_bias": "false"}, {"model": "invalid"}, {"experiment": "enable"},
     {"calibration_file": 0}, {"duration": float("nan")},
+    {"quick_excitation": "unknown"}, {"quick_excitation": True},
 ])
 def test_dashboard_settings_do_not_coerce_or_relax_safety(changes):
     with pytest.raises(CalibrationError):
@@ -35,6 +37,8 @@ def test_dashboard_settings_do_not_coerce_or_relax_safety(changes):
 
 def test_normalization_and_json_reject_unknown_semantics():
     assert normalize_settings({"duration": 12, "model": "stribeck"}) == {"duration": 12.0, "model": "stribeck"}
+    assert normalize_settings({"quick_excitation": "auto"}) == {"quick_excitation": "auto"}
+    assert normalize_settings({"experiment": "validate", "quick_excitation": "auto"})["quick_excitation"] == "auto"
     for value in ('{"duration":NaN}', '{"model":"auto","model":"viscous"}', "[]"):
         with pytest.raises(CalibrationError):
             decode_object(value)
@@ -174,6 +178,79 @@ def fake_node(root):
     node.operate = Mock(return_value={"message": "accepted"})
     node.stop = Mock(return_value={"message": "stop requested; not confirmed"})
     return node
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_low_speed_interruption_restores_even_before_a_fittable_trace(tmp_path, count):
+    run = "20261105T000000-01020304"
+    directory = tmp_path / run
+    directory.mkdir()
+    report = {"experiment": "low_speed", "status": "failed", "samples": count,
+              "qualified": False, "stop_confirmed": True, "error": "Interrupted before sampling",
+              "configuration": {}, "low_speed": {"qualified": False, "cells": [], "pairs": []}}
+    (directory / "report.json").write_text(json.dumps(report))
+    (directory / "samples.csv").write_text("time,position,velocity,torque\n" + "".join(
+        f"{i*.002},0,0,0\n" for i in range(count)))
+    before = (directory / "report.json").read_bytes()
+    restored = fake_node(tmp_path).run_details(run)
+    assert restored["report"] == report and restored["fit"] is None
+    assert restored["raw_samples"] == count and len(restored["trace"]) == count
+    assert not restored["trace_error"]
+    assert (directory / "report.json").read_bytes() == before
+
+
+def test_saved_shared_sliding_ranges_reach_history_without_filling_low_speed_hole(tmp_path):
+    # Shape and values from the retained A v3 report; no CSV refit/reselection.
+    directions = {
+        "negative": {"velocity_min": -.512479, "velocity_max": -.286676,
+                     "windows": {"training": 25, "external_validation": 23}},
+        "positive": {"velocity_min": .271294, "velocity_max": .524166,
+                     "windows": {"training": 30, "external_validation": 22}},
+    }
+    run = "20261104T144039-f09aac0d"
+    directory = tmp_path / run
+    directory.mkdir()
+    node = fake_node(tmp_path)
+    fit = calibration()
+    fit.save(directory / "calibration.json", node.state["identity"])
+    model_bytes = (directory / "calibration.json").read_bytes()
+    for saved in (directions, None):
+        coverage = {"validated_velocity_min": -.512479, "validated_velocity_max": .524166}
+        if saved is not None:
+            coverage["directions"] = saved
+        report = {"status": "completed", "experiment": "calibrate", "qualified": True,
+                  "stop_confirmed": True, "quick": {"coverage": coverage}}
+        path = directory / "report.json"
+        path.write_text(json.dumps(report))
+        original = path.read_bytes()
+        ranges = quick_shared_ranges(report["quick"])
+        assert ranges == (directions if saved is not None else {})
+        entry = node.runs()[0]
+        assert entry["eligible"] and entry["shared_ranges"] == ranges
+        details = node.run_details(run)
+        assert details["report"]["qualified"] is True
+        assert details["fit"]["domain"] == fit.domain
+        assert details["plot"]["curves"] == model_curves(fit, shared_ranges=ranges)
+        if saved is None:
+            assert details["plot"]["curves"] == [[], []]
+        else:
+            negative, positive = details["plot"]["curves"]
+            assert len(negative) == len(positive) == 120
+            assert negative[0][0] == directions["negative"]["velocity_min"]
+            assert negative[-1][0] == directions["negative"]["velocity_max"]
+            assert positive[0][0] == directions["positive"]["velocity_min"]
+            assert positive[-1][0] == directions["positive"]["velocity_max"]
+        assert path.read_bytes() == original
+        assert (directory / "calibration.json").read_bytes() == model_bytes
+
+
+@pytest.mark.parametrize("branch", [
+    {"velocity_min": -.3, "velocity_max": .3, "windows": {"training": 20, "external_validation": 20}},
+    {"velocity_min": .2, "velocity_max": .4, "windows": {"training": 20}},
+    {"velocity_min": .2, "velocity_max": .4, "windows": {"training": 20, "external_validation": 0}},
+])
+def test_shared_range_display_does_not_infer_invalid_or_unrecorded_coverage(branch):
+    assert quick_shared_ranges({"coverage": {"directions": {"positive": branch}}}) == {}
 
 
 def test_history_identity_and_path_boundaries_are_explicit(tmp_path):
@@ -343,6 +420,12 @@ def test_dashboard_layout_separates_live_controls_from_viewed_results():
 
     for identifier in ("drag-details", "parameter-save-section", "experiment-details", "reanalysis-panel"):
         assert "open" not in parser.elements[identifier][0]
+    assert "open" not in parser.elements["experiment-tools"][0]
+    for identifier in ("experiment", "steps", "apply", "reload-settings", "quick-profile"):
+        assert "experiment-tools" in parser.elements[identifier][1]
+    for identifier in ("draft-summary", "current-step", "start", "stop"):
+        assert "experiment-tools" not in parser.elements[identifier][1]
+    assert parser.elements["experiment"][0]["form"] == "settings"
     for identifier in ("constraint-overview", "fourier-panel", "recording-streams"):
         assert identifier not in parser.elements
 
@@ -429,3 +512,32 @@ def test_unqualified_candidate_restores_in_the_single_model_result(tmp_path):
     assert result["report"]["status"] == "completed_unqualified"
     assert "calibration.json" not in result["artifacts"]
     assert path.read_bytes() == original
+
+
+def test_adaptive_history_keeps_formal_analysis_separate_from_whole_motion(tmp_path):
+    run = "20261104T140000-12345678"
+    directory = tmp_path / run
+    directory.mkdir()
+    adaptation = {"status": "selected", "selected_candidate": "C1", "attempts": [{"candidate_id": "C1"}],
+                  "candidates": {"C1": {"formal_settings": {"kp": 4, "kd": .5}}}}
+    report = {"status": "completed_unqualified", "experiment": "calibrate", "samples": 3,
+              "recorded_samples": 6, "stop_confirmed": True, "quick_adaptation": adaptation,
+              "requested_configuration": {"kp": .3}, "configuration": {"kp": 4, "quick_excitation": "auto"}}
+    (directory / "report.json").write_text(json.dumps(report))
+    header = "time,position,velocity,torque,leg\n"
+    (directory / "samples.csv").write_text(header + "3,0,0,0,0\n4,0,0,0,0\n5,0,0,0,1\n")
+    (directory / "all_samples.csv").write_text(header + "0,0,0,0,-2\n1,0,0,0,-2\n2,0,0,0,-1\n3,0,0,0,0\n4,0,0,0,0\n5,0,0,0,1\n")
+    (directory / "pilot_samples.csv").write_text(header + "0,0,0,0,-2\n1,0,0,0,-2\n2,0,0,0,-1\n")
+    (directory / "quick_adaptation.json").write_text(json.dumps(adaptation))
+    (directory / "requested_configuration.json").write_text(json.dumps(report["requested_configuration"]))
+    details = fake_node(tmp_path).run_details(run)
+    assert details["trace_error"] == ""
+    assert len(details["trace"]) == 6 and details["trace"][0][1] == 0
+    assert details["report"] == report
+    assert {"all_samples.csv", "pilot_samples.csv", "quick_adaptation.json", "requested_configuration.json"} <= set(details["artifacts"])
+    # A rejected selection may have only a header in the formal CSV.
+    (directory / "samples.csv").write_text(header)
+    (directory / "report.json").write_text(json.dumps({**report, "status": "failed", "samples": 0}))
+    rejected = fake_node(tmp_path).run_details(run)
+    assert len(rejected["trace"]) == 6 and rejected["report"]["samples"] == 0
+    assert not rejected["trace_error"]

@@ -319,6 +319,22 @@ def velocity_estimate(samples: list[Sample]) -> tuple[float, float]:
     return slope, residual
 
 
+def velocity_pi_step(history, latest: Sample | None, desired: float, dt: float, *,
+                     control_window: float, velocity_ki: float, velocity_kd: float,
+                     max_torque: float, integral: float, last_saturated: bool,
+                     reference_position: float, integrate: bool = True) -> tuple[Drive, float, float]:
+    """Shared observed-position PI primitive; no model feedforward or plant truth."""
+    recent = [s for s in history if latest is not None and latest.time - s.time <= control_window]
+    estimate = velocity_estimate(recent) if len(recent) >= 5 and recent[-1].time - recent[0].time >= 0.05 else None
+    if estimate is not None and integrate:
+        delta = velocity_ki * (desired - estimate[0]) * dt
+        if not last_saturated or delta * integral < 0:
+            integral = float(np.clip(integral + delta, -max_torque * 0.9, max_torque * 0.9))
+    reference_position += desired * dt
+    return Drive(velocity=desired, torque=integral, kd=velocity_kd,
+                 position=reference_position), integral, reference_position
+
+
 def confidence_halfwidth(values: list[float]) -> float:
     if len(values) < 3:
         raise CalibrationError("At least three independent values are required for a confidence interval")
@@ -1098,18 +1114,13 @@ class PrecisionExperiment:
         return self.stable_since is not None and now - self.stable_since >= duration
 
     def speed_drive(self, desired: float, dt: float, *, integrate: bool = True) -> Drive:
-        recent = [s for s in self.history if self.latest is not None and self.latest.time - s.time <= self.settings.control_window]
-        estimate = velocity_estimate(recent) if len(recent) >= 5 and recent[-1].time - recent[0].time >= 0.05 else None
-        if estimate is not None and integrate:
-            error = desired - estimate[0]
-            delta = self.settings.velocity_ki * error * dt
-            if not self.last_saturated or delta * self.integral < 0:
-                self.integral = float(np.clip(self.integral + delta,
-                                               -self.motion_limits.max_torque * 0.9, self.motion_limits.max_torque * 0.9))
+        drive, self.integral, self.reference_position = velocity_pi_step(
+            self.history, self.latest, desired, dt, control_window=self.settings.control_window,
+            velocity_ki=self.settings.velocity_ki, velocity_kd=self.settings.velocity_kd,
+            max_torque=self.motion_limits.max_torque, integral=self.integral,
+            last_saturated=self.last_saturated, reference_position=self.reference_position, integrate=integrate)
         self.command_speed = desired
-        self.reference_position += desired * dt
-        return Drive(velocity=desired, torque=self.integral, kd=self.settings.velocity_kd,
-                     position=self.reference_position)
+        return drive
 
     def passive_brake(self) -> Drive:
         return Drive(kd=min(1.0, self.settings.max_torque / (2 * self.settings.max_speed)),

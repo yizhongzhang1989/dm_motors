@@ -19,6 +19,12 @@ composition = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(composition)
 
 
+@pytest.fixture(autouse=True)
+def offline_port_checks(monkeypatch):
+    # This suite checks composition; live socket availability is a separate concern.
+    monkeypatch.setattr("common.dashboard.socket.socket.bind", lambda self, address: None)
+
+
 def compose(parameters, dashboards=False, can_port="{main: 8080}", motor_port="{one: 8081, two: 8082}", control_rate=""):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as config:
         yaml.safe_dump({"/**": {"ros__parameters": parameters}}, config)
@@ -92,20 +98,23 @@ def test_declared_dashboard_port_defaults():
     ("", "{motor_1: 9081, motor_2: 9382}", [9081, 9382]),
     ("{main: 9080}", "", [9080]),
     ("", "", []),
-    ("config", "config", [8080, 8081, 8082]),
+    ("config", "config", [8080, 8081, 8082, 8088]),
 ])
 def test_composed_dashboard_ports_are_exact_and_overridable(monkeypatch, can_port, motor_port, expected):
     monkeypatch.setattr(composition, "Node", lambda **kwargs: kwargs)
     nodes = compose({
-        "motor_names": ["motor_1", "motor_2"], "bus_names": ["main"],
+        "motor_names": ["motor_1", "motor_2", "motor_3"], "bus_names": ["main"],
         "buses": {"main": {"backend": "sim"}},
-        "motors": {"motor_1": {"motor_id": 1}, "motor_2": {"motor_id": 2}},
+        "motors": {"motor_1": {"motor_id": 1}, "motor_2": {"motor_id": 2},
+                   "motor_3": {"motor_id": 3}},
     }, dashboards=True, can_port=can_port, motor_port=motor_port)
     dashboards = [node for node in nodes if node["executable"] == "dashboard.py"]
     assert [node["parameters"][0]["port"] for node in dashboards] == expected
     assert all(node["parameters"][0]["host"] == "0.0.0.0" for node in dashboards)
     namespaces = (["/robot/can/main"] if can_port else []) + (
         ["/robot/motor_1", "/robot/motor_2"] if motor_port else [])
+    if motor_port == "config":
+        namespaces.append("/robot/motor_3")
     assert [node["namespace"] for node in dashboards] == namespaces
 
 

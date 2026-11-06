@@ -18,7 +18,8 @@ def test_launch_attaches_only_and_preserves_profile_overrides(tmp_path, monkeypa
     spec.loader.exec_module(module)
     document = yaml.safe_load(ConfigManager().path.read_text())
     profile = document["packages"]["dm_motor_calibration"]["launches"]["calibration.launch.py"]
-    profile["nodes"] = {"dm_motor_calibration": {"calibration_node": {"model": "stribeck", "duration": 32.0}}}
+    profile["nodes"] = {"dm_motor_calibration": {"calibration_node": {
+        "model": "stribeck", "duration": 32.0, "quick_excitation": "fixed"}}}
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump(document))
     context = LaunchContext()
@@ -35,6 +36,7 @@ def test_launch_attaches_only_and_preserves_profile_overrides(tmp_path, monkeypa
     assert parameters["motor_namespace"] == "/bench/motor"
     assert parameters["model"] == "stribeck"
     assert parameters["duration"] == 32.0
+    assert parameters["quick_excitation"] == "fixed"
     assert parameters["allow_hardware"] is False
     assert not any(key in parameters for key in ("port", "backend", "auto_start"))
     assert nodes[1]["executable"] == "dashboard.py"
@@ -62,9 +64,21 @@ def test_optional_port_and_namespace_are_consistent(monkeypatch, port, count):
     monkeypatch.setattr(module, "check_endpoints", lambda *_: None)
     nodes = module.launch_calibration(context)
     assert len(nodes) == count
+    assert nodes[0]["parameters"][0]["quick_excitation"] == "auto"
     if count == 2:
         assert nodes[1]["parameters"][0]["controller_namespace"] == "/bench/cal"
         assert nodes[1]["parameters"][0]["port"] == (18085 if port == "18085" else 8085)
+
+
+def test_automatic_default_is_scoped_to_standard_calibration_profile():
+    config = ConfigManager()
+    package, node = "dm_motor_calibration", "calibration_node"
+    assert config.node_parameters(package, node).get("quick_excitation", "fixed") == "fixed"
+    for profile in ("precision.launch.py", "fourier_20rad_test"):
+        assert config.node_parameters(package, node, (package, profile)).get("quick_excitation", "fixed") == "fixed"
+    # CLI parsing is independent of launch defaults and must remain opt-in.
+    from dm_motor_calibration.cli import parser
+    assert parser().parse_args(["quick-simulate", "--output", "/unused"]).excitation == "fixed"
 
 
 def test_standalone_dashboard_does_not_start_a_controller(monkeypatch):

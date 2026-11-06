@@ -11,17 +11,18 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from .data import CalibrationError, atomic_json, read_json
-from .dashboard_data import model_curves
+from .data import CalibrationError, ModelResult, atomic_json, read_json
+from .dashboard_data import model_curves, quick_shared_ranges
 from .recording import environment_versions
 from .reidentify import file_sha256
 from .report_data import ReportData, TERMINAL_STATES, input_path, load_report_data
 from .report_plot import COLORS, MAX_PLOT_POINTS, Series, plot
+from .speed_sweep_report import speed_sweep_analysis, speed_sweep_plot
 
 
 REPORT_NAME = "analysis.html"
 REPORT_META = "analysis.html.meta.json"
-REPORT_VERSION = 3
+REPORT_VERSION = 13
 REPORT_CSP = ("default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; "
               "base-uri 'none'; form-action 'none'; object-src 'none'")
 STATUS_NAMES = {"completed": "采集完成 · 达到记录中的资格标准", "completed_unqualified": "采集完成 · 精度目标未全部通过",
@@ -37,7 +38,7 @@ p,li{line-height:1.65}a{color:#1768ac}nav{display:flex;gap:12px;flex-wrap:wrap;m
 .warning{background:#fff4d7;border-left:4px solid #b77900;padding:12px 16px;color:#65470a}
 .failure{background:#fbe6e5;border-left:4px solid #b93232;padding:12px 16px;color:#842626}
 .muted,.unavailable{color:#607388}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:12px;margin-top:18px}
-.card{background:#f4f7fb;padding:16px;border-radius:8px}.card b{display:block;font-size:23px;margin-bottom:5px}
+.card{background:#f4f7fb;padding:16px;border-radius:8px;min-width:0}.card b{display:block;font-size:23px;margin-bottom:5px;overflow-wrap:anywhere}
 .table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0}
 th,td{border-bottom:1px solid #e2e8f0;padding:9px 10px;text-align:left;vertical-align:top}th{background:#edf2f7;white-space:nowrap}
 td{font-variant-numeric:tabular-nums}tbody tr:nth-child(even){background:#f8fafc}
@@ -46,7 +47,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f6fa;padding:14px;
 details{border:1px solid #dce4ed;border-radius:7px;padding:12px;margin:12px 0}summary{cursor:pointer;font-weight:600}
 .chart{border:1px solid #e4eaf1;border-radius:8px;margin:18px 0;overflow:hidden}.chart svg{display:block;width:100%;height:auto}
 .small{font-size:13px}footer{padding:10px 0 30px;color:#607388}
-@media(max-width:600px){main{padding:10px}header,section{padding:15px}h1{font-size:23px}.chart{overflow-x:auto}.chart svg{min-width:720px}}
+@media(max-width:600px){main{padding:10px}header,section{padding:15px}h1{font-size:23px}.cards{grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr))}.chart{overflow-x:auto}.chart svg{min-width:720px}}
 @media print{body{background:white}main{max-width:none;padding:0}header,section{border:0;padding:10px 0}nav{display:none}
  .chart{break-inside:avoid}pre{max-height:none}details{break-inside:avoid}h2{break-after:avoid}}
 """
@@ -130,6 +131,48 @@ def candidate_series(precision: dict, *, signed: bool) -> list[Series]:
 
 
 def primary_friction_curve(data: ReportData) -> str:
+    sweep = speed_sweep_analysis(data.report)
+    if sweep is not None:
+        view = speed_sweep_plot(sweep)
+        series = [Series("训练平台", view["training_points"], COLORS[0], connect=False),
+                  Series("整轮独立验证平台", view["validation_points"], COLORS[1], connect=False)]
+        series.extend(Series("滑动力矩候选模型", branch, COLORS[2], True) for branch in view["curves"])
+        content = ("<p>各轴物理分离后的独立测量。点为预先指定稳速窗口的时间加权报告力矩，速度由源时间与实测位置估计。"
+                   "模型仅由训练轮拟合，独立验证轮只评分；曲线间的连续插值不代表每个速度均已测量，零速未测区间留空。</p>")
+        if any(item.points for item in series):
+            content += chart("独立轴高速滑动阻力", "实测平台速度 / rad/s", "报告力矩 / Nm", series,
+                             symmetric_x=True, references=((0.0, "零力矩"),))
+        else:
+            content += '<p class="unavailable">没有通过窗口质量检查的稳速点；完整失败记录保留在逐段结果中。</p>'
+        content += "<p>这里的报告力矩仍依赖电流力矩标尺与装夹条件，不是外部力传感器测得的绝对摩擦；本流程不辨识惯量或静摩擦。</p>"
+        return section("friction-curve", "独立高速滑动摩擦与候选", content)
+    quick = data.report.get("quick")
+    if isinstance(quick, dict) and isinstance(quick.get("candidate_model"), dict):
+        candidate = {**quick["candidate_model"], "kind": "mechanical"}
+        candidate.pop("qualified", None)
+        model = data.fit or ModelResult.from_mapping(candidate)
+        shared_ranges = quick_shared_ranges(quick)
+        negative, positive = model_curves(model, shared_ranges=shared_ranges)
+        label = "保存模型" if quick.get("qualified") else "未合格候选"
+        series = [Series("反向" + label, negative, COLORS[1]),
+                  Series("正向" + label, positive, COLORS[0])]
+        content = "<p>这里展示快速辨识的摩擦模型；未通过独立验证时保留候选标签。原始总力矩包含惯性及其它负载，不作为纯摩擦观测绘制。</p>"
+        rows = []
+        for direction, name in (("negative", "反向（负速度）"), ("positive", "正向（正速度）")):
+            shared = shared_ranges.get(direction)
+            windows = shared.get("windows", {}) if shared is not None else {}
+            rows.append((name, [shared["velocity_min"], shared["velocity_max"]] if shared is not None else None,
+                         windows.get("training"), windows.get("external_validation")))
+        content += table(("方向", "共有滑动窗口均速范围 / rad/s", "训练窗口（共有范围内）", "独立验证窗口（共有范围内）"), rows)
+        content += ("<p>模型实线只绘制在已记录的正、负共有范围内，未覆盖段留空。"
+                    "这些是训练与独立验证的滑动窗口均速范围，不表示区间内每个速度已获验证，"
+                    "也不授予连续全速度或零速资格。</p>")
+        if len(shared_ranges) < 2:
+            content += '<p class="unavailable">未记录有效共有范围的方向不绘制模型曲线，也不从整体速度包络推断。</p>'
+        if any(item.points for item in series):
+            content += chart("快速机械标定的摩擦模型", "共有滑动窗口均速范围 / rad/s", "模型滑动摩擦 / Nm", series,
+                             symmetric_x=True, references=((0.0, "零力矩"),))
+        return section("friction-curve", "摩擦模型与资格", content)
     if data.fourier is not None:
         fourier = data.fourier
         training, validation = fourier.get("training_friction"), fourier.get("validation_friction")
@@ -565,6 +608,24 @@ def trace_section(data: ReportData) -> str:
         body += f'有界概览保留：{len(part.trace)} 行。每段时间从自己的记录起点计算，不跨暂停连线。</p>'
         if part.trace and part.trace_fields:
             fields = {name: column for column, name in enumerate(part.trace_fields)}
+            if part.report.get("experiment") == "speed_sweep" and "trial_index" in fields:
+                trials = {}
+                for row in part.trace:
+                    trials.setdefault(int(row[fields["trial_index"]]), []).append(row)
+                for trial, rows in sorted(trials.items()):
+                    plots = "<p>本轮使用整批相对时间；与其它独立轮次分开绘制，不跨失能间隔连接。</p>"
+                    for title, names, unit in (("位置与参考", ("position", "target_position"), "rad"),
+                                               ("速度与参考", ("velocity", "target_velocity"), "rad/s"),
+                                               ("力矩与控制估计", ("torque", "command_torque"), "Nm"),
+                                               ("温度", ("temperature",), "°C")):
+                        selected = [name for name in names if name in fields]
+                        series = [Series(name, [(r[fields["time"]], r[fields[name]]) for r in rows],
+                                         COLORS[i], i > 0) for i, name in enumerate(selected)]
+                        if series:
+                            plots += chart(title, "整批相对时间 / s", unit, series)
+                    body += details(f"独立轮次 {trial + 1} · 全过程", plots)
+                content += body
+                continue
             for plot_title, names, ylabel in (
                 ("位置与参考", ("position", "target_position"), "rad"),
                 ("速度与参考", ("velocity", "target_velocity"), "rad/s"),
@@ -586,6 +647,126 @@ def trace_section(data: ReportData) -> str:
 
 def generic_section(data: ReportData) -> str:
     content = ""
+    sweep = speed_sweep_analysis(data.report)
+    if sweep is not None:
+        coverage = sweep.get("coverage", {})
+        content += table(("项目", "结果"), [
+            ("采集质量通过", sweep.get("acquisition_quality_passed")),
+            ("滑动预测通过", sweep.get("prediction_qualified")),
+            ("生产参数发布", "未发布"),
+            ("独立完成 / 计划轮次", [coverage.get("complete_trials"), coverage.get("expected_trials")]),
+            ("要求双向实测上限 / rad/s", coverage.get("required_max_speed")),
+            ("双向均达到要求", coverage.get("highest_speed_reached_both_directions")),
+            ("独立验证速度包络 / rad/s", [coverage.get("validated_velocity_min"), coverage.get("validated_velocity_max")]),
+            ("惯量 J / 静摩擦", "本流程未测量"),
+        ])
+        candidate = sweep.get("candidate_model")
+        if candidate:
+            content += table(("滑动候选参数", "估计", "单位"), (
+                (name, number, candidate.get("units", {}).get(name)) for name, number in candidate["parameters"].items()))
+        content += table(("数据用途", "窗口", "RMS / Nm", "最大误差 / Nm"), (
+            (label, record.get("cells"), record.get("rmse"), record.get("maximum_error"))
+            for label, record in (("训练轮", sweep.get("training", {})),
+                                  ("整轮独立验证（不用于拟合）", sweep.get("external_validation", {})))))
+        content += details("逐段结果（含失败窗口）", table(
+            ("轮次", "用途", "重复", "目标 / rad/s", "实测 / rad/s", "时间均值 / Nm", "角度均值 / Nm", "有效", "质量说明"), (
+                (row.get("trial"), row.get("role"), row.get("repeat"), row.get("speed", 0) * row.get("direction", 0),
+                 row.get("measured_speed"), row.get("time_mean_torque"), row.get("angle_mean_torque"),
+                 row.get("valid"), row.get("quality_issues")) for row in sweep.get("cells", []))))
+        content += details("整轮独立验证误差", table(
+            ("轮次", "方向", "实测 / rad/s", "报告力矩 / Nm", "预测 / Nm", "误差 / Nm"), (
+                (row.get("trial"), row.get("direction"), row.get("measured_speed"), row.get("torque"),
+                 row.get("prediction"), row.get("error")) for row in sweep.get("external_validation", {}).get("errors", []))))
+        if sweep.get("old_model_comparison"):
+            content += details("已有标定对照（区分原始有效范围与高速外推）", mapping_table(sweep["old_model_comparison"]))
+        diagnostics = data.report.get("excluded_diagnostic_trials", [])
+        if diagnostics:
+            diagnostic_content = ("<p>这些准备 / 启动诊断未进入正式速度轨迹，不计作正式运动失败或模型样本。"
+                                  "记录可能包含 ENABLE 请求与起点 baseline 保持目标；保留实际请求、条数、停止证据和错误，不把它们称为从未使能。</p>")
+            diagnostic_content += table(("诊断记录", "ENABLE 请求", "目标条数", "仅起点 baseline 保持", "STOP 已确认", "原始原因"), (
+                (item.get("trial"), "已请求" if item.get("had_enable_request") is True else "未请求" if item.get("had_enable_request") is False else "未记录",
+                 item.get("commands"), item.get("startup_only"), item.get("stop_confirmed"), item.get("errors", []))
+                for item in diagnostics))
+            diagnostic_content += details("诊断排除依据与完整记录", mapping_table({"excluded_diagnostic_trials": diagnostics}))
+            content += details(f"准备 / 启动诊断（{len(diagnostics)} 项，不属于正式运动轮）", diagnostic_content)
+        content += details("范围、限制与全部判据", mapping_table({
+            "coverage": coverage, "quality_issues": sweep.get("quality_issues", []),
+            "limitations": sweep.get("limitations", [])}))
+        return section("parameters", "独立高速实验的训练、验证与范围", content)
+    low = data.report.get("low_speed")
+    if isinstance(low, dict):
+        content += "<p>正反方向经过同一预定位置区间，比较按角度加权的报告力矩半差。这里只检查局部采集质量，未发布补偿模型；稳速、报告力矩标尺与动态、方向不对称及位置相关负载仍需独立验证。</p>"
+        content += table(("用途", "速度 / rad/s", "重复", "角度加权半差 / Nm", "共同核心区间 / Nm", "质量通过"), (
+            (row.get("role"), row.get("speed"), row.get("repetition"), row.get("odd_resistance"),
+             row.get("common_core_odd_resistance"), row.get("quality_passed")) for row in low.get("pairs", [])))
+        comparisons = [row for row in low.get("pairs", []) if row.get("time_odd_reported_torque") is not None]
+        if comparisons:
+            content += details("时间与角度加权对照", "<p>同一固定区间的报告值对照；两种权重都可能受运动与测量通道影响，差值不用于自动修正摩擦。</p>" + table(
+                ("用途", "速度 / rad/s", "重复", "时间加权半差 / Nm", "角度减时间 / Nm"), (
+                    (row.get("role"), row.get("speed"), row.get("repetition"), row.get("time_odd_reported_torque"),
+                     row.get("angle_minus_time_odd_reported_torque")) for row in comparisons)))
+        content += details("逐段覆盖、稳速与未完成项目", table(
+            ("段", "用途", "目标 / rad/s", "实测 / rad/s", "报告力矩 / Nm", "质量说明"), (
+                (row.get("index"), row.get("role"), row.get("speed", 0) * row.get("direction", 0),
+                 row.get("measured_speed"), row.get("mean_torque"), row.get("quality_issues"))
+                for row in low.get("cells", []))))
+        content += details("配对诊断的完整结果与门限", mapping_table(low))
+        return section("parameters", "短行程低速摩擦观测", content)
+    adaptation = data.report.get("quick_adaptation")
+    if isinstance(adaptation, dict):
+        selected = adaptation.get("selected_candidate")
+        candidates = adaptation.get("candidates", {})
+        recipe = candidates.get(selected, {}).get("formal_settings", {}) if isinstance(candidates, dict) else {}
+        attempts = adaptation.get("attempts", [])
+        content += "<h3>自动选择激励</h3><p>最多两段预探测及实测回位后冻结正式方案；预探测不进入正式拟合，最终验证不用于重新选择。</p>"
+        content += table(("项目", "记录值"), [
+            ("选择状态", adaptation.get("status")), ("已记录探测段数", len(attempts) if isinstance(attempts, list) else None),
+            ("选中方案", selected or "未选定"), ("幅值 / rad", recipe.get("amplitude")),
+            ("频率 / Hz", recipe.get("frequency")), ("Kp / Kd", [recipe.get("kp"), recipe.get("kd")]),
+            ("正式 / 全部样本", [data.report.get("samples"), data.report.get("recorded_samples")]),
+            ("中止原因", adaptation.get("abort_reasons") or "无记录"),
+        ])
+        content += "<p class=\"muted\">选中激励不代表标定合格；以正式训练及后续独立验证结果为准。完整选择记录见 quick_adaptation.json。</p>"
+        if isinstance(data.report.get("requested_configuration"), dict):
+            content += details("自动激励前的请求配置", mapping_table(data.report["requested_configuration"]))
+    quick = data.report.get("quick")
+    if isinstance(quick, dict):
+        content += "<p><b>快速机械标定：训练与最终独立验证分开。</b>训练段选择模型和积分窗；随后另一条轨迹只用于验收，不再调参。以下误差基于设备报告量，不是外部力矩标尺认证。</p>"
+        content += table(("数据段", "样本数", "滑动窗口", "RMS / Nm", "最大误差 / Nm", "窗口均速整体包络 / rad/s"), (
+            (label, item.get("raw_samples"), item.get("windows"), item.get("rmse"), item.get("maximum_error"),
+             [item.get("velocity_min"), item.get("velocity_max")])
+            for label, item in (("训练", quick.get("training", {})),
+                                ("最终独立验证", quick.get("external_validation", {})))))
+        content += "<p>整体包络仅列出该段窗口均速的最小值和最大值，跨零包络不表示低速空洞已被覆盖。</p>"
+        content += details("双向覆盖与验收门限", mapping_table({
+            "coverage": quick.get("coverage"), "limits": quick.get("limits"),
+            "training_directions": quick.get("training", {}).get("directions"),
+            "validation_directions": quick.get("external_validation", {}).get("directions")}))
+        diagnostic = quick.get("parameter_identifiability")
+        if isinstance(diagnostic, dict):
+            content += "<p><b>预测通过不等于物理参数准确。</b>惯量、库仑/黏性分解、偏置及负载项尚未独立验证；以下训练段敏感性范围不是置信区间，不用于重新选择模型。</p>"
+            parameter_rows = []
+            for name, item in diagnostic.get("parameters", {}).items():
+                span = item.get("training_sensitivity", {})
+                parameter_rows.append((name, item.get("estimate"), item.get("unit"),
+                                       span.get("minimum"), span.get("maximum"),
+                                       item.get("local_orthogonal_contribution_nm_rms")))
+            body = table(("参数", "主拟合", "单位", "训练敏感性最小值", "最大值", "正交信号 / Nm RMS"), parameter_rows)
+            body += mapping_table({"测量链假设": diagnostic.get("measurement_assumptions"),
+                                   "未知测量项": diagnostic.get("measurement_chain"),
+                                   "量化影响尺度": diagnostic.get("quantization_sensitivity"),
+                                   "参数相关性": diagnostic.get("local_design"),
+                                   "组合摩擦敏感性": diagnostic.get("combined_friction_sensitivity"),
+                                   "保留的训练重拟合": diagnostic.get("training_refits")})
+            content += details("物理参数可信度与测量链", body)
+        issues = quick.get("quality_issues", [])
+        if issues:
+            content += '<div class="warning"><ul>' + "".join(f"<li>{escape(str(issue))}</li>" for issue in issues) + "</ul></div>"
+        if data.fit is None and isinstance(quick.get("candidate_model"), dict):
+            candidate = quick["candidate_model"]
+            content += "<p>以下为未通过全部验收的候选参数，未发布合格补偿文件。</p>"
+            content += mapping_table(candidate.get("parameters", {}))
+        content += "<p>完整窗口索引、训练选模与最终验证的归属保存在 quick.json / report.json。回位段只归档，不参与拟合。</p>"
     if data.fit is not None:
         fit = data.fit
         content += f"<p>参数类别：{escape(fit.kind)}；模型：{escape(fit.model)}。</p>"
@@ -607,18 +788,37 @@ def render_html(data: ReportData, generated: str) -> str:
     name = f"电机 {motor}" if motor is not None else "离线数据"
     title = name + " · 标定分析报告"
     state = data.report["status"]
-    p = data.precision or data.fourier or {}
-    metrics = p.get("metrics") or {}
+    sweep = speed_sweep_analysis(data.report)
+    p = data.precision or data.fourier or data.report.get("quick") or data.report.get("low_speed") or sweep or {}
+    metrics = p.get("metrics") or ({"validation_rmse": p["external_validation"].get("rmse")}
+                                  if "external_validation" in p else {})
     issues = p.get("quality_issues") or []
     status_class = "failure" if state in ("failed", "incomplete") else "warning" if state == "completed_unqualified" else "badge"
-    summary = f'<header><h1>{escape(title)}</h1><div class="{status_class}">{escape(STATUS_NAMES[state])}</div>'
+    status_label = ("低速采集与诊断已保存 · 未发布补偿模型"
+                    if data.report.get("experiment") == "low_speed" and state == "completed_unqualified"
+                    else STATUS_NAMES[state])
+    if sweep is not None and state in ("completed", "completed_unqualified"):
+        status_label = ("独立高速实验已保存 · 滑动预测通过" if sweep.get("prediction_qualified")
+                        else "独立高速实验已保存 · 滑动预测未通过") + " · 未发布生产参数"
+    summary = f'<header><h1>{escape(title)}</h1><div class="{status_class}">{escape(status_label)}</div>'
     summary += f'<p class="muted">记录：<code>{escape(data.root.name)}</code> · 报告生成：{escape(generated)}'
     summary += ' · 此文件完全离线、只读，不连接电机，不包含 START/STOP 控制。</p>'
+    quick = data.report.get("quick")
+    coverage_card = (("训练 / 独立验证窗口", [quick.get("training", {}).get("windows"),
+                                             quick.get("external_validation", {}).get("windows")])
+                     if isinstance(quick, dict) else
+                     ("实测 / 计划周期" if data.fourier is not None else "完整 / 计划速度单元",
+                      f'{value(p.get("measured_cells", p.get("completed_cells")))} / {value(p.get("required_cells", p.get("cells")))}'))
+    if data.report.get("experiment") == "low_speed":
+        progress = data.report.get("low_speed_progress", {})
+        coverage_card = ("已执行 / 计划速度段", [progress.get("completed_cells"), progress.get("required_cells")])
+    if sweep is not None:
+        coverage_card = ("独立完成 / 计划轮次", [sweep.get("coverage", {}).get("complete_trials"),
+                                                  sweep.get("coverage", {}).get("expected_trials")])
     cards = [
-        ("本段样本", data.report.get("samples", data.diagnostics.get("sample_rows"))),
-        ("累计样本", data.report.get("cumulative_samples", data.report.get("samples", data.diagnostics.get("sample_rows")))),
-        ("实测 / 计划周期" if data.fourier is not None else "完整 / 计划速度单元",
-         f'{value(p.get("measured_cells", p.get("completed_cells")))} / {value(p.get("required_cells", p.get("cells")))}'),
+        ("正式样本" if data.report.get("quick_adaptation") else "本段样本", data.report.get("samples", data.diagnostics.get("sample_rows"))),
+        ("全部记录样本" if data.report.get("quick_adaptation") else "累计样本", data.report.get("recorded_samples", data.report.get("cumulative_samples", data.report.get("samples", data.diagnostics.get("sample_rows"))))),
+        coverage_card,
         ("验证 RMSE / Nm", metrics.get("validation_rmse")),
         ("质量提示", len(issues) if issues else "见各项诊断"),
     ]
@@ -635,22 +835,27 @@ def render_html(data: ReportData, generated: str) -> str:
             navigation.append(("friction", "幅值 / 低速"))
     elif data.fourier is not None:
         navigation.append(("fourier", "傅里叶辨识"))
-    elif data.fit is not None or data.report.get("comparison") is not None or data.report.get("breakaway") is not None:
+    elif data.fit is not None or any(data.report.get(name) is not None for name in (
+            "quick_adaptation", "quick", "comparison", "breakaway", "low_speed", "speed_sweep")):
         navigation.append(("parameters", "参数 / 评估"))
     navigation.extend([("static", "静摩擦"), ("timeline", "全过程"), ("diagnostics", "日志审计"),
                        ("events", "完整事件"), ("configuration", "配置与复现")])
     summary += "<nav>" + "".join(f'<a href="#{identifier}">{label}</a>' for identifier, label in navigation) + "</nav></header>"
     overview = cards_html + '<p><b>采集完整、数据完整性、参数精度和绝对标尺准确度是不同结论。</b>质量未达标时不生成新的合格模型，不覆盖原始报告，也不通过删除数据提高分数。</p>'
+    simulated_stop = (data.report.get("stop") or {}).get("method") == "synchronous_simulator_enabled_false_step"
     overview += table(("项目", "记录值"), [
         ("保存状态", state), ("实验类型", data.report.get("experiment", data.report.get("operation", "离线拟合"))),
         ("原始记录创建时间（UTC）", (data.metadata or {}).get("created_utc")),
         ("采集计划完成", data.report.get("acquisition_complete")),
         ("本次结果达到记录中的资格标准", data.report.get("qualified", state in ("completed", "qualified") and data.fit is not None)),
-        ("记录时已确认失能", data.report.get("stop_confirmed")), ("运行错误", data.report.get("error") or "未记录错误"),
+        ("模拟器失能步应答" if simulated_stop else "记录时已确认失能", data.report.get("stop_confirmed")),
+        ("运行错误", data.report.get("error") or "未记录错误"),
         ("失败阶段", data.report.get("failure_stage")), ("累计采集时间（含预运行）/ s", p.get("elapsed_time")),
         ("正式标定时间 / s", p.get("formal_elapsed_time")),
         ("本段原始输入 SHA-256 / 列定义核验", data.verified_inputs), ("生成时间（UTC）", generated),
     ])
+    if simulated_stop:
+        overview += '<p>停止证据仅表明同步模拟器处理了失能步进并返回新时间，不是实际驱动的状态核验，也不证明机械静止。</p>'
     overview += mapping_table({key: data.identity[key] for key in
                               ("namespace", "motor_id", "simulated", "mode", "direction", "software_offset", "pmax", "vmax", "tmax", "source")
                               if key in data.identity})
@@ -686,7 +891,9 @@ def render_html(data: ReportData, generated: str) -> str:
                      '不表示关闭驱动保护。力矩、温度和反馈保护保留。</p>'
                      if (data.report.get("configuration") or {}).get("drag_motion_policy") == "driver_only" else
                      '<p>本精密流程实际使用 precision settings；完整节点参数中同名的通用 max_speed 等字段不应误认为本流程的保护值。</p>')
-    configuration += details("实际傅里叶设置" if data.fourier is not None else "实际精密设置",
+    if sweep is not None:
+        configuration = "<p>独立轴高速协议使用本实验保存的速度、时窗和保护边界；原始轴身份、分离拓扑及带宽见配置和源记录。滑动候选尚未自动写入生产注册表。</p>"
+    configuration += details("独立高速协议设置" if sweep is not None else "实际傅里叶设置" if data.fourier is not None else "实际精密设置",
                              mapping_table(p.get("settings") or (data.metadata or {}).get("precision_settings") or {}))
     if (data.report.get("configuration") or {}).get("drag_stop_policy") == "operator":
         configuration += '<p>拖动由用户开启和停止，无定时结束；duration=null。正常手动停止不代表生成新的标定模型。</p>'
@@ -711,9 +918,11 @@ def render_html(data: ReportData, generated: str) -> str:
             ensure_ascii=False, indent=2, allow_nan=False)) + "</pre>")
     configuration += details("完整保存结果 JSON（保留全部数值精度）", "<pre>" + escape(json.dumps(
         redact({"report": data.report, "static": data.static}), ensure_ascii=False, indent=2, allow_nan=False)) + "</pre>")
-    configuration += ('<div class="warning">傅里叶运动模式可辨识惯性与滑动摩擦；其结果仍依赖电流力矩标尺、负载模型和有效激励。'
+    configuration += ('<div class="warning">本流程仅拟合独立轴稳速滑动报告力矩；惯量与静摩擦未知。速度包络内的模型插值不是连续全域认证，重新联轴后的补偿效果仍需独立验证。</div>'
+                      if sweep is not None else
+                      '<div class="warning">运动辨识估计惯性与滑动摩擦；其结果仍依赖电流力矩标尺、负载模型和有效激励。'
                       '动力学预测通过不等于绝对力矩已外部校准，也不能从动态零速穿越直接断言静摩擦峰值。</div>'
-                      if data.fourier is not None else
+                      if data.fourier is not None or isinstance(data.report.get("quick"), dict) else
                      '<div class="warning">稳速精密流程不独立辨识惯量；inertia=0 若出现是占位，不是真实惯量为零。'
                       'R/L/Kt、独立外载、齿隙等没有独立测量时不能唯一恢复。低速速度/力矩量化、相关噪声、温漂和装夹均影响精度；'
                       '统计平均低于单包量化步长，不等于绝对力矩标尺同样准确。候选模型投入补偿前仍需独立验证。</div>')
@@ -777,7 +986,7 @@ def generate_html_report(directory: Path, output: Path | None = None, *, overwri
         "verified_inputs": data.verified_inputs, "max_plot_points": MAX_PLOT_POINTS,
         "overview_rows": len(data.trace), "environment": environment_versions(),
         "generator_sources": {name: file_sha256(Path(__file__).with_name(name)) for name in
-                              ("html_report.py", "report_plot.py", "report_data.py")},
+                              ("html_report.py", "report_plot.py", "report_data.py", "speed_sweep_report.py")},
     }
     atomic_json(target.with_name(target.name + ".meta.json"), metadata)
     return {"output": str(target), "metadata": str(target.with_name(target.name + ".meta.json")),

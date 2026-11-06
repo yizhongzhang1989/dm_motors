@@ -1,0 +1,57 @@
+# 独立轴试验合同；不是 ROS 驱动参数，不会自动使能或写 Flash。
+schema: 1
+protocol: independent_speed_sweep_v1
+topology: separated
+topology_declared_on: '2026-11-06'
+topology_source: operator_confirmed_A_C_disconnected
+can_bus_namespace: /can/main
+motor_profile: j4310_v12
+axes:
+  A:
+    motor_id: 1
+    namespace: /motor_1
+    expected_velocity_bandwidth_Hz: 100.0
+    initial_direction: -1
+  C:
+    motor_id: 3
+    namespace: /motor_3
+    expected_velocity_bandwidth_Hz: 40.0
+    initial_direction: 1
+# 初始方向用于本次坐标，执行器仍须按实时起点验证整条轨迹。
+controller:
+  bilateral_state: idle
+  non_selected_axes: disabled_and_stationary
+  native_kp: 10.0
+  native_kd: 0.6
+  torque_feedforward_Nm: 0.0
+  rate_Hz: 500.0
+  registry_mutation: false
+plan:
+  training_speeds_rad_s: [0.6, 3.0, 9.0, 13.2]
+  training_repeats: 2
+  validation_speeds_rad_s: [1.5, 6.0, 13.2]
+  validation_repeats: 1
+  directions_per_trial: [1, -1]
+  split_unit: entire_trial
+  # 含加减速、折返及末尾停稳；最高档单轮约 5.77 秒。
+  cruise_s: 0.6
+  analysis_trim_each_end_s: 0.15
+  minimum_high_speed_actual_rad_s: 12.566370614359172
+guards:
+  measured_speed_rad_s: 15.9
+  measured_torque_Nm: 3.8
+  displacement_from_start_rad: 20.1
+  native_target_position_abs_rad: 12.4
+  temperature_C: 48.0
+analysis:
+  model: coulomb_viscous_bias
+  training_only_fit: true
+  steady_feedback_max_gap_s: 0.02
+  speed_relative_tolerance: 0.05
+  validation_rmse_max_Nm: 0.03
+  validation_window_error_max_Nm: 0.06
+  torque_measurement: motor_reported_estimate
+  inertia_identified: false
+  static_friction_identified: false
+  full_angle_precision_calibration: false
+  production_model_published: false

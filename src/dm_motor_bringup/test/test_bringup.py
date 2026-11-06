@@ -63,7 +63,7 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
     follow = entry.startswith("lead_follow")
     port = available_port_block(4 if follow else 3)
     namespace = f"bringup_test_{os.getpid()}_{time.monotonic_ns()}"
-    environment = dict(os.environ, ROS_DOMAIN_ID=str(80 + os.getpid() % 40))
+    environment = dict(os.environ, ROS_DOMAIN_ID=os.environ.get("DM_MOTOR_TEST_DOMAIN", str(80 + os.getpid() % 40)))
     # Explicit config prevents any hardware access even if the default regresses.
     config = Path(get_package_share_directory("dm_motor_control")) / "test/config/sim_bus.yaml"
     opener = build_opener(ProxyHandler({}))
@@ -191,7 +191,7 @@ def test_installed_bringup_starts_three_dashboards_and_disabled_simulated_motors
     ("lead_follow.launch.py", 5),
 ])
 def test_empty_ports_start_devices_but_no_dashboard_process(entry, expected_nodes, monkeypatch):
-    monkeypatch.setenv("ROS_DOMAIN_ID", str(120 + os.getpid() % 20))
+    monkeypatch.setenv("ROS_DOMAIN_ID", os.environ.get("DM_MOTOR_TEST_DOMAIN", str(120 + os.getpid() % 20)))
     namespace = f"/headless_test_{os.getpid()}_{time.monotonic_ns()}"
     config = Path(get_package_share_directory("dm_motor_control")) / "test/config/sim_bus.yaml"
     rclpy.init()
@@ -236,6 +236,9 @@ def test_single_config_changes_ports_and_runtime_parameters_without_port_argumen
     port = available_port_block(4)
     config = ConfigManager()
     document = yaml.safe_load(config.path.read_text())
+    registry = tmp_path / "system_parameters.yaml"
+    registry.write_text("version: 1\nmotors: {}\n")
+    document["system_parameters_file"] = str(registry)
     profile = document["packages"]["dm_motor_bringup"]["launches"]["lead_follow.launch.py"]
     profile["parameters"].update(
         dashboard_host="127.0.0.1", dashboard_port=port + 3,
@@ -249,7 +252,7 @@ def test_single_config_changes_ports_and_runtime_parameters_without_port_argumen
     path = tmp_path / "single.yaml"
     path.write_text(yaml.safe_dump(document))
     namespace = f"common_config_{os.getpid()}_{time.monotonic_ns()}"
-    environment = dict(os.environ, ROS_DOMAIN_ID=str(80 + os.getpid() % 40))
+    environment = dict(os.environ, ROS_DOMAIN_ID=os.environ.get("DM_MOTOR_TEST_DOMAIN", str(80 + os.getpid() % 40)))
     config_arguments = []
     if config_source == "argument":
         config_arguments.append(f"config_file:={path}")
@@ -308,7 +311,7 @@ def test_single_config_changes_ports_and_runtime_parameters_without_port_argumen
 def test_direct_nodes_reject_missing_common_file_without_falling_back(tmp_path, package, executable):
     path = str(tmp_path / "missing-runtime.yaml")
     executable_path = Path(get_package_prefix(package)) / "lib" / package / executable
-    environment = dict(os.environ, ROS_DOMAIN_ID=str(80 + os.getpid() % 40))
+    environment = dict(os.environ, ROS_DOMAIN_ID=os.environ.get("DM_MOTOR_TEST_DOMAIN", str(80 + os.getpid() % 40)))
     result = subprocess.run(
         [str(executable_path), "--ros-args", "-p", f"config_file:={path}"],
         env=environment, capture_output=True, text=True, timeout=5)

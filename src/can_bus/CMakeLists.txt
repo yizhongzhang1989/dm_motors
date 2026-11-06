@@ -12,6 +12,7 @@ find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Frame.msg" "msg/FrameFilter.msg" "msg/TxFrame.msg" "msg/Heartbeat.msg"
+  "msg/OptionalReadRemoved.msg"
   "msg/Status.msg" "srv/RegisterClient.srv" "srv/Maintenance.srv"
   DEPENDENCIES std_msgs builtin_interfaces)
 add_library(can_bus_transport src/transport.cpp src/router.cpp)
@@ -38,8 +39,11 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_router test/test_router.cpp)
   target_link_libraries(test_router can_bus_transport)
+  ament_add_gtest(test_serial_transport test/test_serial_transport.cpp)
+  target_link_libraries(test_serial_transport can_bus_transport)
   ament_add_pytest_test(test_latency test/test_latency.py TIMEOUT 45)
   ament_add_pytest_test(test_dds_environment test/test_dds_environment.py TIMEOUT 30)
+  ament_add_pytest_test(test_dds_loopback test/test_dds_loopback.py TIMEOUT 30)
   ament_add_pytest_test(test_dashboard test/test_dashboard.py TIMEOUT 30)
   ament_add_pytest_test(test_dashboard_integration test/test_dashboard_integration.py TIMEOUT 60)
   ament_add_pytest_test(test_dashboard_launch test/test_dashboard_launch.py TIMEOUT 30)

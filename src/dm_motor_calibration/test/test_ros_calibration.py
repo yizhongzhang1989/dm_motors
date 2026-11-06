@@ -7,6 +7,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from unittest.mock import Mock
 
 import pytest
 import rclpy
@@ -27,7 +28,7 @@ from dm_motor_control.system_parameters import SystemParameters
 
 
 class Scene:
-    def __init__(self, directory):
+    def __init__(self, directory, *, use_default_quick_profile=False):
         self.directory = directory
         self.prefix = f"/calibration_test_{os.getpid()}_{time.monotonic_ns()}"
         self.motor = self.prefix + "/motor"
@@ -49,6 +50,12 @@ class Scene:
         self.config["packages"]["dm_motor_control"]["nodes"]["sim_motor_node"].update(
             inertia=0.018, coulomb_friction=0.065, viscous_friction=0.037, static_friction=0.1)
         self.options = self.config["packages"]["dm_motor_calibration"]["nodes"]["calibration_node"]
+        if not use_default_quick_profile:
+            # Legacy cases exercise their explicit fixed recipe. The opt-in
+            # case retains the unmodified production launch default instead.
+            profile = self.config["packages"]["dm_motor_calibration"]["launches"]["calibration.launch.py"]
+            profile.get("nodes", {}).get("dm_motor_calibration", {}).get("calibration_node", {}).pop("quick_excitation", None)
+            self.options["quick_excitation"] = "fixed"
         self.options.update(motor_namespace=self.motor, model="coulomb_viscous", duration=28.0,
                             output_directory=str(directory / "reports"), integration_window=0.12,
                             feedback_timeout=0.15, max_gap=0.04, max_rmse=0.012)
@@ -143,11 +150,11 @@ class Scene:
 
 @pytest.fixture
 def scene(tmp_path, monkeypatch, request):
-    monkeypatch.setenv("ROS_DOMAIN_ID", str(170 + os.getpid() % 25))
+    monkeypatch.setenv("ROS_DOMAIN_ID", os.environ.get("DM_MOTOR_TEST_DOMAIN", str(170 + os.getpid() % 25)))
     monkeypatch.setenv("ROS_LOCALHOST_ONLY", "1")
     rclpy.init()
-    current = Scene(tmp_path)
     overrides = getattr(request, "param", {})
+    current = Scene(tmp_path, use_default_quick_profile=overrides.get("default_quick_profile", False))
     current.config["packages"]["dm_motor_control"]["nodes"]["sim_motor_node"].update(overrides.get("physics", {}))
     current.options.update(overrides.get("calibration", {}))
     current.config["packages"]["dm_motor_control"]["launches"]["motor.launch.py"]["variants"]["simulation"][
@@ -163,6 +170,22 @@ def scene(tmp_path, monkeypatch, request):
     finally:
         current.close()
         rclpy.shutdown()
+
+
+@pytest.mark.parametrize("default_profile,explicit,expected", [
+    (False, None, "fixed"), (False, "auto", "auto"), (True, None, "auto"),
+])
+def test_scene_excitation_mode_is_explicit_or_uses_production_profile(tmp_path, monkeypatch, default_profile, explicit, expected):
+    monkeypatch.setattr(__name__ + ".Node", Mock())
+    current = Scene(tmp_path, use_default_quick_profile=default_profile)
+    if explicit is not None:
+        current.options["quick_excitation"] = explicit
+    current.write_config()
+    package = "dm_motor_calibration"
+    parameters = ConfigManager(current.config_path).node_parameters(package, "calibration_node", (package, "calibration.launch.py"))
+    assert parameters["quick_excitation"] == expected
+    if default_profile:
+        assert "quick_excitation" not in current.options
 
 
 def test_hardware_and_busy_gates_cannot_be_bypassed():
@@ -197,12 +220,20 @@ def test_production_calibration_ab_compensation_and_feedback_failure(scene):
     scene.wait(lambda: time.monotonic() >= idle_until)
     assert scene.state.phase == MotorState.DISABLED
     assert scene.status["samples"] == 0
-    output = scene.finish_experiment(timeout=40)
+    output = scene.finish_experiment(timeout=60)
     fit = FitResult.load(output / "calibration.json")
     assert fit.parameters["inertia"] == pytest.approx(0.018, rel=0.18)
     assert fit.parameters["coulomb"] == pytest.approx(0.065, rel=0.15)
     assert fit.parameters["viscous"] == pytest.approx(0.037, rel=0.20)
     assert fit.diagnostics["validation_rmse"] < 0.012
+    assert fit.diagnostics["independent_validation"] == 1
+    report = json.loads((output / "report.json").read_text())
+    assert report["quick"]["protocol"] == "quick_independent_v1"
+    assert report["quick"]["qualified"] is True
+    assert report["quick"]["external_validation"]["windows"] >= 30
+    assert (output / "quick_plan.json").exists()
+    assert (output / "quick_sources.json").exists()
+    assert (output / "driver_configuration.json").exists()
     assert (output / "samples.csv").exists()
     scene.options.update(experiment="validate", duration=12.0, kp=0.3, kd=0.18,
                          calibration_file=str(output / "calibration.json"))
@@ -282,7 +313,17 @@ def test_operator_stop_competing_source_and_shutdown_do_not_qualify(scene):
     assert not (output / "calibration.json").exists()
 
 
-@pytest.mark.parametrize("scene", [{}, {"physics": {"initial_position": 0.1}}], indirect=True)
+@pytest.mark.parametrize("scene", [{"calibration": {"breakaway_settle_time": .15}},
+                                  {"physics": {"initial_position": 0.1}}, {
+    "driver": {"control_rate": 500.}, "calibration": {
+        "rate": 200., "amplitude": .45, "frequency": .1, "kp": 4., "kd": .5,
+        "breakaway_settle_time": .5, "breakaway_approach": .03,
+        "breakaway_return_tolerance": .003, "breakaway_speed": .04,
+        "breakaway_position": .005, "breakaway_samples": 3,
+        "breakaway_ramp_rate": .05, "max_torque": .4, "max_speed": 1.,
+        "max_travel": .7, "max_temperature": 48., "feedback_timeout": .08,
+    },
+}], indirect=True)
 def test_ros_breakaway_from_a_known_simulation_calibration(scene):
     trace = collect_simulation({"inertia": 0.018, "coulomb_friction": 0.065,
                                 "viscous_friction": 0.037, "static_friction": 0.1})
@@ -295,6 +336,36 @@ def test_ros_breakaway_from_a_known_simulation_calibration(scene):
     result = FitResult.load(output / "breakaway.json")
     assert result.parameters["breakaway_positive"] == pytest.approx(0.1, abs=0.025)
     assert result.parameters["breakaway_negative"] == pytest.approx(0.1, abs=0.025)
+    report = json.loads((output / "report.json").read_text())
+    journals = report["raw_recording"]
+    assert journals["recording_complete"] and journals["stop_confirmed"]
+    assert journals["files"]["feedback.csv"]["rows"] > report["samples"]
+    assert journals["files"]["state.csv"]["rows"] > 0
+    assert journals["files"]["commands.csv"]["rows"] > 0
+    assert len(report["breakaway_preparation"]) == 4
+    assert all(item["ready"] and item["complete"] for item in report["breakaway_preparation"])
+    # A new stopped-by-operator preparation still restores a complete report,
+    # including empty formal samples and the feedback proving fresh disable.
+    scene.call(scene.start, Trigger.Request())
+    scene.wait(lambda: scene.status["stage"] == "neutral_dwell")
+    delayed_stop = scene.state.control_rate == 500.
+    if delayed_stop:
+        scene.call(scene.simulation, SimulationControl.Request(operation=SimulationControl.Request.PAUSE_FEEDBACK, data=True))
+    scene.call(scene.stop, Trigger.Request())
+    if delayed_stop:
+        scene.wait(lambda: scene.status["phase"] == "failed" and not scene.status["stop_confirmed"], timeout=6)
+        pending_output = Path(scene.status["output_directory"])
+        pending = json.loads((pending_output / "raw_recording.json").read_text())
+        assert not pending["recording_complete"]
+        scene.call(scene.simulation, SimulationControl.Request(operation=SimulationControl.Request.PAUSE_FEEDBACK, data=False))
+    scene.wait(lambda: scene.status["phase"] == "failed" and scene.status["stop_confirmed"])
+    failed_output = Path(scene.status["output_directory"])
+    failed = json.loads((failed_output / "report.json").read_text())
+    assert failed["samples"] == 0
+    assert (failed_output / "samples.csv").read_text().startswith("time,position,velocity,torque")
+    assert failed["raw_recording"]["recording_complete"]
+    assert failed["raw_recording"]["files"]["feedback.csv"]["rows"] > 0
+    assert failed["breakaway_preparation"][-1]["interrupted"]
 
 
 @pytest.mark.parametrize("scene", [{
@@ -307,7 +378,7 @@ def test_ros_breakaway_from_a_known_simulation_calibration(scene):
 }], indirect=True)
 def test_native_pd_stabilizes_low_inertia_high_stiction_and_recovers_friction(scene):
     scene.launch_collector()
-    output = scene.finish_experiment(timeout=50)
+    output = scene.finish_experiment(timeout=75)
     fit = FitResult.load(output / "calibration.json")
     assert fit.parameters["coulomb"] == pytest.approx(0.14, rel=0.12)
     assert fit.parameters["bias"] == pytest.approx(-0.02, abs=0.01)
